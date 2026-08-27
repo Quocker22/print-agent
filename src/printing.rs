@@ -9,11 +9,15 @@ use std::path::PathBuf;
 /// Đường dẫn SumatraPDF mặc định (có thể đổi qua config sau nếu cần).
 const SUMATRA_MAC_DINH: &str = "SumatraPDF.exe";
 
-/// tray "tray-2" → số bin cho SumatraPDF `-print-settings bin=<n>`.
-/// tray-<n> → n. Không parse được → giữ nguyên chuỗi (SumatraPDF tự hiểu tên khay).
+/// tray "tray-2" → `bin=Tray 2` cho SumatraPDF `-print-settings`.
+///
+/// VÌ SAO tên khay chứ không phải số: đo thật trên máy in HP LaserJet Pro 4003
+/// (27/08) — `bin=2` bị máy PHỚT LỜ, in ra khay mặc định (A4); `bin=Tray 2`
+/// (đúng tên khay Windows hiển thị) mới chọn đúng khay A5. tray-<n> → "Tray <n>";
+/// giá trị không theo dạng tray-<n> → giữ nguyên (config ghi thẳng tên khay).
 pub fn tray_sang_bin(tray: &str) -> String {
     if let Some(so) = tray.strip_prefix("tray-") {
-        format!("bin={}", so)
+        format!("bin=Tray {}", so)
     } else {
         format!("bin={}", tray)
     }
@@ -110,8 +114,8 @@ mod tests {
 
     #[test]
     fn tray2_sang_bin2() {
-        assert_eq!(tray_sang_bin("tray-2"), "bin=2");
-        assert_eq!(tray_sang_bin("tray-1"), "bin=1");
+        assert_eq!(tray_sang_bin("tray-2"), "bin=Tray 2");
+        assert_eq!(tray_sang_bin("tray-1"), "bin=Tray 1");
     }
 
     #[test]
@@ -121,7 +125,7 @@ mod tests {
         assert_eq!(a[1], "-print-to");
         assert_eq!(a[2], "HP LaserJet");
         assert_eq!(a[3], "-print-settings");
-        assert_eq!(a[4], "paper=A5,bin=2");
+        assert_eq!(a[4], "paper=A5,bin=Tray 2");
         assert_eq!(a[5], "-silent");
         assert_eq!(a[6], "c:\\a.pdf");
     }
