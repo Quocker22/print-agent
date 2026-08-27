@@ -555,7 +555,62 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> efra
         options,
         Box::new(move |cc| {
             cai_font(&cc.egui_ctx);
+            // BUG THẬT (xem doc-comment nguon_repaint_nen bên dưới): cửa sổ ẩn
+            // (with_visible(false) ở trên) khiến winit/eframe KHÔNG bao giờ tự
+            // đánh thức event loop để chạy App::update() — mà xu_ly_su_kien_tray
+            // (nơi đọc menu "Cấu hình...") chỉ được gọi TỪ BÊN TRONG update().
+            // Không có nguồn đánh thức ngoài, bấm "Cấu hình..." sau khi ẩn cửa
+            // sổ (đóng X hoặc mới khởi động) sẽ KHÔNG BAO GIỜ được xử lý. Spawn
+            // thread nền gọi ctx.request_repaint() định kỳ — xem hàm bên dưới.
+            nguon_repaint_nen(cc.egui_ctx.clone());
             Ok(Box::new(App::moi(cfg, trang_thai)))
         }),
     )
+}
+
+/// Giữ event loop eframe LUÔN được đánh thức đều đặn, KỂ CẢ KHI cửa sổ đang
+/// ẩn — vá bug "bấm 'Cấu hình...' sau khi ẩn cửa sổ không mở lại được".
+///
+/// GỐC RỄ (đã đọc trực tiếp source eframe 0.32.3, native/run.rs):
+/// - event loop winit chạy với ControlFlow::Wait / WaitUntil(next_repaint) —
+///   nó NGỦ cho tới khi có 1 trong 2: (a) hệ điều hành gửi window event thật
+///   (chuột/phím/resize/...), hoặc (b) đồng hồ chạm mốc next_repaint_time mà
+///   chính update() đã đặt qua request_repaint_after() ở LƯỢT CHẠY TRƯỚC.
+/// - Khi cửa sổ ẨN (Visible(false)), OS không còn gửi window event cho nó,
+///   NÊN (a) không xảy ra. Và vì update() không chạy, nó không tự đặt lại
+///   next_repaint_time cho lượt sau → (b) cũng không xảy ra. Việc gọi
+///   ctx.request_repaint_after(500ms) Ở CUỐI update() (xem eframe::App::update)
+///   vì vậy KHÔNG cứu được: nó chỉ có tác dụng nếu update() đã chạy ít nhất 1
+///   lần để gọi được nó — vòng lặp "ai đánh thức ai" bị đứt ngay từ khi ẩn.
+/// - Kết quả: tray event (bấm "Cấu hình...") được poll trong
+///   xu_ly_su_kien_tray(), nhưng hàm đó CHỈ được gọi từ bên trong update() —
+///   nên khi event loop ngủ vô thời hạn, tray event không bao giờ được đọc.
+///
+/// CÁCH VÁ: egui::Context::request_repaint() có tài liệu chính thức (egui
+/// 0.32.3 src/context.rs, doc-comment của request_repaint()) nói rõ: "If
+/// called from outside the UI thread, the UI thread will wake up and run,
+/// provided the egui integration has set that up (...) (this will work on
+/// eframe)". Context là Arc<RwLock<..>> — Clone rẻ, Send/Sync, gọi được từ
+/// thread khác an toàn. Cơ chế bên trong (đã đọc eframe native/run.rs): gọi
+/// từ thread ngoài đi qua EventLoopProxy → gửi UserEvent::RequestRepaint →
+/// winit ApplicationHandler::user_event() được gọi NGAY CẢ KHI event loop
+/// đang park ở Wait/WaitUntil (đây là đúng cơ chế OS wake, không phải poll)
+/// → eframe đặt EventResult::RepaintAt → check_redraw_requests() gọi thẳng
+/// window.request_redraw() KHÔNG kiểm tra window có visible hay không → egui
+/// chạy update() như bình thường dù cửa sổ đang ẩn.
+///
+/// Vì vậy: spawn 1 thread nền, sống suốt đời app (không cần join — process
+/// thoát qua std::process::exit(0) ở nhánh Thoát, thread nền tự bị dọn theo),
+/// gọi ctx.request_repaint() mỗi 250ms. 250ms đủ nhanh để tray "Cấu hình..."
+/// cảm giác phản hồi ngay (dưới ngưỡng người dùng nhận ra độ trễ ~300-400ms),
+/// đủ thưa để không tốn CPU đáng kể lúc idle (so với bản cũ request_repaint_
+/// after(500ms) VỐN ĐÃ được chấp nhận cho lúc cửa sổ hiện — 250ms cùng bậc độ
+/// lớn, không phải đổi mô hình chi phí). KHÔNG dùng request_repaint_after()
+/// gọi 1 LẦN duy nhất ở đây vì nó chỉ đặt lịch 1 mốc — cần lặp lại suốt đời
+/// app, giống hệt lý do App::update() phải tự gọi lại mỗi frame.
+fn nguon_repaint_nen(ctx: egui::Context) {
+    std::thread::spawn(move || loop {
+        ctx.request_repaint();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    });
 }
