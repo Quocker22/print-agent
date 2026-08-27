@@ -357,6 +357,24 @@ impl eframe::App for App {
     }
 }
 
+/// Nạp font Be Vietnam Pro (có dấu tiếng Việt) — font mặc định egui THIẾU
+/// dấu Việt (ã, ế, ơ… ra ô vuông). Nhúng thẳng vào binary qua include_bytes.
+fn cai_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "viet".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/font-regular.ttf"
+        ))),
+    );
+    // Đặt font Việt LÊN ĐẦU cả hai họ (proportional + monospace) để mọi chữ
+    // dùng nó trước, fallback font gốc cho ký tự nó không có.
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().insert(0, "viet".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// Chạy UI egui + tray icon. Gọi từ main() SAU KHI đã spawn thread net.
 /// Cửa sổ khởi động ẨN nếu đã có config.ini hợp lệ (chạy nền kiểu Tailscale);
 /// hiện ngay nếu đây là lần đầu chưa có config (buộc người dùng nhập).
@@ -383,6 +401,9 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>, hien_ng
     eframe::run_native(
         "Incokit Print Agent",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::moi(cfg, trang_thai)))),
+        Box::new(move |cc| {
+            cai_font(&cc.egui_ctx);
+            Ok(Box::new(App::moi(cfg, trang_thai)))
+        }),
     )
 }
