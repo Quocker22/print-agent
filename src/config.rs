@@ -74,6 +74,25 @@ pub fn parse_config(text: &str) -> Result<Config> {
     })
 }
 
+/// Serialize Config → chuỗi INI (ngược của parse_config) để UI ghi lại
+/// config.ini sau khi người dùng sửa trong tab Cấu hình.
+///
+/// VÌ SAO không dùng crate ini riêng: định dạng quá đơn giản (1 section,
+/// key=value phẳng), thêm crate chỉ để làm việc này là thừa; tự viết vài
+/// dòng đọc lại được ngay bằng parse_config ở trên (test round-trip bên dưới).
+pub fn ghi_config(cfg: &Config) -> String {
+    format!(
+        "[agent]\n\
+         server_url = {}\n\
+         token = {}\n\
+         org_id = {}\n\
+         printer_name = {}\n\
+         tray = {}\n\
+         paper_size = {}\n",
+        cfg.server_url, cfg.token, cfg.org_id, cfg.printer_name, cfg.tray, cfg.paper_size
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +143,14 @@ mod tests {
         let t = "; comment\n\n[agent]\n# ghi chu\nserver_url = u\ntoken = t\norg_id = o\nprinter_name = p\n";
         let c = parse_config(t).unwrap();
         assert_eq!(c.server_url, "u");
+    }
+
+    #[test]
+    fn ghi_config_roi_doc_lai_ra_dung_gia_tri() {
+        // round-trip: parse -> ghi -> parse lại phải ra cùng Config.
+        let c = parse_config(DU).unwrap();
+        let text = ghi_config(&c);
+        let c2 = parse_config(&text).unwrap();
+        assert_eq!(c, c2);
     }
 }

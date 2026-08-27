@@ -15,5 +15,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 anyhow = "1"
+# UI (egui/eframe) — cửa sổ cấu hình + trạng thái, kiểu Tailscale.
+# GHI CHÚ: yêu cầu ban đầu là eframe 0.36, nhưng 0.36.x cần rustc >= 1.95
+# (máy build hiện có rustc 1.94 — xem report-ui.md phần "concern"). Đã ghim
+# 0.32 (default feature = backend glow) để cargo check/test chạy được ngay
+# trên toolchain hiện tại; nâng lên 0.36 sau khi rustc được cập nhật chỉ cần
+# đổi số version — API update() không đổi giữa 2 bản minor gần nhau này
+# (0.36 mới đổi sang App::ui(), 0.32 vẫn dùng App::update() cổ điển).
+eframe = "0.32"
+egui = "0.32"
+# Tray icon (khay hệ thống) — icon xanh/đỏ theo trạng thái nối, menu phải chuột.
+tray-icon = "0.24"
+# Dựng icon tray từ buffer RGBA — image chỉ dùng để build ảnh vuông đơn giản,
+# tắt hết feature ảnh không cần (không đọc file ảnh nào) cho gọn build.
+image = { version = "0.25", default-features = false }
 
 [dev-dependencies]
