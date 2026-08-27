@@ -25,38 +25,48 @@
 //! Resumed — "the earliest you can create icons"), không phải "trước khi
 //! event loop chạy" như lo ngại ban đầu. KHÔNG cần chuyển việc tạo tray ra
 //! chay_ui() — giữ nguyên vị trí tạo trong App::moi(), chỉ sửa CÁCH tạo menu
-//! + cách xử lý event cho khớp mẫu rust-daemon (xem 2 chỗ sửa thật bên dưới).
+//! + cách xử lý event cho khớp mẫu rust-daemon (xem các chỗ sửa thật bên dưới).
 //!
-//! 2 LỖI THẬT tìm thấy khi so với mẫu (không phải lỗi luồng thread):
+//! MÔ HÌNH MỚI (tray-first kiểu Tailscale, thay bản "cửa sổ luôn hiện" cũ):
+//! - Khởi động CHỈ có icon khay, cửa sổ egui ẨN ngay từ đầu (xem chay_ui()).
+//! - Bấm icon khay (trái HOẶC phải, không phân biệt — with_menu_on_left_click
+//!   (true), khác bản trước tắt hẳn menu-khi-click-trái để dành click trái
+//!   riêng cho "hiện cửa sổ") → hiện menu text: trạng thái nối, server,
+//!   máy in, rồi "Cấu hình..." mới mở cửa sổ. KHÔNG còn hành vi "click icon
+//!   tự mở cửa sổ" của bản cũ — đúng yêu cầu "bấm icon → menu hiện thông
+//!   tin, bấm 'Cấu hình...' MỚI mở cửa sổ".
+//! - 3 mục đầu (trạng thái/server/máy in) là menu item DISABLED (enabled=
+//!   false) — chỉ để hiển thị text, không bấm được, đúng cách macOS/Windows
+//!   thường dùng cho info-only rows trong tray menu (vd Tailscale hiện
+//!   "Connected as ..." disabled ở đầu menu).
 //!
-//! 1. Menu dùng MenuItem::new() (id số tự sinh) + so `ev.id ==
-//!    self.tray_menu_mo.id().clone()` — chạy được nhưng phải giữ sống 2
-//!    field MenuItem chỉ để so id, không tường minh. Mẫu rust-daemon dùng
-//!    MenuItem::with_id("start", ...) — id là string đặt tên rõ ràng, so
-//!    trực tiếp với hằng &str. Đã đổi theo mẫu: with_id("mo"/"thoat", ...).
+//! 2 LỖI THẬT tìm thấy khi so bản cũ với mẫu rust-daemon (không phải lỗi
+//! luồng thread, đã sửa từ trước và vẫn giữ nguyên ở bản mới):
 //!
-//! 2. TrayIconBuilder mặc định with_menu_on_left_click(true) (xem
-//!    tray-icon 0.24.2 src/lib.rs dòng ~307: "default is true") — nghĩa là
-//!    trên Windows, CLICK TRÁI cũng bật menu chuột phải, xung đột với yêu
-//!    cầu "click icon → hiện cửa sổ". Thêm nữa, code cũ khớp MỌI
-//!    TrayIconEvent::Click bất kể nút chuột nào (trái/phải/giữa) và mọi
-//!    button_state (Up/Down) — click phải mở menu CŨNG kích hoạt luôn hiện
-//!    cửa sổ. Đã sửa: with_menu_on_left_click(false) (chỉ phải mới mở menu)
-//!    + chỉ xử lý Click khi button = Left và button_state = Up.
+//! 1. Menu dùng id string tường minh qua MenuItem::with_id("mo"/"thoat", ...)
+//!    thay vì MenuItem::new() (id số tự sinh) — khớp mẫu rust-daemon
+//!    (MenuItem::with_id("start", "Start Task", true, None)), so trực tiếp
+//!    event.id với hằng &str, không cần giữ sống MenuItem chỉ để so id.
+//!
+//! 2. TrayIconEvent::Click bắn cho MỌI nút chuột (trái/phải/giữa) và cả 2
+//!    trạng thái (Down rồi Up) — khớp lỏng sẽ xử lý event 2 lần (Down+Up)
+//!    hoặc nhầm nút. Đã sửa: chỉ xử lý khi button_state = Up (1 lần/click
+//!    hoàn chỉnh), không còn lọc theo button vì menu giờ hiện ở CẢ 2 nút.
 
 use crate::config::{self, Config};
 use crate::net;
 use crate::printing;
 use crate::state::TrangThaiChung;
 use std::sync::{Arc, Mutex};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// Id string của 2 mục menu tray — dùng chung giữa lúc DỰNG menu (with_id) và
-/// lúc SO SÁNH event nhận về, theo đúng cách rust-daemon làm (match
-/// event.id.as_ref() với hằng "start"/"stop"/"quit"). Đặt hằng ở đây để
-/// tránh gõ nhầm chuỗi ở 2 nơi khác nhau.
-const MENU_ID_MO: &str = "mo";
+/// Id string của 2 mục menu tray BẤM ĐƯỢC — dùng chung giữa lúc DỰNG menu
+/// (with_id) và lúc SO SÁNH event nhận về, theo đúng cách rust-daemon làm
+/// (match event.id.as_ref() với hằng "start"/"stop"/"quit"). 3 mục đầu
+/// (trạng thái/server/máy in) không cần hằng id vì disabled — không bao giờ
+/// sinh MenuEvent để phải so.
+const MENU_ID_CAU_HINH: &str = "cauhinh";
 const MENU_ID_THOAT: &str = "thoat";
 
 /// Đường dẫn config.ini thao tác trong UI (đọc lúc khởi động, ghi lúc bấm Lưu).
@@ -119,36 +129,64 @@ struct App {
     tray_icon: Option<TrayIcon>,
     /// Icon hiện tray đang hiển thị, để tránh gọi set_icon() mỗi frame (phí).
     tray_da_noi_hien_thi: Option<bool>,
+    /// Mục menu tray "● Đã kết nối"/"● Mất kết nối" — GIỮ tham chiếu để gọi
+    /// set_text() cập nhật động khi trang_thai.da_noi đổi (menu tray không
+    /// tự vẽ lại như egui, phải chủ động set_text mỗi khi trạng thái thật
+    /// sự thay đổi, giống cach cap_nhat_tray() làm với icon).
+    menu_trang_thai: Option<MenuItem>,
+    /// Mục menu tray "Server: <url>" / "Máy in: <tên> (...)" — GIỮ tham chiếu
+    /// để set_text() lại khi người dùng bấm Lưu cấu hình mới (nhánh cfg_moi
+    /// trong update()); không disable/enable gì thêm, chỉ đổi text hiển thị.
+    menu_server: Option<MenuItem>,
+    menu_may_in: Option<MenuItem>,
 
     an_cua_so: bool,
 }
 
 impl App {
     fn moi(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Self {
-        // Dùng with_id (id string tường minh) thay vì MenuItem::new (id số tự
-        // sinh) — theo đúng mẫu rust-daemon (build_tray_icon(): MenuItem::
-        // with_id("start", "Start Task", true, None)). Lợi ích: không cần giữ
-        // sống struct MenuItem chỉ để so .id() lúc nhận event — so thẳng
-        // event.id với hằng MENU_ID_MO/MENU_ID_THOAT ở xu_ly_su_kien_tray().
-        let menu_mo = MenuItem::with_id(MENU_ID_MO, "Mở cửa sổ", true, None);
+        // 3 mục ĐẦU: chỉ đọc (enabled=false), hiển thị trạng thái/server/máy
+        // in ngay trong menu tray — người dùng thấy thông tin KHÔNG cần mở
+        // cửa sổ. menu_trang_thai giữ tham chiếu riêng để set_text() động
+        // trong cap_nhat_tray() (server/máy in không đổi trong lúc app chạy
+        // — trừ lúc Lưu cấu hình mới, xử lý riêng ở nhánh cfg_moi bên dưới).
+        let menu_trang_thai = MenuItem::new("● Mất kết nối", false, None);
+        let menu_server = MenuItem::new(format!("Server: {}", cfg.server_url), false, None);
+        let menu_may_in = MenuItem::new(
+            format!("Máy in: {} ({}, khay {})", cfg.printer_name, cfg.paper_size, cfg.tray),
+            false,
+            None,
+        );
+        // 2 mục CUỐI: bấm được — dùng with_id (id string tường minh) theo
+        // đúng mẫu rust-daemon (MenuItem::with_id("start", ...)), so thẳng
+        // event.id với hằng MENU_ID_CAU_HINH/MENU_ID_THOAT ở xu_ly_su_kien_tray.
+        let menu_cau_hinh = MenuItem::with_id(MENU_ID_CAU_HINH, "Cấu hình...", true, None);
         let menu_thoat = MenuItem::with_id(MENU_ID_THOAT, "Thoát", true, None);
+
         let tray_menu = Menu::new();
         // Lỗi dựng menu tray chỉ nên xảy ra khi hệ thống thiếu hỗ trợ (vd Linux
         // thiếu gtk) — không panic, chỉ bỏ qua tray, cửa sổ chính vẫn chạy được.
-        let _ = tray_menu.append(&menu_mo);
+        let _ = tray_menu.append(&menu_trang_thai);
+        let _ = tray_menu.append(&menu_server);
+        let _ = tray_menu.append(&menu_may_in);
+        let _ = tray_menu.append(&PredefinedMenuItem::separator());
+        let _ = tray_menu.append(&menu_cau_hinh);
         let _ = tray_menu.append(&menu_thoat);
 
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip("Incokit Print Agent — mất kết nối")
             .with_icon(icon_do())
-            // VÌ SAO tắt menu-khi-click-trái: mặc định của tray-icon crate là
-            // TRUE (xem lib.rs: "Whether to show the tray menu on left click
-            // ... default is true") — trên Windows điều này khiến click trái
-            // (vốn dùng để "hiện cửa sổ" theo yêu cầu) CŨNG bật menu chuột
-            // phải, xung đột hành vi. Chỉ giữ menu ở click phải; click trái
-            // dành riêng cho hành động hiện cửa sổ (xử lý ở xu_ly_su_kien_tray).
-            .with_menu_on_left_click(false)
+            // VÌ SAO bật tường minh (thay vì tắt như bản trước): mô hình mới
+            // KHÔNG còn hành vi "click trái → tự mở cửa sổ" (yêu cầu: bấm
+            // icon chỉ mở MENU, "Cấu hình..." trong menu mới mở cửa sổ) — nên
+            // không còn lý do tách click trái/phải nữa. menu_on_right_click
+            // đã mặc định true sẵn (không đổi); gọi with_menu_on_left_click
+            // (true) ở đây là ĐẶT LẠI VỀ mặc định gốc của crate (lib.rs:
+            // "default is true"), ghi tường minh cho rõ ý đồ thay vì dựa vào
+            // giá trị ngầm định — cả 2 nút chuột giờ đều hiện cùng 1 menu,
+            // đúng yêu cầu "bỏ phân biệt trái/phải, đơn giản".
+            .with_menu_on_left_click(true)
             .build()
             .ok(); // None nếu môi trường không hỗ trợ tray (vd CI headless) — không chặn app chạy.
 
@@ -166,12 +204,17 @@ impl App {
             thong_bao_in_thu: None,
             tray_icon,
             tray_da_noi_hien_thi: None,
-            an_cua_so: false,
+            menu_trang_thai: Some(menu_trang_thai),
+            menu_server: Some(menu_server),
+            menu_may_in: Some(menu_may_in),
+            an_cua_so: true,
         }
     }
 
-    /// Cập nhật icon tray theo trạng thái nối — chỉ gọi set_icon khi trạng thái
-    /// đổi (tránh dựng lại icon mỗi frame, lãng phí dù nhỏ).
+    /// Cập nhật icon + mục trạng thái trong menu tray theo trạng thái nối —
+    /// chỉ gọi set_icon/set_text khi trạng thái ĐỔI (tránh vẽ lại mỗi frame,
+    /// lãng phí dù nhỏ). GIỮ NGUYÊN icon xanh/đỏ như bản cũ — chỉ thêm phần
+    /// set_text() cho mục menu trạng thái (mới ở mô hình tray-first).
     fn cap_nhat_tray(&mut self, da_noi: bool) {
         if self.tray_da_noi_hien_thi == Some(da_noi) {
             return;
@@ -187,31 +230,36 @@ impl App {
             };
             let _ = tray.set_tooltip(Some(tooltip));
         }
+        if let Some(mi) = &self.menu_trang_thai {
+            // Menu tray dùng font HỆ THỐNG (không phải font nhúng egui) nên
+            // ký tự ● thường hiển thị đúng trên Windows/macOS — khác với
+            // trong cửa sổ egui (font Be Vietnam Pro nhúng, xem tab_trang_thai
+            // vẫn giữ ● vì đã test được trong bản cũ). Không đổi sang "•"/
+            // "[OK]" ở đây trừ khi verify thật trên Windows cho thấy lỗi.
+            let nhan = if da_noi { "● Đã kết nối" } else { "● Mất kết nối" };
+            mi.set_text(nhan);
+        }
     }
 
     /// Xử lý sự kiện click tray + menu (nhận qua channel toàn cục của tray-icon
     /// crate, đúng pattern rust-daemon: poll try_recv() mỗi vòng lặp thay vì
     /// đăng ký callback). Gọi mỗi frame — try_recv không chặn nên rẻ.
     fn xu_ly_su_kien_tray(&mut self, ctx: &egui::Context) {
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            // VÌ SAO khớp CHÍNH XÁC Left + Up: TrayIconEvent::Click bắn cho
-            // MỌI nút chuột (trái/phải/giữa) và cả 2 trạng thái (Down rồi Up).
-            // Khớp lỏng (như bản cũ `Click { .. }`) khiến click PHẢI — vốn chỉ
-            // để mở menu — cũng vô tình kích hoạt "hiện cửa sổ". Left+Up là
-            // thời điểm chuẩn của một cú click hoàn chỉnh (giống double-click
-            // protection tự nhiên của OS).
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
-                self.an_cua_so = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-        }
+        // Mô hình mới: bấm icon tray (trái HOẶC phải, không phân biệt —
+        // with_menu_on_left_click(true) ở App::moi()) chỉ BẬT MENU, không
+        // còn tự mở cửa sổ nữa — nên ở đây không cần đọc TrayIconEvent::Click
+        // để hiện cửa sổ như bản cũ. Vẫn phải rút cạn receiver() mỗi frame
+        // (không thì channel phình vô hạn) nhưng bỏ qua nội dung — tray-icon
+        // crate tự lo phần bật menu khi with_menu_on_left_click(true).
+        while TrayIconEvent::receiver().try_recv().is_ok() {}
+
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             // So id STRING tường minh (mẫu rust-daemon: match event.id.as_ref())
             // thay vì so với MenuItem lưu sẵn — MenuId có impl PartialEq<&str>
             // nên so trực tiếp với hằng &str, không cần .as_ref()/.to_string().
-            if ev.id == MENU_ID_MO {
+            // 3 mục info-only (trạng thái/server/máy in) không có hằng id vì
+            // enabled=false — hệ thống không bao giờ sinh MenuEvent cho chúng.
+            if ev.id == MENU_ID_CAU_HINH {
                 self.an_cua_so = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -231,7 +279,13 @@ impl App {
             } else {
                 (egui::Color32::from_rgb(0xc0, 0x39, 0x2b), "Mất kết nối")
             };
-            ui.label(egui::RichText::new(format!("● {}", nhan)).color(mau).strong());
+            // "•" (U+2022) chứ KHÔNG phải "●" (U+25CF): đã kiểm trực tiếp
+            // cmap của assets/font-regular.ttf (Be Vietnam Pro, font nhúng
+            // cho cửa sổ egui qua cai_font()) — U+25CF KHÔNG có glyph trong
+            // font này (ra ô vuông tofu như report-ui.md cảnh báo), U+2022
+            // CÓ. Menu tray dùng font hệ thống nên vẫn giữ "●" ở đó (xem
+            // cap_nhat_tray/App::moi) — chỉ đổi 2 chỗ vẽ trong cửa sổ egui.
+            ui.label(egui::RichText::new(format!("• {}", nhan)).color(mau).strong());
         });
         if let Some(tb) = &t.thong_bao_cuoi {
             ui.colored_label(egui::Color32::from_rgb(0xc0, 0x39, 0x2b), tb);
@@ -402,7 +456,9 @@ impl eframe::App for App {
                 } else {
                     (egui::Color32::from_rgb(0xc0, 0x39, 0x2b), "Mất kết nối")
                 };
-                ui.label(egui::RichText::new(format!("● {}", nhan)).color(mau).strong());
+                // "•" chứ không phải "●" — xem giải thích ở tab_trang_thai()
+                // (font nhúng Be Vietnam Pro thiếu glyph U+25CF).
+                ui.label(egui::RichText::new(format!("• {}", nhan)).color(mau).strong());
             });
             ui.separator();
 
@@ -427,9 +483,20 @@ impl eframe::App for App {
                     let trang_thai_moi = trang_thai_moi.clone();
                     std::thread::spawn(move || net::chay_net(cfg, trang_thai_moi));
                 }
+                // Cập nhật ngay 2 mục info-only "Server: .."/"Máy in: .." trong
+                // menu tray theo config vừa lưu — nếu không làm, menu vẫn hiện
+                // server/máy in CŨ dù cửa sổ đã lưu cấu hình mới, gây lệch
+                // thông tin giữa menu tray và config thật đang chạy.
+                if let Some(mi) = &self.menu_server {
+                    mi.set_text(format!("Server: {}", cfg.server_url));
+                }
+                if let Some(mi) = &self.menu_may_in {
+                    mi.set_text(format!("Máy in: {} ({}, khay {})", cfg.printer_name, cfg.paper_size, cfg.tray));
+                }
+
                 self.cfg_dang_dung = cfg;
                 self.trang_thai = trang_thai_moi;
-                self.tray_da_noi_hien_thi = None; // ép vẽ lại icon theo trạng thái mới
+                self.tray_da_noi_hien_thi = None; // ép vẽ lại icon + text trạng thái theo config mới
             }
         });
 
@@ -458,13 +525,16 @@ fn cai_font(ctx: &egui::Context) {
 }
 
 /// Chạy UI egui + tray icon. Gọi từ main() SAU KHI đã spawn thread net.
-/// Cửa sổ khởi động ẨN nếu đã có config.ini hợp lệ (chạy nền kiểu Tailscale);
-/// hiện ngay nếu đây là lần đầu chưa có config (buộc người dùng nhập).
-pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>, hien_ngay: bool) -> eframe::Result {
+/// Cửa sổ khởi động LUÔN ẨN (mô hình tray-first kiểu Tailscale: khởi động
+/// chỉ có icon khay, kể cả lần chạy đầu tiên chưa có config.ini hợp lệ —
+/// khác bản trước ép hiện cửa sổ khi thiếu config). Người dùng tự bấm
+/// "Cấu hình..." trong menu tray để mở cửa sổ, dù là nhập lần đầu hay xem
+/// lại cấu hình đã lưu.
+pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> eframe::Result {
     let viewport = egui::ViewportBuilder::default()
         .with_title("Incokit Print Agent")
         .with_inner_size([520.0, 560.0])
-        .with_visible(hien_ngay)
+        .with_visible(false)
         // KHÔNG hiện trên taskbar — giống Tailscale, chỉ sống ở khay hệ thống.
         // Hỗ trợ tuỳ platform (xem ghi chú trong report-ui.md): egui expose
         // with_taskbar(false) ở API, nhưng winit/OS quyết định có tôn trọng

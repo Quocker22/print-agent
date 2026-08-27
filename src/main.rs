@@ -63,10 +63,10 @@ fn main() -> Result<()> {
         std::thread::spawn(move || net::chay_net(cfg_net, trang_thai_net));
     }
 
-    // Cửa sổ hiện ngay nếu chưa có config hợp lệ (bắt buộc người dùng nhập);
-    // ẩn ngay từ đầu nếu đã có config — chạy nền kiểu Tailscale, người dùng
-    // tự mở qua tray icon khi cần xem trạng thái.
-    let hien_ngay = !hop_le;
-
-    ui::chay_ui(cfg, trang_thai, hien_ngay).map_err(|e| anyhow::anyhow!("eframe lỗi: {}", e))
+    // Mô hình MỚI (kiểu Tailscale): cửa sổ LUÔN ẨN lúc khởi động, kể cả khi
+    // CHƯA có config hợp lệ — icon tray là điểm vào duy nhất, người dùng tự
+    // bấm "Cấu hình..." trong menu tray để mở cửa sổ nhập. Khác bản trước
+    // (hiện ngay nếu thiếu config): giữ đúng "khởi động chỉ có icon khay,
+    // cửa sổ ẩn" theo yêu cầu, kể cả lần chạy đầu tiên chưa có config.ini.
+    ui::chay_ui(cfg, trang_thai).map_err(|e| anyhow::anyhow!("eframe lỗi: {}", e))
 }
