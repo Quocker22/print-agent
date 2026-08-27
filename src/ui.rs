@@ -374,6 +374,9 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>, hien_ng
 
     let options = eframe::NativeOptions {
         viewport,
+        // Wgpu (DirectX tren Windows) thay cho glow/OpenGL: may ao/RDP shop
+        // thuong thieu OpenGL 2.0 (loi "egui_glow requires opengl 2.0+").
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
