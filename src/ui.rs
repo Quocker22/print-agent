@@ -203,6 +203,7 @@ impl App {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
                 self.an_cua_so = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
@@ -213,6 +214,7 @@ impl App {
             if ev.id == MENU_ID_MO {
                 self.an_cua_so = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else if ev.id == MENU_ID_THOAT {
                 // Thoát thật: đóng viewport gốc → eframe kết thúc vòng lặp.
@@ -370,6 +372,16 @@ impl eframe::App for App {
         // chỉ thoát thật qua menu tray "Thoát"). CancelClose huỷ yêu cầu đóng.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.an_cua_so = true;
+        }
+
+        // Bấm nút minimize (_) → ẩn HẲN xuống tray thay vì để cửa sổ minimized
+        // lơ lửng (bug: minimize xong click tray mở lại không lên vì Visible(true)
+        // không tự un-minimize). Un-minimize rồi ẩn, để lần mở sau Minimized(false)
+        // + Visible(true) đưa lại đúng.
+        if !self.an_cua_so && ctx.input(|i| i.viewport().minimized == Some(true)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.an_cua_so = true;
         }
