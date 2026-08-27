@@ -1,0 +1,23 @@
+; Mau config cho print-agent (ban Rust). Copy thanh config.ini roi dien gia tri that.
+; QUAN TRONG: config.ini chua token bi mat, KHONG commit vao git (da .gitignore).
+; Luu file bang UTF-8 (agent tu bo BOM neu notepad them).
+
+[agent]
+; URL server ZaloCRM (https:// — socket.io tu nang cap transport).
+server_url = https://crm.example.com
+
+; AGENT_TOKEN cap cho shop nay — lay tu quan tri ZaloCRM.
+token = DAN_TOKEN_THAT_VAO_DAY
+
+; ma to chuc (orgId) cua shop nay.
+org_id = DAN_ORG_ID_VAO_DAY
+
+; Ten may in y het Windows hien thi trong "Printers & scanners".
+printer_name = HP LaserJet Pro 4003
+
+; Khay mac dinh neu job khong chi dinh. tray-<n> -> SumatraPDF bin=<n>.
+; VD tray-2 -> bin=2. CAN VERIFY tren may that: bin=2 co dung khay A5 khong.
+tray = tray-2
+
+; Kho giay mac dinh.
+paper_size = A5
