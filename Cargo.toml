@@ -22,8 +22,9 @@ anyhow = "1"
 # trên toolchain hiện tại; nâng lên 0.36 sau khi rustc được cập nhật chỉ cần
 # đổi số version — API update() không đổi giữa 2 bản minor gần nhau này
 # (0.36 mới đổi sang App::ui(), 0.32 vẫn dùng App::update() cổ điển).
-eframe = { version = "0.32", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.32", features = ["wgpu"] }
 egui = "0.32"
+wgpu = { version = "25", default-features = false, features = ["dx12"] }
 # Tray icon (khay hệ thống) — icon xanh/đỏ theo trạng thái nối, menu phải chuột.
 tray-icon = "0.24"
 # Dựng icon tray từ buffer RGBA — image chỉ dùng để build ảnh vuông đơn giản,
