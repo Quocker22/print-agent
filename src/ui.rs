@@ -1,12 +1,48 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Cửa sổ egui (trạng thái + cấu hình) và tray icon (khay hệ thống).
 //!
-//! VÌ SAO gộp UI + tray trong 1 module: cả hai đều chạy trên MAIN THREAD
-//! (tray-icon yêu cầu điều này trên macOS — xem doc-comment đầu file
-//! tray-icon crate: "an event loop must be running on the main thread so
-//! you also need to create the tray icon on the main thread"). eframe cũng
-//! chạy vòng lặp sự kiện chính trên main thread, nên ta tạo tray NGAY TRONG
-//! App::ui / lúc khởi tạo App — không tách thread riêng cho tray.
+//! VÌ SAO gộp UI + tray trong 1 module: cả hai đều chạy trên MAIN THREAD.
+//!
+//! Doc-comment đầu file crate tray-icon nói rõ:
+//! - macOS: "an event loop must be running on the main thread so you also
+//!   need to create the tray icon on the main thread"
+//! - Windows/Linux: "it doesn't need to be the main thread but you have to
+//!   create the tray icon on the SAME thread as the event loop"
+//!
+//! Đối chiếu với rust-daemon (bản mẫu weijia/68★): build_tray_icon() được gọi
+//! ngay TRƯỚC khi chạy event loop, trên cùng 1 thread — họ không có window
+//! nên gọi thẳng trong main(). App này CÓ window (eframe), nên câu hỏi mấu
+//! chốt là: App::moi() — nơi tray được tạo — có thật sự chạy trên thread nào
+//! và lúc nào so với vòng lặp sự kiện?
+//!
+//! ĐÃ KIỂM TRA TRỰC TIẾP SOURCE eframe 0.32.3 (native/wgpu_integration.rs):
+//! app_creator (closure truyền cho eframe::run_native, nơi gọi App::moi) được
+//! gọi từ bên trong ApplicationHandler::resumed() — hàm này được winit gọi
+//! trong lúc event_loop.run_app() đang chạy, TRÊN CHÍNH THREAD gọi run_app()
+//! (main.rs gọi ui::chay_ui() thẳng từ main(), không spawn thread riêng).
+//! Tức là: tạo tray trong App::moi() ĐÃ ở đúng main thread, và còn đúng thời
+//! điểm lý tưởng mà tray-icon khuyến nghị cho macOS (StartCause::Init /
+//! Resumed — "the earliest you can create icons"), không phải "trước khi
+//! event loop chạy" như lo ngại ban đầu. KHÔNG cần chuyển việc tạo tray ra
+//! chay_ui() — giữ nguyên vị trí tạo trong App::moi(), chỉ sửa CÁCH tạo menu
+//! + cách xử lý event cho khớp mẫu rust-daemon (xem 2 chỗ sửa thật bên dưới).
+//!
+//! 2 LỖI THẬT tìm thấy khi so với mẫu (không phải lỗi luồng thread):
+//!
+//! 1. Menu dùng MenuItem::new() (id số tự sinh) + so `ev.id ==
+//!    self.tray_menu_mo.id().clone()` — chạy được nhưng phải giữ sống 2
+//!    field MenuItem chỉ để so id, không tường minh. Mẫu rust-daemon dùng
+//!    MenuItem::with_id("start", ...) — id là string đặt tên rõ ràng, so
+//!    trực tiếp với hằng &str. Đã đổi theo mẫu: with_id("mo"/"thoat", ...).
+//!
+//! 2. TrayIconBuilder mặc định with_menu_on_left_click(true) (xem
+//!    tray-icon 0.24.2 src/lib.rs dòng ~307: "default is true") — nghĩa là
+//!    trên Windows, CLICK TRÁI cũng bật menu chuột phải, xung đột với yêu
+//!    cầu "click icon → hiện cửa sổ". Thêm nữa, code cũ khớp MỌI
+//!    TrayIconEvent::Click bất kể nút chuột nào (trái/phải/giữa) và mọi
+//!    button_state (Up/Down) — click phải mở menu CŨNG kích hoạt luôn hiện
+//!    cửa sổ. Đã sửa: with_menu_on_left_click(false) (chỉ phải mới mở menu)
+//!    + chỉ xử lý Click khi button = Left và button_state = Up.
 
 use crate::config::{self, Config};
 use crate::net;
@@ -14,7 +50,14 @@ use crate::printing;
 use crate::state::TrangThaiChung;
 use std::sync::{Arc, Mutex};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+/// Id string của 2 mục menu tray — dùng chung giữa lúc DỰNG menu (with_id) và
+/// lúc SO SÁNH event nhận về, theo đúng cách rust-daemon làm (match
+/// event.id.as_ref() với hằng "start"/"stop"/"quit"). Đặt hằng ở đây để
+/// tránh gõ nhầm chuỗi ở 2 nơi khác nhau.
+const MENU_ID_MO: &str = "mo";
+const MENU_ID_THOAT: &str = "thoat";
 
 /// Đường dẫn config.ini thao tác trong UI (đọc lúc khởi động, ghi lúc bấm Lưu).
 const CONFIG_PATH: &str = "config.ini";
@@ -23,6 +66,15 @@ const CONFIG_PATH: &str = "config.ini";
 /// VÌ SAO tự vẽ thay vì nạp file .ico/.png: agent chỉ cần 2 trạng thái màu
 /// đơn giản (chấm tròn không cần thiết ở kích thước khay hệ thống nhỏ xíu),
 /// tự dựng buffer RGBA bằng crate `image` là đủ, khỏi phải đóng gói asset.
+///
+/// Đối chiếu điểm "nhúng icon qua include_bytes!" của mẫu rust-daemon
+/// (load_icon() đọc include_bytes!(".../icon.png") rồi decode PNG lúc chạy):
+/// mục tiêu của include_bytes! ở đó là "không phụ thuộc file ngoài đĩa" —
+/// project này KHÔNG có sẵn file .ico/.png asset nào (chỉ có 2 file font),
+/// nên tự dựng buffer RGBA NGAY TRONG BINARY (compile-time, không cả bước
+/// decode PNG lúc runtime) đã thoả mãn đúng mục tiêu đó, thậm chí chặt hơn:
+/// không có bước decode nào có thể lỗi. KHÔNG đổi sang include_bytes! của
+/// một PNG vì sẽ phải tự vẽ + thêm asset mới ngoài phạm vi yêu cầu sửa tray.
 fn icon_mau(r: u8, g: u8, b: u8) -> Icon {
     const N: u32 = 32;
     let mut img = image::RgbaImage::new(N, N);
@@ -65,8 +117,6 @@ struct App {
     thong_bao_in_thu: Option<String>,
 
     tray_icon: Option<TrayIcon>,
-    tray_menu_mo: MenuItem,
-    tray_menu_thoat: MenuItem,
     /// Icon hiện tray đang hiển thị, để tránh gọi set_icon() mỗi frame (phí).
     tray_da_noi_hien_thi: Option<bool>,
 
@@ -75,8 +125,13 @@ struct App {
 
 impl App {
     fn moi(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Self {
-        let menu_mo = MenuItem::new("Mở cửa sổ", true, None);
-        let menu_thoat = MenuItem::new("Thoát", true, None);
+        // Dùng with_id (id string tường minh) thay vì MenuItem::new (id số tự
+        // sinh) — theo đúng mẫu rust-daemon (build_tray_icon(): MenuItem::
+        // with_id("start", "Start Task", true, None)). Lợi ích: không cần giữ
+        // sống struct MenuItem chỉ để so .id() lúc nhận event — so thẳng
+        // event.id với hằng MENU_ID_MO/MENU_ID_THOAT ở xu_ly_su_kien_tray().
+        let menu_mo = MenuItem::with_id(MENU_ID_MO, "Mở cửa sổ", true, None);
+        let menu_thoat = MenuItem::with_id(MENU_ID_THOAT, "Thoát", true, None);
         let tray_menu = Menu::new();
         // Lỗi dựng menu tray chỉ nên xảy ra khi hệ thống thiếu hỗ trợ (vd Linux
         // thiếu gtk) — không panic, chỉ bỏ qua tray, cửa sổ chính vẫn chạy được.
@@ -87,6 +142,13 @@ impl App {
             .with_menu(Box::new(tray_menu))
             .with_tooltip("Incokit Print Agent — mất kết nối")
             .with_icon(icon_do())
+            // VÌ SAO tắt menu-khi-click-trái: mặc định của tray-icon crate là
+            // TRUE (xem lib.rs: "Whether to show the tray menu on left click
+            // ... default is true") — trên Windows điều này khiến click trái
+            // (vốn dùng để "hiện cửa sổ" theo yêu cầu) CŨNG bật menu chuột
+            // phải, xung đột hành vi. Chỉ giữ menu ở click phải; click trái
+            // dành riêng cho hành động hiện cửa sổ (xử lý ở xu_ly_su_kien_tray).
+            .with_menu_on_left_click(false)
             .build()
             .ok(); // None nếu môi trường không hỗ trợ tray (vd CI headless) — không chặn app chạy.
 
@@ -103,8 +165,6 @@ impl App {
             thong_bao_luu: None,
             thong_bao_in_thu: None,
             tray_icon,
-            tray_menu_mo: menu_mo,
-            tray_menu_thoat: menu_thoat,
             tray_da_noi_hien_thi: None,
             an_cua_so: false,
         }
@@ -130,21 +190,31 @@ impl App {
     }
 
     /// Xử lý sự kiện click tray + menu (nhận qua channel toàn cục của tray-icon
-    /// crate). Gọi mỗi frame — try_recv không chặn nên rẻ.
+    /// crate, đúng pattern rust-daemon: poll try_recv() mỗi vòng lặp thay vì
+    /// đăng ký callback). Gọi mỗi frame — try_recv không chặn nên rẻ.
     fn xu_ly_su_kien_tray(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click { .. } = ev {
+            // VÌ SAO khớp CHÍNH XÁC Left + Up: TrayIconEvent::Click bắn cho
+            // MỌI nút chuột (trái/phải/giữa) và cả 2 trạng thái (Down rồi Up).
+            // Khớp lỏng (như bản cũ `Click { .. }`) khiến click PHẢI — vốn chỉ
+            // để mở menu — cũng vô tình kích hoạt "hiện cửa sổ". Left+Up là
+            // thời điểm chuẩn của một cú click hoàn chỉnh (giống double-click
+            // protection tự nhiên của OS).
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
                 self.an_cua_so = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if ev.id == self.tray_menu_mo.id().clone() {
+            // So id STRING tường minh (mẫu rust-daemon: match event.id.as_ref())
+            // thay vì so với MenuItem lưu sẵn — MenuId có impl PartialEq<&str>
+            // nên so trực tiếp với hằng &str, không cần .as_ref()/.to_string().
+            if ev.id == MENU_ID_MO {
                 self.an_cua_so = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if ev.id == self.tray_menu_thoat.id().clone() {
+            } else if ev.id == MENU_ID_THOAT {
                 // Thoát thật: đóng viewport gốc → eframe kết thúc vòng lặp.
                 std::process::exit(0);
             }
