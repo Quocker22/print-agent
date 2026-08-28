@@ -18,6 +18,28 @@ use std::sync::{Arc, Mutex};
 
 const NAMESPACE: &str = "/print-agent";
 
+/// Chu kỳ kiểm tra `trang_thai.da_noi` trong lúc giữ client sống.
+/// 5s đủ nhanh để phát hiện treo mà không tốn CPU (so với sleep(3600) mù trước đây).
+const CHU_KY_KIEM_TRA: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ngưỡng coi client là CHẾT HẲN khi `da_noi=false` liên tục quá lâu.
+/// VÌ SAO 60s: rust_socketio 0.6 (xem client/client.rs::poll_callback) tự
+/// phát hiện lỗi transport (EngineIO Error → Error::IncompleteResponseFromEngineIo)
+/// và tự gọi reconnect() nội bộ với backoff mặc định (1s→5s, thử vô hạn lần vì
+/// max_reconnect_attempts=None), rồi gắn lại đúng các callback on("open")/on("error")/
+/// on("job") vào client mới — nên "im lặng" vài giây/chục giây là chuyện BÌNH THƯỜNG,
+/// đang trong lúc thư viện tự nối lại, KHÔNG phải zombie. Nếu ta drop+connect() lại
+/// ngay ở lần error đầu tiên sẽ đá văng đúng lúc thư viện đang tự phục hồi (double-
+/// reconnect, tranh nhau). Ngưỡng 60s đủ rộng để qua nhiều vòng backoff của thư viện,
+/// nhưng vẫn đủ hẹp để không để khách chờ hoá đơn quá lâu khi:
+///
+/// - thread poll_callback nội bộ của thư viện CHẾT HẲN (panic/treo — lúc đó không gì
+///   tự nối lại nữa, chờ mãi cũng vô ích), hoặc
+/// - server không phản hồi "open" dù transport đã sống lại (kẹt nửa chừng).
+///
+/// Đây là lớp watchdog NGOÀI, bổ sung cho reconnect nội bộ của thư viện — không thay thế.
+const NGUONG_CHET_HAN: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Giờ:phút:giây hiện tại — đủ cho UI, không cần chính xác ms.
 /// VÌ SAO không dùng crate chrono: chỉ cần giờ địa phương dạng chuỗi ngắn,
 /// std::time đủ dùng, tránh thêm dependency chỉ cho 1 chỗ hiển thị.
@@ -80,7 +102,9 @@ pub fn chay_net(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) {
     let trang_thai_open = trang_thai.clone();
     let trang_thai_err = trang_thai.clone();
 
-    // reconnect tự động do ClientBuilder bật sẵn; nối vòng lặp lại nếu build lỗi.
+    // Vòng NGOÀI: build + connect() lại từ đầu mỗi khi client cũ bị coi là chết.
+    // rust_socketio tự reconnect ở TẦNG TRONG của nó (xem NGUONG_CHET_HAN ở trên);
+    // vòng ngoài này là watchdog dự phòng khi tầng trong không tự cứu được nữa.
     loop {
         eprintln!("[print-agent] đang nối {} ...", cfg.server_url);
         let trang_thai_open2 = trang_thai_open.clone();
@@ -108,10 +132,54 @@ pub fn chay_net(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) {
 
         match ket_noi {
             Ok(_client) => {
-                // connect() trả client sống; giữ thread sống, để callback chạy.
+                // connect() trả client sống. VÌ SAO _client khai báo TRONG vòng
+                // trong (không đẩy ra ngoài): khi vòng trong `break` để reconnect,
+                // _client ra khỏi scope và DROP ngay tại đây — đóng socket cũ
+                // trước khi ClientBuilder::connect() mới được gọi ở vòng ngoài,
+                // tránh rò socket (2 kết nối cùng auth token chồng nhau).
+                //
+                // Health-check thay cho sleep(3600) mù: kiểm trang_thai.da_noi
+                // mỗi CHU_KY_KIEM_TRA (5s). Đếm thời gian da_noi=false LIÊN TỤC;
+                // hễ đủ NGUONG_CHET_HAN (60s) thì coi client chết hẳn, thoát
+                // vòng trong để vòng ngoài connect() lại từ đầu. Mỗi lần thấy
+                // da_noi=true thì reset bộ đếm — chỉ tính CHUỖI mất kết nối
+                // liên tục, không cộng dồn qua nhiều lần rớt-nối ngắt quãng.
+                let mut mat_ket_noi_tu: Option<std::time::Instant> = None;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                    std::thread::sleep(CHU_KY_KIEM_TRA);
+
+                    let da_noi = match trang_thai.lock() {
+                        Ok(t) => t.da_noi,
+                        // Mutex poisoned (thread khác panic khi đang giữ khoá) —
+                        // coi như không rõ trạng thái, thà kiểm tiếp còn hơn
+                        // đoán bừa; vòng sau lock lại vẫn poisoned nên rơi vào
+                        // nhánh mất-kết-nối bên dưới qua giá trị mặc định false.
+                        Err(poisoned) => poisoned.into_inner().da_noi,
+                    };
+
+                    if da_noi {
+                        mat_ket_noi_tu = None;
+                        continue;
+                    }
+
+                    let luc_bat_dau_mat = *mat_ket_noi_tu.get_or_insert_with(std::time::Instant::now);
+                    let da_mat_bao_lau = luc_bat_dau_mat.elapsed();
+
+                    if da_mat_bao_lau >= NGUONG_CHET_HAN {
+                        eprintln!(
+                            "[print-agent] mất kết nối >{}s liên tục — coi client chết, nối lại từ đầu...",
+                            NGUONG_CHET_HAN.as_secs()
+                        );
+                        if let Ok(mut t) = trang_thai.lock() {
+                            t.thong_bao_cuoi = Some(format!(
+                                "mất kết nối >{}s, đang nối lại...",
+                                NGUONG_CHET_HAN.as_secs()
+                            ));
+                        }
+                        break; // thoát vòng trong → _client drop → vòng ngoài connect() lại
+                    }
                 }
+                // _client drop ở đây (cuối scope Ok(_client)).
             }
             Err(e) => {
                 eprintln!("[print-agent] nối thất bại: {} — thử lại sau 10s", e);
