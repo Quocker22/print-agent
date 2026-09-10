@@ -20,6 +20,7 @@ mod state;
 // ui::chay_ui() (thay bằng no-op) để `cargo check` pass cho Task 2 mà
 // KHÔNG đụng nội dung ui.rs — Task 5 bật lại module này khi viết lại.
 // mod ui;
+mod taskbar_win;
 mod view_model;
 
 use anyhow::Result;
