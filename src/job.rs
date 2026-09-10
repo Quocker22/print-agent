@@ -85,7 +85,7 @@ mod tests {
 
     fn cfg() -> Config {
         Config {
-            server_url: "u".into(), token: "t".into(), org_id: "o".into(),
+            server_url: "u".into(), token: "t".into(),
             printer_name: "HP".into(), tray: "tray-1".into(), paper_size: "A5".into(),
         }
     }

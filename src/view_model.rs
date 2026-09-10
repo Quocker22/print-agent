@@ -42,7 +42,7 @@ mod tests {
 
     fn cfg() -> Config {
         Config { server_url: "zalocrm.incokit.com".into(), token: "".into(),
-                 org_id: "shop1".into(), printer_name: "HP 4003".into(),
+                 printer_name: "HP 4003".into(),
                  tray: "tray-1".into(), paper_size: "A5".into() }
     }
 

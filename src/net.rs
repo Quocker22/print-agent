@@ -5,7 +5,7 @@
 //! UI + spawn thread này — UI đọc trạng thái qua `trang_thai` (Arc<Mutex>).
 //!
 //! Giao thức CHỐT (khớp backend/src/modules/ai/may-in/agent-ws.ts):
-//!   - namespace "/print-agent", auth {token, orgId}
+//!   - namespace "/print-agent", auth {token} (server tra token → máy + chi nhánh)
 //!   - server→agent event "job": {loai:"in", job:{id,pdfBase64,paperSize,tray,copies}}
 //!   - agent→server event "ket-qua": {jobId, trangThai:"da_in"|"loi", loiCuoi?}
 
@@ -58,8 +58,8 @@ fn gio_hien_tai() -> String {
 /// để UI (thread khác) đọc thấy ngay ở frame kế tiếp.
 pub fn chay_net(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) {
     eprintln!(
-        "[print-agent] khởi động — server={} org={} printer={:?} tray={} paper={}",
-        cfg.server_url, cfg.org_id, cfg.printer_name, cfg.tray, cfg.paper_size
+        "[print-agent] khởi động — server={} printer={:?} tray={} paper={}",
+        cfg.server_url, cfg.printer_name, cfg.tray, cfg.paper_size
     );
 
     let cfg_job = cfg.clone();
@@ -96,8 +96,9 @@ pub fn chay_net(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) {
         }
     };
 
-    // auth {token, orgId} — khớp handshake server đọc socket.handshake.auth.
-    let auth = serde_json::json!({ "token": cfg.token, "orgId": cfg.org_id });
+    // auth {token} — khớp handshake server đọc socket.handshake.auth (server
+    // tra token trong bảng print_agents → biết máy nào + chi nhánh nào).
+    let auth = serde_json::json!({ "token": cfg.token });
 
     let trang_thai_open = trang_thai.clone();
     let trang_thai_err = trang_thai.clone();

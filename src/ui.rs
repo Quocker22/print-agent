@@ -38,7 +38,7 @@
 //! (xem Cargo.toml + doc-comment ở đó) — ép chọn tường minh bằng
 //! BackendSelector ngay đầu chay_ui(), TRƯỚC khi tạo MainWindow.
 
-use crate::config::{self, Config, AGENT_TOKEN};
+use crate::config::{self, Config};
 use crate::net;
 use crate::printing;
 use crate::state::TrangThaiChung;
@@ -317,12 +317,11 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
     let trang_thai_dang_doc: Rc<RefCell<Arc<Mutex<TrangThaiChung>>>> =
         Rc::new(RefCell::new(trang_thai.clone()));
 
-    // Bơm giá trị ban đầu vào form Cấu hình (org_id hiển thị ở field "Mã shop"
-    // — context.md: "Token KHÔNG lấy từ form (dùng config::AGENT_TOKEN)", nên
-    // form không có field token, khớp .slint hiện tại (f_server/f_ma_shop/
-    // f_may_in/f_tray, không có f_token)).
+    // Bơm giá trị ban đầu vào form Cấu hình — token giờ dán tay từ trang
+    // ZaloCRM (gen 1 token riêng mỗi máy), KHÔNG còn hằng nhúng lúc build,
+    // nên form có field f_token đọc/ghi thẳng vào Config.token.
     window.set_f_server(cfg.server_url.clone().into());
-    window.set_f_ma_shop(cfg.org_id.clone().into());
+    window.set_f_token(cfg.token.clone().into());
     // 2 ComboBox: đổ danh sách TRƯỚC (máy in thật từ Get-Printer, khay cố định),
     // ghép giá trị config hiện tại vào nếu thiếu để không mất cấu hình cũ, RỒI
     // mới set current-value = giá trị config (ComboBox current-value <=> f_*).
@@ -350,10 +349,11 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
         });
     }
 
-    // Bài học #4 (on_luu): đọc form → dựng Config mới (token = AGENT_TOKEN,
-    // KHÔNG lấy từ form — ràng buộc chốt trong context.md) → ghi config.ini →
-    // spawn thread net MỚI với Mutex trạng thái MỚI → trỏ mọi tham chiếu đang
-    // dùng (cfg_dang_dung/trang_thai_dang_doc) sang cái mới → cập nhật tray.
+    // Bài học #4 (on_luu): đọc form → dựng Config mới (token đọc THẲNG từ
+    // form f_token — mỗi máy dán token riêng gen từ trang ZaloCRM, không còn
+    // hằng nhúng lúc build) → ghi config.ini → spawn thread net MỚI với Mutex
+    // trạng thái MỚI → trỏ mọi tham chiếu đang dùng (cfg_dang_dung/
+    // trang_thai_dang_doc) sang cái mới → cập nhật tray.
     {
         let w_weak = window.as_weak();
         let cfg_dang_dung = cfg_dang_dung.clone();
@@ -364,20 +364,19 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
 
             let cfg_moi = Config {
                 server_url: w.get_f_server().trim().to_string(),
-                token: AGENT_TOKEN.to_string(),
-                org_id: w.get_f_ma_shop().trim().to_string(),
+                token: w.get_f_token().trim().to_string(),
                 printer_name: w.get_f_may_in().trim().to_string(),
                 tray: w.get_f_tray().trim().to_string(),
                 paper_size: cfg_dang_dung.borrow().paper_size.clone(),
             };
 
             if cfg_moi.server_url.is_empty()
-                || cfg_moi.org_id.is_empty()
+                || cfg_moi.token.is_empty()
                 || cfg_moi.printer_name.is_empty()
             {
                 // Giữ nguyên thông báo bản egui cũ (validate field bắt buộc).
                 w.set_trang_thai_text(
-                    "Thiếu field bắt buộc (server_url/mã shop/máy in)".into(),
+                    "Thiếu field bắt buộc (server_url/token/máy in)".into(),
                 );
                 return;
             }

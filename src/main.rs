@@ -4,7 +4,7 @@
 //! Có UI Slint + tray icon (kiểu Tailscale: chạy ẩn ở khay hệ thống).
 //!
 //! Giao thức CHỐT (khớp backend/src/modules/ai/may-in/agent-ws.ts):
-//!   - namespace "/print-agent", auth {token, orgId}
+//!   - namespace "/print-agent", auth {token} (server tra token → máy + chi nhánh)
 //!   - server→agent event "job": {loai:"in", job:{id,pdfBase64,paperSize,tray,copies}}
 //!   - agent→server event "ket-qua": {jobId, trangThai:"da_in"|"loi", loiCuoi?}
 
@@ -27,7 +27,6 @@ fn config_rong() -> config::Config {
     config::Config {
         server_url: String::new(),
         token: String::new(),
-        org_id: String::new(),
         printer_name: String::new(),
         tray: "tray-1".to_string(),
         paper_size: "A5".to_string(),

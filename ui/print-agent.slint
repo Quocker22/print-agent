@@ -25,7 +25,7 @@ export component MainWindow inherits Window {
     in property <string> may_in: "";
     in property <[JobRow]> jobs: [];
     in-out property <string> f_server: "";
-    in-out property <string> f_ma_shop: "";
+    in-out property <string> f_token: "";
     in-out property <string> f_may_in: "";
     in-out property <string> f_tray: "";
     // Danh sách cho 2 ComboBox — Rust bơm vào lúc khởi tạo. Máy in: lấy thật từ
@@ -110,8 +110,8 @@ export component MainWindow inherits Window {
                 padding: 14px; spacing: 10px;
                 Text { text: "Server URL"; color: #69727F; font-size: 11px; }
                 LineEdit { text <=> root.f_server; }
-                Text { text: "Mã shop"; color: #69727F; font-size: 11px; }
-                LineEdit { text <=> root.f_ma_shop; }
+                Text { text: "Token"; color: #69727F; font-size: 11px; }
+                LineEdit { text <=> root.f_token; }
                 Text { text: "Máy in"; color: #69727F; font-size: 11px; }
                 ComboBox {
                     model: root.ds_may_in;
