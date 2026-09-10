@@ -62,24 +62,117 @@ const MENU_ID_THOAT: &str = "thoat";
 /// Giữ nguyên hằng từ bản egui cũ.
 const CONFIG_PATH: &str = "config.ini";
 
-/// Sinh icon RGBA đặc 1 màu, kích thước NxN — GIỮ NGUYÊN từ bản egui cũ (xem
-/// doc-comment gốc: tự dựng buffer RGBA compile-time thay vì include_bytes! 1
-/// PNG, không có bước decode nào có thể lỗi).
-fn icon_mau(r: u8, g: u8, b: u8) -> Icon {
+/// Vẽ icon HÌNH MÁY IN 32x32 (nền trong suốt), tô theo màu trạng thái `(r,g,b)`
+/// — xanh = đã nối, đỏ = mất kết nối. Thay ô vuông đặc 1 màu của bản egui cũ
+/// (anh Quốc: "icon xấu quá"). Tự dựng buffer RGBA trong code (không include_bytes!
+/// PNG → không bước decode nào lỗi được, giữ ưu điểm bản cũ).
+///
+/// Hình: thân máy in (chữ nhật bo nhẹ) + khe giấy phía trên + tờ giấy trắng nhô
+/// ra khỏi khe + 1 chấm đèn nhỏ. Toàn bộ nét vẽ dùng màu trạng thái để icon khay
+/// nhìn là thấy ngay xanh/đỏ; giấy để trắng cho tương phản.
+fn icon_may_in(r: u8, g: u8, b: u8) -> Icon {
     const N: u32 = 32;
-    let mut img = image::RgbaImage::new(N, N);
-    for px in img.pixels_mut() {
-        *px = image::Rgba([r, g, b, 255]);
+    let mau = image::Rgba([r, g, b, 255]);
+    let trang = image::Rgba([255, 255, 255, 255]);
+    let trong = image::Rgba([0, 0, 0, 0]);
+    let mut img = image::RgbaImage::from_pixel(N, N, trong);
+
+    let mut set = |x: i32, y: i32, px: image::Rgba<u8>| {
+        if (0..N as i32).contains(&x) && (0..N as i32).contains(&y) {
+            img.put_pixel(x as u32, y as u32, px);
+        }
+    };
+    let fill = |set: &mut dyn FnMut(i32, i32, image::Rgba<u8>),
+                x0: i32, y0: i32, x1: i32, y1: i32, px: image::Rgba<u8>| {
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                set(x, y, px);
+            }
+        }
+    };
+
+    // Thân máy in: chữ nhật đặc (bo góc bằng cách chừa 4 pixel góc).
+    fill(&mut set, 5, 13, 26, 24, mau);
+    for &(cx, cy) in &[(5, 13), (26, 13), (5, 24), (26, 24)] {
+        set(cx, cy, trong); // bo 4 góc thân
     }
+    // Tờ giấy TRÊN (đầu vào) — nhô lên khỏi thân, để trắng.
+    fill(&mut set, 9, 7, 22, 12, trang);
+    // Viền giấy trên bằng màu trạng thái cho rõ nét trên nền sáng.
+    fill(&mut set, 9, 7, 22, 7, mau);
+    fill(&mut set, 9, 7, 9, 12, mau);
+    fill(&mut set, 22, 7, 22, 12, mau);
+    // Tờ giấy RA (đầu ra) — nhô xuống dưới thân, để trắng có viền.
+    fill(&mut set, 10, 24, 21, 29, trang);
+    fill(&mut set, 10, 29, 21, 29, mau);
+    fill(&mut set, 10, 24, 10, 29, mau);
+    fill(&mut set, 21, 24, 21, 29, mau);
+    // Vài dòng "chữ" trên tờ giấy ra (nét màu) — gợi hình đơn in.
+    fill(&mut set, 12, 26, 19, 26, mau);
+    fill(&mut set, 12, 28, 17, 28, mau);
+    // Chấm đèn nguồn trên thân (trắng) để icon sinh động.
+    fill(&mut set, 23, 15, 24, 16, trang);
+
     Icon::from_rgba(img.into_raw(), N, N).expect("icon RGBA hợp lệ (buffer đúng NxN*4 byte)")
 }
 
 fn icon_xanh() -> Icon {
-    icon_mau(0x2e, 0xa0, 0x4a) // xanh lá — đã nối server
+    icon_may_in(0x2e, 0xa0, 0x4a) // xanh lá — đã nối server
 }
 
 fn icon_do() -> Icon {
-    icon_mau(0xc0, 0x39, 0x2b) // đỏ — mất kết nối
+    icon_may_in(0xc0, 0x39, 0x2b) // đỏ — mất kết nối
+}
+
+/// Danh sách khay cố định cho ComboBox "Khay" — khớp printing::tray_sang_bin
+/// (tray-1..tray-4 là các bin hợp lệ driver thường có).
+const DANH_SACH_KHAY: &[&str] = &["tray-1", "tray-2", "tray-3", "tray-4"];
+
+/// Liệt kê tên máy in đã cài trên máy (Windows) để đổ vào ComboBox "Máy in" —
+/// NV chọn thay vì gõ tay (gõ sai 1 ký tự là in fail; tên PHẢI khớp Get-Printer
+/// vì lệnh in dùng đúng tên đó). Dùng `Get-Printer` qua PowerShell: cùng nguồn
+/// tên với đường in thật, không cần thêm Win32 EnumPrinters API.
+///
+/// Trả Vec rỗng nếu chạy được lệnh nhưng không có máy in, hoặc nếu gọi lỗi
+/// (không phải Windows / PowerShell không có) — UI sẽ ghép giá trị config hiện
+/// tại vào để không mất cấu hình cũ.
+#[cfg(windows)]
+fn liet_ke_may_in() -> Vec<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000; // đừng nháy cửa sổ console
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Printer | Select-Object -ExpandProperty Name",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(not(windows))]
+fn liet_ke_may_in() -> Vec<String> {
+    Vec::new()
+}
+
+/// Ghép giá trị `hien_tai` (từ config) vào đầu `ds` nếu chưa có — để ComboBox
+/// luôn hiển thị đúng cấu hình đang lưu kể cả khi máy in đó không còn trong
+/// danh sách liệt kê (đã tháo, đổi tên...). Trả về ModelRc để set vào .slint.
+fn model_co_gia_tri_hien_tai(mut ds: Vec<String>, hien_tai: &str) -> ModelRc<slint::SharedString> {
+    if !hien_tai.is_empty() && !ds.iter().any(|s| s == hien_tai) {
+        ds.insert(0, hien_tai.to_string());
+    }
+    let hang: Vec<slint::SharedString> = ds.into_iter().map(Into::into).collect();
+    ModelRc::new(VecModel::from(hang))
 }
 
 /// Trạng thái tray-icon (icon/menu) — tách khỏi state chung vì chỉ dùng trong
@@ -230,6 +323,14 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
     // f_may_in/f_tray, không có f_token)).
     window.set_f_server(cfg.server_url.clone().into());
     window.set_f_ma_shop(cfg.org_id.clone().into());
+    // 2 ComboBox: đổ danh sách TRƯỚC (máy in thật từ Get-Printer, khay cố định),
+    // ghép giá trị config hiện tại vào nếu thiếu để không mất cấu hình cũ, RỒI
+    // mới set current-value = giá trị config (ComboBox current-value <=> f_*).
+    window.set_ds_may_in(model_co_gia_tri_hien_tai(liet_ke_may_in(), &cfg.printer_name));
+    window.set_ds_khay(model_co_gia_tri_hien_tai(
+        DANH_SACH_KHAY.iter().map(|s| s.to_string()).collect(),
+        &cfg.tray,
+    ));
     window.set_f_may_in(cfg.printer_name.clone().into());
     window.set_f_tray(cfg.tray.clone().into());
     bom_view_model(&window, &cfg, &trang_thai.lock().expect("mutex trang_thai không bị poison"));
