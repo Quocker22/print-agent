@@ -16,7 +16,15 @@ serde_json = "1"
 base64 = "0.22"
 anyhow = "1"
 # UI (Slint) — cửa sổ cấu hình + trạng thái, kiểu Tailscale. Thay egui/eframe.
-slint = "1.8"
+# raw-window-handle-06: cần để lấy HWND thật (Window::window_handle()) rồi gọi
+# taskbar_win::an_khoi_taskbar — Slint không có API ẩn taskbar sẵn (xem
+# taskbar_win.rs), phải xuống Win32 qua raw-window-handle. Không tắt default
+# features (renderer-software/backend-default đã bật sẵn theo mặc định crate).
+slint = { version = "1.8", features = ["raw-window-handle-06"] }
+# Cần trực tiếp (không chỉ qua feature slint) để `use raw_window_handle::HasWindowHandle`
+# resolve được — bài học từ slint-ui/slint#5319 (feature bật ở slint không đủ,
+# IDE/compiler cần crate này khai trực tiếp trong Cargo.toml của binary).
+raw-window-handle = "0.6"
 # Tray icon (khay hệ thống) — icon xanh/đỏ theo trạng thái nối, menu phải chuột.
 tray-icon = "0.24"
 # Dựng icon tray từ buffer RGBA — image chỉ dùng để build ảnh vuông đơn giản,
