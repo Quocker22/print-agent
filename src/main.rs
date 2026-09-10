@@ -14,6 +14,7 @@ mod net;
 mod printing;
 mod state;
 mod ui;
+mod view_model;
 
 use anyhow::Result;
 use state::TrangThaiChung;
