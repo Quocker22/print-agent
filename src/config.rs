@@ -4,6 +4,13 @@
 
 use anyhow::{bail, Result};
 
+/// Token agent nhúng lúc build: `AGENT_TOKEN=<token> cargo build`.
+/// Khi thiếu env lúc build → rỗng (net.rs auth fail rõ ràng, không âm thầm sai).
+pub const AGENT_TOKEN: &str = match option_env!("AGENT_TOKEN") {
+    Some(t) => t,
+    None => "",
+};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub server_url: String,
@@ -60,7 +67,10 @@ pub fn parse_config(text: &str) -> Result<Config> {
 
     Ok(Config {
         server_url: bat_buoc("server_url")?,
-        token: bat_buoc("token")?,
+        token: {
+            let v = get("token");
+            if v.is_empty() { AGENT_TOKEN.to_string() } else { v }
+        },
         org_id: bat_buoc("org_id")?,
         printer_name: bat_buoc("printer_name")?,
         tray: {
@@ -84,12 +94,11 @@ pub fn ghi_config(cfg: &Config) -> String {
     format!(
         "[agent]\n\
          server_url = {}\n\
-         token = {}\n\
          org_id = {}\n\
          printer_name = {}\n\
          tray = {}\n\
          paper_size = {}\n",
-        cfg.server_url, cfg.token, cfg.org_id, cfg.printer_name, cfg.tray, cfg.paper_size
+        cfg.server_url, cfg.org_id, cfg.printer_name, cfg.tray, cfg.paper_size
     )
 }
 
@@ -126,8 +135,8 @@ mod tests {
 
     #[test]
     fn thieu_field_bat_buoc_bao_loi() {
-        let e = parse_config("[agent]\nserver_url = x\n").unwrap_err();
-        assert!(e.to_string().contains("token"));
+        let e = parse_config("[agent]\ntoken = t\n").unwrap_err();
+        assert!(e.to_string().contains("server_url"));
     }
 
     #[test]
@@ -146,11 +155,26 @@ mod tests {
     }
 
     #[test]
+    fn khong_co_token_thi_dung_gia_tri_default() {
+        // Config không có token → dùng AGENT_TOKEN (rỗng lúc test vì không set env)
+        let cfg_text = "[agent]\nserver_url = https://crm.example.com\norg_id = org1\nprinter_name = HP LaserJet\n";
+        let c = parse_config(cfg_text).unwrap();
+        assert_eq!(c.token, AGENT_TOKEN);
+        assert_eq!(c.token, ""); // AGENT_TOKEN rỗng khi không set env lúc build
+    }
+
+    #[test]
     fn ghi_config_roi_doc_lai_ra_dung_gia_tri() {
-        // round-trip: parse -> ghi -> parse lại phải ra cùng Config.
+        // round-trip: parse -> ghi -> parse lại phải ra cùng Config (tất cả field TRỪ token vì token không ghi).
         let c = parse_config(DU).unwrap();
         let text = ghi_config(&c);
         let c2 = parse_config(&text).unwrap();
-        assert_eq!(c, c2);
+        // So sánh tất cả field TRỪ token (vì token từ file là "tok123" nhưng ghi_config không ghi → parse lại sẽ = AGENT_TOKEN = "")
+        assert_eq!(c.server_url, c2.server_url);
+        assert_eq!(c.org_id, c2.org_id);
+        assert_eq!(c.printer_name, c2.printer_name);
+        assert_eq!(c.tray, c2.tray);
+        assert_eq!(c.paper_size, c2.paper_size);
+        // token không so sánh vì ghi_config bỏ nó
     }
 }
