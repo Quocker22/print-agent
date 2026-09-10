@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Trạng thái chia sẻ giữa thread net (socket.io) và UI (egui).
+//! Trạng thái chia sẻ giữa thread net (socket.io) và UI (Slint).
 //!
-//! VÌ SAO Arc<Mutex<..>> chứ không phải channel: UI cần ĐỌC LẠI trạng thái
-//! hiện tại mỗi frame (egui vẽ lại ~60fps theo kiểu immediate-mode), không
-//! phải "nhận sự kiện một lần" — Mutex đọc nhanh, khoá ngắn (chỉ trong lúc
-//! đọc/ghi struct, không giữ khoá qua I/O mạng) nên không đáng lo tranh chấp.
+//! VÌ SAO Arc<Mutex<..>>: State chia sẻ giữa net thread (ghi khi có job) và
+//! UI timer thread (đọc mỗi 300ms để cập nhật giao diện). Mutex đơn giản, khoá
+//! ngắn (chỉ trong lúc đọc/ghi struct), không giữ khoá qua I/O nên không đáng lo tranh chấp.
 
 /// Một dòng log job in gần đây, hiển thị trong UI "In gần đây".
 #[derive(Debug, Clone)]

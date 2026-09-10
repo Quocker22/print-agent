@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Print agent: nối ZaloCRM qua socket.io (namespace /print-agent), nhận event
 //! "job", in qua driver Windows, emit "ket-qua". Tự reconnect khi mất kết nối.
-//! Có UI egui + tray icon (kiểu Tailscale: chạy ẩn ở khay hệ thống).
+//! Có UI Slint + tray icon (kiểu Tailscale: chạy ẩn ở khay hệ thống).
 //!
 //! Giao thức CHỐT (khớp backend/src/modules/ai/may-in/agent-ws.ts):
 //!   - namespace "/print-agent", auth {token, orgId}
