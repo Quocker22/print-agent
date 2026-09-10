@@ -13,7 +13,13 @@ mod job;
 mod net;
 mod printing;
 mod state;
-mod ui;
+// TODO(task-5 ui-slint): ui.rs vẫn là egui/eframe cũ — không compile được
+// sau khi Task 2 đổi deps sang Slint (Cargo.toml đã bỏ egui/eframe). Việc
+// viết lại ui.rs bằng Slint (dùng MainWindow sinh từ ui/print-agent.slint)
+// thuộc phạm vi Task 5, không phải Task 2. Tạm bỏ `mod ui;` + lời gọi
+// ui::chay_ui() (thay bằng no-op) để `cargo check` pass cho Task 2 mà
+// KHÔNG đụng nội dung ui.rs — Task 5 bật lại module này khi viết lại.
+// mod ui;
 mod view_model;
 
 use anyhow::Result;
@@ -69,5 +75,9 @@ fn main() -> Result<()> {
     // bấm "Cấu hình..." trong menu tray để mở cửa sổ nhập. Khác bản trước
     // (hiện ngay nếu thiếu config): giữ đúng "khởi động chỉ có icon khay,
     // cửa sổ ẩn" theo yêu cầu, kể cả lần chạy đầu tiên chưa có config.ini.
-    ui::chay_ui(cfg, trang_thai).map_err(|e| anyhow::anyhow!("eframe lỗi: {}", e))
+    //
+    // TODO(task-5 ui-slint): ui::chay_ui() (egui) tạm vô hiệu hoá — xem ghi
+    // chú ở `mod ui;` phía trên. Task 5 nối lại bằng UI Slint (MainWindow).
+    let _ = (cfg, trang_thai);
+    Ok(())
 }

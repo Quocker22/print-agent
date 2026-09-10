@@ -1,0 +1,112 @@
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool }
+
+export component MainWindow inherits Window {
+    title: "Incokit Print Agent";
+    width: 400px;
+    background: #F4F6F9;
+
+    in property <bool> da_noi: false;
+    in property <string> trang_thai_text: "Mất kết nối";
+    in property <string> server: "";
+    in property <string> may_in: "";
+    in property <[JobRow]> jobs: [];
+    in-out property <string> f_server: "";
+    in-out property <string> f_ma_shop: "";
+    in-out property <string> f_may_in: "";
+    in-out property <string> f_tray: "";
+    callback luu();
+    callback in_thu();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 14px;
+
+        // Titlebar
+        HorizontalLayout {
+            alignment: space-between;
+            Text { text: "Incokit Print Agent"; font-size: 14px; font-weight: 600; color: #1B2432; vertical-alignment: center; }
+            Rectangle {
+                background: root.da_noi ? #E7F6EC : #FCE8E8;
+                border-radius: 16px;
+                horizontal-stretch: 0;
+                HorizontalLayout {
+                    padding-left: 10px; padding-right: 10px; spacing: 6px;
+                    Text {
+                        text: "● " + root.trang_thai_text;
+                        color: root.da_noi ? #16A34A : #C0392B;
+                        font-size: 12px; font-weight: 600; vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Status card
+        Rectangle {
+            background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
+            VerticalLayout {
+                padding: 14px; spacing: 10px;
+                HorizontalLayout { alignment: space-between;
+                    Text { text: "Server"; color: #69727F; font-size: 13px; }
+                    Text { text: root.server; color: #1B2432; font-size: 13px; font-weight: 500; }
+                }
+                HorizontalLayout { alignment: space-between;
+                    Text { text: "Máy in"; color: #69727F; font-size: 13px; }
+                    Text { text: root.may_in; color: #1B2432; font-size: 13px; font-weight: 500; }
+                }
+            }
+        }
+
+        // In gần đây
+        Text { text: "IN GẦN ĐÂY"; color: #69727F; font-size: 12px; font-weight: 600; }
+        Rectangle {
+            background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
+            height: 160px;
+            ScrollView {
+                VerticalLayout {
+                    for j in root.jobs: Rectangle {
+                        height: 44px;
+                        HorizontalLayout {
+                            padding: 11px; spacing: 10px; alignment: space-between;
+                            VerticalLayout {
+                                Text { text: j.so_hoa_don; color: #1B2432; font-size: 13px; font-weight: 500; }
+                                Text { text: j.khach; color: #69727F; font-size: 11px; }
+                            }
+                            Rectangle {
+                                background: j.da_in ? #E7F6EC : #FCE8E8; border-radius: 12px;
+                                HorizontalLayout { padding-left: 9px; padding-right: 9px;
+                                    Text { text: j.badge; color: j.da_in ? #16A34A : #C0392B; font-size: 11px; font-weight: 600; vertical-alignment: center; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cấu hình
+        Text { text: "CẤU HÌNH"; color: #69727F; font-size: 12px; font-weight: 600; }
+        Rectangle {
+            background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
+            VerticalLayout {
+                padding: 14px; spacing: 10px;
+                Text { text: "Server URL"; color: #69727F; font-size: 11px; }
+                LineEdit { text <=> root.f_server; }
+                Text { text: "Mã shop"; color: #69727F; font-size: 11px; }
+                LineEdit { text <=> root.f_ma_shop; }
+                Text { text: "Máy in"; color: #69727F; font-size: 11px; }
+                LineEdit { text <=> root.f_may_in; }
+                Text { text: "Khay"; color: #69727F; font-size: 11px; }
+                LineEdit { text <=> root.f_tray; }
+            }
+        }
+
+        // Actions
+        HorizontalLayout {
+            spacing: 10px;
+            Button { text: "In thử"; clicked => { root.in_thu(); } }
+            Button { text: "Lưu"; primary: true; clicked => { root.luu(); } }
+        }
+    }
+}
