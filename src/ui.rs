@@ -58,9 +58,18 @@ slint::include_modules!();
 const MENU_ID_CAU_HINH: &str = "cauhinh";
 const MENU_ID_THOAT: &str = "thoat";
 
-/// Đường dẫn config.ini thao tác trong UI (đọc lúc khởi động, ghi lúc bấm Lưu).
-/// Giữ nguyên hằng từ bản egui cũ.
-const CONFIG_PATH: &str = "config.ini";
+/// Đường dẫn config.ini để GHI lúc bấm Lưu — phải CẠNH exe (khớp chỗ main.rs
+/// đọc). Double-click từ Explorer có cwd khác nơi để exe, nên "config.ini"
+/// tương đối sẽ ghi lạc chỗ rồi lần sau đọc không thấy. Fallback tương đối nếu
+/// không lấy được đường dẫn exe.
+fn config_path() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("config.ini");
+        }
+    }
+    std::path::PathBuf::from("config.ini")
+}
 
 /// Vẽ icon HÌNH MÁY IN 32x32 (nền trong suốt), tô theo màu trạng thái `(r,g,b)`
 /// — xanh = đã nối, đỏ = mất kết nối. Thay ô vuông đặc 1 màu của bản egui cũ
@@ -381,7 +390,7 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
                 return;
             }
 
-            match std::fs::write(CONFIG_PATH, config::ghi_config(&cfg_moi)) {
+            match std::fs::write(config_path(), config::ghi_config(&cfg_moi)) {
                 Ok(()) => {
                     let cfg_moi = Arc::new(cfg_moi);
                     let trang_thai_moi = Arc::new(Mutex::new(TrangThaiChung::default()));
