@@ -111,13 +111,21 @@ pub fn in_pdf(
         return KetQuaIn::Loi(format!("{:#}", e));
     }
 
-    let ket_qua = in_va_xac_nhan(&tmp, printer, paper_size, tray, copies, job_id);
+    let ket_qua = in_va_xac_nhan(&tmp, printer, paper_size, tray, copies, job_id, |p, j, t| {
+        crate::spooler::theo_doi_job(p, j, t)
+    });
     let _ = std::fs::remove_file(&tmp); // dọn file tạm dù thành công hay lỗi
     ket_qua
 }
 
 /// Gọi SumatraPDF cho từng bản copy rồi poll spooler xác nhận. Tách riêng để
 /// `in_pdf` gọn — logic map exit-code/spooler nằm hết ở đây.
+///
+/// `hoi_spooler` TIÊM ĐƯỢC (thật = `spooler::theo_doi_job`, test = closure giả
+/// trả `KetQuaIn` bất kỳ) — ĐÂY LÀ CHỖ BẮT BUỘC PHẢI TIÊM ĐƯỢC: bug tìm thấy ở
+/// review round 1 (KhongRo bị nhánh `_ =>` nuốt thành Loi khi Sumatra exit≠0)
+/// chỉ lộ ra được khi test giả lập spooler trả KhongRo — không gọi Win32 thật
+/// thì không bao giờ tái tạo được ca này trên Mac/CI.
 fn in_va_xac_nhan(
     tmp: &std::path::Path,
     printer: &str,
@@ -125,6 +133,7 @@ fn in_va_xac_nhan(
     tray: &str,
     copies: u32,
     job_id: &str,
+    hoi_spooler: impl Fn(&str, &str, SystemTime) -> KetQuaIn,
 ) -> KetQuaIn {
     let sumatra = std::env::var("SUMATRA_PATH").unwrap_or_else(|_| SUMATRA_MAC_DINH.to_string());
     let submit_time = SystemTime::now();
@@ -145,13 +154,21 @@ fn in_va_xac_nhan(
             // thể khiến server retry và IN ĐÔI. Luôn hỏi spooler để quyết,
             // KHÔNG override bằng exit code — đúng yêu cầu "KHÔNG để exit
             // code override evidence spooler".
-            let kq_spooler = crate::spooler::theo_doi_job(printer, job_id, submit_time);
-            return match kq_spooler {
+            //
+            // BA nhánh riêng biệt — KHÔNG gộp `_ =>` (bug đã sửa ở review
+            // round 1): KhongRo phải CHẢY NGUYÊN VẸN ra ngoài, tuyệt đối
+            // không bị quy thành Loi chỉ vì "không phải DaIn". Quy Loi ở
+            // nhánh KhongRo sẽ khiến server coi là an toàn để retry —
+            // trong khi máy có thể ĐÃ nhả giấy (PRINTING quan sát được)
+            // rồi mất dấu — retry lúc đó CHÍNH LÀ IN ĐÔI.
+            return match hoi_spooler(printer, job_id, submit_time) {
                 KetQuaIn::DaIn => KetQuaIn::DaIn,
-                // Spooler cũng không có bằng chứng đã in → giờ mới an toàn
-                // quy về lỗi Sumatra (đúng yêu cầu §3: "sumatra exit≠0 VÀ
-                // spooler chưa từng observe PRINTING → Loi").
-                _ => KetQuaIn::Loi(format!(
+                KetQuaIn::KhongRo(ly_do) => KetQuaIn::KhongRo(ly_do),
+                // Spooler CŨNG không có bằng chứng đã bắt đầu in (Loi rõ
+                // ràng, ví dụ máy offline từ trước khi gọi Sumatra) → giờ
+                // mới an toàn quy về lỗi Sumatra (đúng yêu cầu §3: "sumatra
+                // exit≠0 VÀ spooler chưa từng observe PRINTING → Loi").
+                KetQuaIn::Loi(_) => KetQuaIn::Loi(format!(
                     "SumatraPDF lỗi (exit {:?}): {}",
                     out.status.code(),
                     String::from_utf8_lossy(&out.stderr)
@@ -164,7 +181,7 @@ fn in_va_xac_nhan(
         // gọi lại từ đầu mỗi vòng lặp) — chỉ bản CUỐI quyết định KetQuaIn trả
         // về caller; các bản giữa nếu KhongRo/Loi thì dừng ngay (không in
         // tiếp bản sau khi bản trước đã mơ hồ/lỗi, tránh in đôi/thiếu kiểm soát).
-        let kq = crate::spooler::theo_doi_job(printer, job_id, submit_time);
+        let kq = hoi_spooler(printer, job_id, submit_time);
         if !matches!(kq, KetQuaIn::DaIn) || lan == copies.max(1) - 1 {
             return kq;
         }
@@ -187,6 +204,13 @@ fn now_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// SUMATRA_PATH là biến môi trường TOÀN TIẾN TRÌNH — cargo test chạy
+    /// nhiều test song song trong cùng 1 process, nên 3 test set/unset biến
+    /// này PHẢI khoá tuần tự với nhau (không cần khoá với test khác vì không
+    /// test nào khác đọc/ghi SUMATRA_PATH).
+    static SUMATRA_PATH_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn tray2_sang_bin2() {
@@ -231,5 +255,98 @@ mod tests {
         assert_eq!(sanitize_job_id("abc-123_XYZ"), "abc-123_XYZ");
         assert_eq!(sanitize_job_id("a/b c*d"), "a_b_c_d");
         assert_eq!(sanitize_job_id(""), "unknown");
+    }
+
+    /// Sinh 1 script/batch nhỏ LUÔN exit 1 bất kể argv nhận được — dùng làm
+    /// "SumatraPDF giả" để test `in_va_xac_nhan` không cần binary in ấn thật.
+    /// KHÔNG dùng "cmd" trực tiếp: cmd.exe không argv sẽ mở shell tương tác
+    /// và TREO MÃI chờ stdin — nguy hiểm hơn cả không đúng, phải tự sinh
+    /// script có `exit 1` tường minh rồi trỏ SUMATRA_PATH vào đó.
+    fn tao_lenh_luon_that_bai() -> PathBuf {
+        if cfg!(windows) {
+            let p = std::env::temp_dir().join(format!("pa-test-fail-{}.cmd", now_id()));
+            std::fs::write(&p, "@echo off\r\nexit /b 1\r\n").unwrap();
+            p
+        } else {
+            let p = std::env::temp_dir().join(format!("pa-test-fail-{}.sh", now_id()));
+            std::fs::write(&p, "#!/bin/sh\nexit 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms).unwrap();
+            }
+            p
+        }
+    }
+
+    /// TÁI TẠO BUG review round 1: Sumatra exit≠0 NHƯNG spooler đã quan sát
+    /// "đã bắt đầu in rồi mất dấu" (KhongRo) — trước fix, nhánh `_ =>` gộp
+    /// KhongRo thành Loi ở đây, khiến server coi là an toàn để retry trong
+    /// khi máy có thể ĐÃ nhả giấy → IN ĐÔI. Sau fix: PHẢI giữ nguyên KhongRo.
+    #[test]
+    fn sumatra_that_bai_nhung_spooler_khong_ro_thi_giu_khong_ro_khong_duoc_thanh_loi() {
+        let _guard = SUMATRA_PATH_LOCK.lock().unwrap();
+        let script = tao_lenh_luon_that_bai();
+        let tmp = std::env::temp_dir().join(format!("pa-test-tmp-{}.pdf", now_id()));
+        std::fs::write(&tmp, b"%PDF-1.4").unwrap();
+        std::env::set_var("SUMATRA_PATH", &script);
+
+        let kq = in_va_xac_nhan(&tmp, "HP", "A5", "tray-1", 1, "job-x", |_p, _j, _t| {
+            KetQuaIn::KhongRo("da bat dau in nhung khong xac nhan duoc luc in xong".into())
+        });
+
+        std::env::remove_var("SUMATRA_PATH");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&script);
+
+        assert!(
+            matches!(kq, KetQuaIn::KhongRo(_)),
+            "BUG TAI XUAT HIEN: Sumatra exit!=0 + spooler KhongRo phai giu KhongRo (khong emit), \
+             KHONG duoc quy thanh Loi (retry = in doi). Got: {:?}",
+            kq
+        );
+    }
+
+    /// Đối chứng: Sumatra exit≠0 VÀ spooler CŨNG trả Loi rõ ràng (chưa từng
+    /// thấy PRINTING) → mới an toàn quy về Loi (retry được, chưa in gì).
+    #[test]
+    fn sumatra_that_bai_va_spooler_loi_ro_rang_thi_tra_loi() {
+        let _guard = SUMATRA_PATH_LOCK.lock().unwrap();
+        let script = tao_lenh_luon_that_bai();
+        let tmp = std::env::temp_dir().join(format!("pa-test-tmp-{}.pdf", now_id()));
+        std::fs::write(&tmp, b"%PDF-1.4").unwrap();
+        std::env::set_var("SUMATRA_PATH", &script);
+
+        let kq = in_va_xac_nhan(&tmp, "HP", "A5", "tray-1", 1, "job-y", |_p, _j, _t| {
+            KetQuaIn::Loi("may in offline tu truoc".into())
+        });
+
+        std::env::remove_var("SUMATRA_PATH");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&script);
+
+        assert!(matches!(kq, KetQuaIn::Loi(_)), "expect Loi, got {:?}", kq);
+    }
+
+    /// Đối chứng: Sumatra exit≠0 nhưng spooler lại có bằng chứng DaIn (race
+    /// hiếm — Sumatra trả lỗi trễ sau khi máy đã in xong) → vẫn phải DaIn,
+    /// không được hạ xuống Loi/KhongRo.
+    #[test]
+    fn sumatra_that_bai_nhung_spooler_thay_da_in_thi_tra_da_in() {
+        let _guard = SUMATRA_PATH_LOCK.lock().unwrap();
+        let script = tao_lenh_luon_that_bai();
+        let tmp = std::env::temp_dir().join(format!("pa-test-tmp-{}.pdf", now_id()));
+        std::fs::write(&tmp, b"%PDF-1.4").unwrap();
+        std::env::set_var("SUMATRA_PATH", &script);
+
+        let kq = in_va_xac_nhan(&tmp, "HP", "A5", "tray-1", 1, "job-z", |_p, _j, _t| KetQuaIn::DaIn);
+
+        std::env::remove_var("SUMATRA_PATH");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&script);
+
+        assert_eq!(kq, KetQuaIn::DaIn);
     }
 }
