@@ -16,6 +16,7 @@ mod config;
 mod job;
 mod net;
 mod printing;
+mod spooler;
 mod state;
 mod ui;
 mod taskbar_win;

@@ -39,6 +39,7 @@
 //! BackendSelector ngay đầu chay_ui(), TRƯỚC khi tạo MainWindow.
 
 use crate::config::{self, Config};
+use crate::job;
 use crate::net;
 use crate::printing;
 use crate::state::TrangThaiChung;
@@ -421,9 +422,16 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
         let cfg_dang_dung = cfg_dang_dung.clone();
         window.on_in_thu(move || {
             let cfg = cfg_dang_dung.borrow().clone();
-            let kq = printing::in_pdf(PDF_GIA, &cfg.printer_name, &cfg.paper_size, &cfg.tray, 1);
-            if let Err(e) = kq {
-                eprintln!("[print-agent] in thử lỗi: {}", e);
+            // "in-thu" (test) không phải job thật từ server nên không có
+            // job_id — dùng id tạm chỉ để spooler.rs (Phase 1 xác nhận in)
+            // có chuỗi khớp document name khi poll.
+            let kq = printing::in_pdf(PDF_GIA, &cfg.printer_name, &cfg.paper_size, &cfg.tray, 1, "in-thu");
+            match kq {
+                job::KetQuaIn::DaIn => {}
+                job::KetQuaIn::Loi(e) => eprintln!("[print-agent] in thử lỗi: {}", e),
+                job::KetQuaIn::KhongRo(ly_do) => {
+                    eprintln!("[print-agent] in thử không rõ kết quả: {}", ly_do)
+                }
             }
         });
     }

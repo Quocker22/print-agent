@@ -75,24 +75,53 @@ pub fn chay_net(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) {
             #[allow(deprecated)]
             Payload::String(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
         };
-        let in_fn = |pdf: &[u8], printer: &str, paper: &str, tray: &str, copies: u32| {
-            printing::in_pdf(pdf, printer, paper, tray, copies)
+        let in_fn = |pdf: &[u8], printer: &str, paper: &str, tray: &str, copies: u32, job_id: &str| {
+            printing::in_pdf(pdf, printer, paper, tray, copies, job_id)
         };
-        let kq = job::xu_ly_job(&val, &cfg, &in_fn);
-        eprintln!("[print-agent] job {} → {}", kq.job_id, kq.trang_thai);
+        // Lấy job_id sớm (kể cả khi xu_ly_job trả None) để log/ghi trạng thái
+        // vẫn nêu đúng job — payload có thể thiếu id nhưng ta cố gắng đọc thô.
+        let job_id_tho = val
+            .get("job")
+            .and_then(|j| j.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-        if let Ok(mut t) = trang_thai_job.lock() {
-            t.them_job(JobLog {
-                so_hoa_don: kq.job_id.clone(),
-                khach: None, // server hiện không gửi tên khách — xem state.rs, không bịa
-                trang_thai: kq.trang_thai.clone(),
-                luc: gio_hien_tai(),
-            });
-        }
+        match job::xu_ly_job(&val, &cfg, &in_fn) {
+            Some(kq) => {
+                eprintln!("[print-agent] job {} → {}", kq.job_id, kq.trang_thai);
 
-        // emit kết quả; lỗi emit (mất kết nối lúc gửi) để server tự dọn qua disconnect.
-        if let Ok(v) = serde_json::to_value(&kq) {
-            let _ = socket.emit("ket-qua", v);
+                if let Ok(mut t) = trang_thai_job.lock() {
+                    t.them_job(JobLog {
+                        so_hoa_don: kq.job_id.clone(),
+                        khach: None, // server hiện không gửi tên khách — xem state.rs, không bịa
+                        trang_thai: kq.trang_thai.clone(),
+                        luc: gio_hien_tai(),
+                    });
+                }
+
+                // emit kết quả; lỗi emit (mất kết nối lúc gửi) để server tự dọn qua disconnect.
+                if let Ok(v) = serde_json::to_value(&kq) {
+                    let _ = socket.emit("ket-qua", v);
+                }
+            }
+            None => {
+                // NGUYÊN TẮC CHỐNG IN ĐÔI: không chắc job đã in hay chưa →
+                // TUYỆT ĐỐI KHÔNG emit "ket-qua" (server tự suy "khong_ro",
+                // KHÔNG tự retry). Log structured để còn tra được sau này,
+                // và vẫn ghi trang_thai để UI "In gần đây" hiện có dòng này
+                // (nhãn "khong_ro" — KHÔNG BAO GIỜ ghi "da_in" ở nhánh này).
+                eprintln!("print_unknown job_uuid={} reason=khong_xac_nhan_duoc_spooler", job_id_tho);
+
+                if let Ok(mut t) = trang_thai_job.lock() {
+                    t.them_job(JobLog {
+                        so_hoa_don: job_id_tho,
+                        khach: None,
+                        trang_thai: "khong_ro".to_string(),
+                        luc: gio_hien_tai(),
+                    });
+                }
+            }
         }
     };
 
