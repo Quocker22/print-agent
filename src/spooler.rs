@@ -28,6 +28,16 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Thời gian tối đa chờ spooler xác nhận trước khi bỏ cuộc (→ KhongRo, không emit).
 pub const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Số lần quan sát VẮNG LIÊN TIẾP (sau khi đã thấy job đang in) để kết luận job
+/// đã rời hàng đợi vì IN XONG — xem §"Rời hàng đợi sạch" ở `suy_ket_qua`.
+///
+/// VÌ SAO 2 chứ không phải 1: `EnumJobs` có thể trả rỗng thoáng qua đúng lúc
+/// spooler đang cập nhật hàng đợi, một lần vắng đơn lẻ chưa đủ chắc. Hai lần
+/// liên tiếp (2 × POLL_INTERVAL = 1s) đủ loại nhiễu đó mà vẫn nhanh hơn nhiều
+/// so với chờ hết POLL_TIMEOUT. Đặt cao hơn nữa chỉ làm mỗi job chậm thêm mà
+/// không tăng độ chắc — job đã in xong thì không bao giờ quay lại hàng đợi.
+pub const SO_LAN_VANG_LA_XONG: usize = 2;
+
 /// Trạng thái máy in đọc từ PRINTER_INFO_2.Status tại một lần poll (rút gọn
 /// các cờ PRINTER_STATUS_* liên quan tới lỗi vật lý — offline/hết giấy/kẹt).
 /// Chỉ dùng trên Windows (nơi có PRINTER_INFO_2 thật) — gate cfg để tránh
@@ -71,18 +81,44 @@ pub enum TrangThaiJob {
 ///   KhongThay/LoiTruyVan ở giai đoạn này KHÔNG phải lỗi in — chỉ là chưa
 ///   quan sát được — tiếp tục poll; hết quan sát (hết thời gian) → KhongRo
 ///   (KHÔNG suy Loi vì có thể job in cực nhanh trước khi kịp thấy).
-/// - ĐÃ từng thấy DangIn (đã bắt đầu in tờ vật lý) rồi sau đó gặp bất kỳ điều
-///   mơ hồ nào (lỗi, mất dấu, hết thời gian) mà CHƯA thấy DaInXong → KhongRo
-///   (không emit gì — chống in đôi tuyệt đối, không suy Loi vì có thể tờ đã
-///   ra khỏi máy in trước khi lỗi được ghi nhận).
+/// - ĐÃ thấy DangIn rồi job RỜI HÀNG ĐỢI SẠCH (KhongThay liên tiếp đủ
+///   `SO_LAN_VANG_LA_XONG` lần, không kèm lỗi nào) → DaIn. Xem §"Rời hàng đợi
+///   sạch" bên dưới.
+/// - ĐÃ từng thấy DangIn (đã bắt đầu in tờ vật lý) rồi gặp lỗi, hoặc hết thời
+///   gian mà job VẪN CÒN trong hàng đợi → KhongRo (không emit gì — chống in đôi
+///   tuyệt đối, không suy Loi vì có thể tờ đã ra khỏi máy in trước khi lỗi được
+///   ghi nhận).
+///
+/// # Rời hàng đợi sạch = đã in xong
+///
+/// ĐO THẬT 18/09 trên máy build .207 (máy in ảo "Microsoft Print To PDF", poll
+/// 50ms): job đi `Spooling` ×7 → `Printing` ×3 → **biến mất**, và file PDF RA
+/// THẬT 310KB. Cờ `JOB_STATUS_PRINTED` **không xuất hiện lần nào**.
+///
+/// Windows xoá job khỏi hàng đợi NGAY khi in xong; `PRINTED` chỉ là trạng thái
+/// thoáng qua giữa hai lần poll, thường không bao giờ bắt được. Bản trước chỉ
+/// trả DaIn khi TRỰC TIẾP thấy `PRINTED` → mọi ca in thành công bình thường đều
+/// rơi vào KhongRo. Đó chính là 3 job `khong_ro` của máy HCM ngày 14–15/09:
+/// **giấy đã ra rồi mà hệ thống báo không rõ.**
+///
+/// Vì sao suy DaIn ở đây KHÔNG phá luật chống in đôi: job GẶP SỰ CỐ thì **nằm
+/// lại** hàng đợi kèm cờ lỗi (ERROR/PAPEROUT/OFFLINE/BLOCKED_DEVQ) — nhánh lỗi
+/// phía trên bắt trước và trả KhongRo. Chỉ job hoàn tất mới rời đi lặng lẽ.
+/// Đòi `SO_LAN_VANG_LA_XONG` lần vắng LIÊN TIẾP để loại nhiễu một-lần-đọc-hụt
+/// (EnumJobs có thể trả rỗng thoáng qua lúc spooler đang cập nhật).
+///
+/// Vẫn thận trọng ở chiều ngược lại: CHƯA từng thấy DangIn mà job không bao giờ
+/// xuất hiện → vẫn KhongRo, vì không có bằng chứng nào cho thấy đã in.
 pub fn suy_ket_qua(quan_sat: &[TrangThaiJob]) -> KetQuaIn {
     let mut da_thay_dang_in = false;
+    let mut vang_lien_tiep = 0_usize;
 
     for ts in quan_sat {
         match ts {
             TrangThaiJob::DaInXong => return KetQuaIn::DaIn,
             TrangThaiJob::DangIn => {
                 da_thay_dang_in = true;
+                vang_lien_tiep = 0; // còn thấy job → chuỗi vắng bị ngắt
             }
             TrangThaiJob::LoiJob(ly_do) | TrangThaiJob::MayInLoi(ly_do) => {
                 if da_thay_dang_in {
@@ -91,8 +127,18 @@ pub fn suy_ket_qua(quan_sat: &[TrangThaiJob]) -> KetQuaIn {
                     return KetQuaIn::Loi(format!("loi truoc khi in: {}", ly_do));
                 }
             }
-            TrangThaiJob::DangCho | TrangThaiJob::KhongThay | TrangThaiJob::LoiTruyVan => {
-                // Chưa có bằng chứng gì mới — tiếp tục xét quan sát kế tiếp.
+            TrangThaiJob::KhongThay => {
+                if da_thay_dang_in {
+                    vang_lien_tiep += 1;
+                    if vang_lien_tiep >= SO_LAN_VANG_LA_XONG {
+                        return KetQuaIn::DaIn;
+                    }
+                }
+            }
+            TrangThaiJob::DangCho | TrangThaiJob::LoiTruyVan => {
+                // Chưa có bằng chứng gì mới. LoiTruyVan KHÔNG tính là "vắng":
+                // ta không ĐỌC ĐƯỢC hàng đợi, khác hẳn với việc job đã rời đi.
+                vang_lien_tiep = 0;
             }
         }
     }
@@ -409,10 +455,55 @@ mod tests {
         assert!(matches!(kq, KetQuaIn::KhongRo(_)), "expect KhongRo, got {:?}", kq);
     }
 
+    /// ĐỔI HÀNH VI 18/09 (trước đây bài này khẳng định KhongRo — chính là bug).
+    ///
+    /// Đang in rồi job RỜI HÀNG ĐỢI SẠCH = ĐÃ IN XONG. Đo thật trên .207 (máy in
+    /// ảo, poll 50ms): Spooling ×7 → Printing ×3 → biến mất, file PDF RA THẬT
+    /// 310KB, `PRINTED` không xuất hiện lần nào. Giữ KhongRo ở đây nghĩa là MỌI
+    /// lần in thành công đều bị báo "không rõ" — đúng 3 job khong_ro của máy HCM
+    /// ngày 14–15/09, giấy đã ra mà hệ thống không biết.
     #[test]
-    fn c3_dang_in_roi_job_bien_mat_khong_ro() {
+    fn c3_dang_in_roi_job_roi_hang_doi_sach_la_da_in() {
         let kq = suy_ket_qua(&[DangIn, KhongThay, KhongThay]);
-        assert!(matches!(kq, KetQuaIn::KhongRo(_)));
+        assert_eq!(kq, KetQuaIn::DaIn, "rời hàng đợi sạch sau khi đang in = in xong");
+    }
+
+    /// PHẢN CHỨNG cho c3 — vắng MỘT lần chưa đủ kết luận.
+    /// `EnumJobs` có thể trả rỗng thoáng qua lúc spooler cập nhật; một lần vắng
+    /// rồi thấy lại job thì chuỗi phải bị ngắt, không được cộng dồn.
+    #[test]
+    fn c3b_vang_mot_lan_roi_thay_lai_thi_khong_tinh_la_xong() {
+        let kq = suy_ket_qua(&[DangIn, KhongThay, DangIn, KhongThay]);
+        assert!(matches!(kq, KetQuaIn::KhongRo(_)),
+            "1 lần vắng xen giữa không đủ; hết chuỗi mà job vẫn còn → KhongRo, got {:?}", kq);
+    }
+
+    /// PHẢN CHỨNG — không được suy DaIn khi CHƯA từng thấy job đang in.
+    /// Vắng ngay từ đầu nghĩa là không có bằng chứng nào cho thấy đã in.
+    #[test]
+    fn c3c_chua_tung_thay_dang_in_thi_vang_bao_nhieu_cung_khong_phai_da_in() {
+        let kq = suy_ket_qua(&[KhongThay, KhongThay, KhongThay, KhongThay]);
+        assert!(matches!(kq, KetQuaIn::KhongRo(_)),
+            "chưa thấy đang in thì vắng không chứng minh được gì, got {:?}", kq);
+    }
+
+    /// PHẢN CHỨNG — lỗi đọc hàng đợi KHÁC với job đã rời đi.
+    /// `LoiTruyVan` = ta không đọc được spooler; suy "chắc in xong rồi" ở đây là
+    /// mở đường báo da_in cho job có thể đang kẹt giấy.
+    #[test]
+    fn c3d_loi_truy_van_khong_duoc_tinh_la_roi_hang_doi() {
+        let kq = suy_ket_qua(&[DangIn, LoiTruyVan, LoiTruyVan, LoiTruyVan]);
+        assert!(matches!(kq, KetQuaIn::KhongRo(_)),
+            "không đọc được hàng đợi ≠ job đã in xong, got {:?}", kq);
+    }
+
+    /// PHẢN CHỨNG — job kẹt giấy NẰM LẠI hàng đợi kèm cờ lỗi, không rời đi.
+    /// Đây là lý do "rời hàng đợi sạch" an toàn: sự cố thì job còn đó.
+    #[test]
+    fn c3e_ket_giay_thi_van_khong_ro_khong_thanh_da_in() {
+        let kq = suy_ket_qua(&[DangIn, LoiJob("het giay"), KhongThay, KhongThay]);
+        assert!(matches!(kq, KetQuaIn::KhongRo(_)),
+            "gặp lỗi sau khi đang in phải KhongRo, không được thành DaIn, got {:?}", kq);
     }
 
     // --- D: job KHÔNG BAO GIỜ tìm thấy (Sumatra exit 0 nhưng in quá nhanh) → KhongRo ---
