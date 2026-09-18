@@ -342,6 +342,10 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
     ));
     window.set_f_may_in(cfg.printer_name.clone().into());
     window.set_f_tray(cfg.tray.clone().into());
+    // Đọc registry để ô tick hiện ĐÚNG CHIỀU thực tế, không mặc định false —
+    // hiển thị sai làm người dùng tưởng chưa bật rồi bấm tắt mất (xem
+    // tu_khoi_dong::dang_bat, nó còn đối chiếu đúng đường dẫn exe đang chạy).
+    window.set_f_tu_khoi_dong(crate::tu_khoi_dong::dang_bat());
     bom_view_model(&window, &cfg, &trang_thai.lock().expect("mutex trang_thai không bị poison"));
 
     // Tray phải dựng trên CÙNG thread + TRƯỚC khi event loop chạy (bài học #1).
@@ -356,6 +360,36 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
                 let _ = w.hide();
             }
             CloseRequestResponse::HideWindow
+        });
+    }
+
+    // Tự khởi động cùng Windows — áp dụng NGAY khi bấm, không chờ nút Lưu.
+    //
+    // VÌ SAO CÓ NÚT NÀY: máy in HCM im lặng hơn 3 ngày (15–18/09) chỉ vì không
+    // ai bật lại app sau khi tắt máy. Bot vẫn nhận lệnh in, vẫn nói "đã xếp
+    // hàng in", job chết lặng sau 5 phút, người phát hiện đầu tiên là KHÁCH.
+    //
+    // Ghi lỗi ra UI thay vì nuốt lặng: bấm nút mà không thấy gì đổi thì người
+    // dùng tưởng đã xong, và lần sau máy vẫn không tự lên.
+    {
+        let w_weak = window.as_weak();
+        window.on_doi_tu_khoi_dong(move |bat| {
+            let Some(w) = w_weak.upgrade() else { return };
+            match crate::tu_khoi_dong::dat(bat) {
+                Ok(()) => {
+                    w.set_loi_tu_khoi_dong(Default::default());
+                    // Đọc lại registry thay vì tin giá trị vừa ghi — nguồn sự
+                    // thật là registry, không phải ý định của ta.
+                    w.set_f_tu_khoi_dong(crate::tu_khoi_dong::dang_bat());
+                }
+                Err(e) => {
+                    eprintln!("[print-agent] đặt tự khởi động thất bại: {:#}", e);
+                    w.set_loi_tu_khoi_dong(format!("Không đặt được: {}", e).into());
+                    // Trả ô tick về trạng thái THẬT, không để nó hiện đã bật
+                    // trong khi registry chưa ghi được.
+                    w.set_f_tu_khoi_dong(crate::tu_khoi_dong::dang_bat());
+                }
+            }
         });
     }
 

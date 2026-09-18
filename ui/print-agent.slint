@@ -1,4 +1,4 @@
-import { Button, LineEdit, ComboBox, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit, ComboBox, ScrollView, CheckBox } from "std-widgets.slint";
 // Nhúng font Be Vietnam Pro (có dấu tiếng Việt) — font hệ thống mặc định của
 // Slint (mặc định "software renderer" dùng fontique) không đảm bảo có glyph
 // dấu Việt trên máy Windows Server thiếu font cài đặt. "Be Vietnam Pro" ở đây
@@ -33,8 +33,13 @@ export component MainWindow inherits Window {
     // đồng bộ ngược về f_may_in/f_tray để on_luu đọc như cũ.
     in property <[string]> ds_may_in: [];
     in property <[string]> ds_khay: [];
+    // Tự khởi động cùng Windows. Rust đọc registry lúc mở cửa sổ để đặt đúng
+    // chiều, và ghi lại khi người dùng bấm (xem src/tu_khoi_dong.rs).
+    in-out property <bool> f_tu_khoi_dong: false;
+    in property <string> loi_tu_khoi_dong: "";
     callback luu();
     callback in_thu();
+    callback doi_tu_khoi_dong(bool);
 
     VerticalLayout {
         padding: 16px;
@@ -121,6 +126,18 @@ export component MainWindow inherits Window {
                 ComboBox {
                     model: root.ds_khay;
                     current-value <=> root.f_tray;
+                }
+                // Bấm là áp dụng NGAY, không chờ nút Lưu: đây là cài đặt của
+                // máy chứ không phải của phiên in, và người dùng dễ tưởng đã
+                // bật rồi mà quên bấm Lưu.
+                CheckBox {
+                    text: "Khởi động cùng Windows";
+                    checked <=> root.f_tu_khoi_dong;
+                    toggled => { root.doi_tu_khoi_dong(self.checked); }
+                }
+                if root.loi_tu_khoi_dong != "": Text {
+                    text: root.loi_tu_khoi_dong;
+                    color: #C0392B; font-size: 11px; wrap: word-wrap;
                 }
             }
         }

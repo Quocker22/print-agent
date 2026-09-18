@@ -20,6 +20,7 @@ mod spooler;
 mod state;
 mod ui;
 mod taskbar_win;
+mod tu_khoi_dong;
 mod view_model;
 
 use anyhow::Result;

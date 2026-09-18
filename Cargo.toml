@@ -36,6 +36,9 @@ image = { version = "0.25", default-features = false }
 # thật — xem src/spooler.rs. JOB_INFO_2W/PRINTER_INFO_2W (windows 0.58) cần
 # CẢ Win32_Graphics_Gdi (field pDevMode) LẪN Win32_Security (pSecurityDescriptor)
 # để struct được định nghĩa (đã tra thẳng nguồn crate cục bộ, không đoán).
+# winreg: ghi HKCU\...\Run cho "tự khởi động cùng Windows" (src/tu_khoi_dong.rs).
+# Máy HCM im 3 ngày 15-18/09 chỉ vì không ai bật lại app sau khi tắt máy.
+winreg = "0.52"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
