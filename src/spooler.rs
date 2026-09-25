@@ -1008,12 +1008,19 @@ impl BoSauKhiRoi {
 
 /// Sau khi job rời hàng đợi sạch: đọc máy in tiếp tới khi `BoSauKhiRoi` kết
 /// luận (R5c; máy USB: U2). Mọi lần đọc vẫn báo trạng thái/sự cố ra ngoài NGAY.
-fn kiem_may_in_sau_khi_roi(sp: &mut dyn Spooler, nen: TapMa, bao: &dyn Fn(QuanSat)) -> (SauKhiRoi, bool) {
+fn kiem_may_in_sau_khi_roi(
+    sp: &mut dyn Spooler,
+    nen: TapMa,
+    job_id: &str,
+    vet: &mut VetJob,
+    bao: &dyn Fn(QuanSat),
+) -> (SauKhiRoi, bool) {
     let mut bo = BoSauKhiRoi::default();
     let bat_dau = std::time::Instant::now();
     loop {
         sp.cho(POLL_INTERVAL);
         let vong = sp.doc_vong();
+        vet.ghi("sau_roi", &vong, job_id);
         let chan_moi = bao_may_in(&vong, nen, bao).chan_moi;
         if let Some(kl) = bo.them(chan_moi, vong.usb.as_ref().map(DocUsb::tinh_trang)) {
             return (kl, bo.da_thay_dang_in());
@@ -1022,6 +1029,59 @@ fn kiem_may_in_sau_khi_roi(sp: &mut dyn Spooler, nen: TapMa, bao: &dyn Fn(QuanSa
             return (bo.het_gio(), bo.da_thay_dang_in());
         }
     }
+}
+
+/// Vết TỪNG hoá đơn (chủ yêu cầu 25/09 — "ghi log ra nhằm cải thiện sau này"):
+/// mỗi nhịp đọc ghi một dòng `vet_in` — cờ job của ta trong hàng đợi (+ số
+/// trang), cờ máy in, USB — dòng giống nhau liên tiếp được gộp (vẫn ghi lại mỗi
+/// `NHIP_GHI_LAI`), và một dòng KẾT cuối cùng. Đủ để dựng lại dòng thời gian
+/// "hàng đợi → máy in → giấy ra" của từng hoá đơn ở cửa hàng.
+struct VetJob {
+    id: String,
+    bat_dau: std::time::Instant,
+    gop: crate::usb_may_in::GopDong,
+}
+
+impl VetJob {
+    fn moi(job_id: &str) -> Self {
+        Self { id: job::rut_gon_job_id(job_id), bat_dau: std::time::Instant::now(), gop: Default::default() }
+    }
+
+    fn ghi(&mut self, giai_doan: &str, vong: &VongDoc, job_id: &str) {
+        let dong = format!("gd={} {}", giai_doan, mo_ta_vong(vong, job_id));
+        if let Some(d) = self.gop.them(&dong, std::time::Instant::now(), crate::usb_may_in::NHIP_GHI_LAI) {
+            nhat_ky::ghi("vet_in", &format!("job={} t={}ms {}", self.id, self.bat_dau.elapsed().as_millis(), d));
+        }
+    }
+
+    fn ket(&self, kq: &KetQuaIn) {
+        nhat_ky::ghi("vet_in", &format!("job={} t={}ms KET {:?}", self.id, self.bat_dau.elapsed().as_millis(), kq));
+    }
+}
+
+/// Một vòng đọc, gọn cho `vet_in`: `hd=[0x2010/p1] khac=0 may=0x0 usb=0x98/BUSY`.
+fn mo_ta_vong(vong: &VongDoc, job_id: &str) -> String {
+    let hd = match &vong.hang_doi {
+        None => "hd=?".to_string(),
+        Some(jobs) => {
+            let ta: Vec<String> =
+                jobs.iter().filter(|j| la_cua_job(j, job_id)).map(|j| format!("0x{:x}/p{}", j.status, j.trang_da_in)).collect();
+            let khac = jobs.len() - ta.len();
+            format!("hd=[{}] khac={}", if ta.is_empty() { "vang".to_string() } else { ta.join(",") }, khac)
+        }
+    };
+    let may = if vong.khong_tim_thay_may_in {
+        "khong_tim_thay".to_string()
+    } else {
+        vong.co_may_in.map_or_else(|| "?".to_string(), |c| format!("0x{:x}", c))
+    };
+    let usb = match (&vong.usb, vong.usb_khong_doc_duoc, vong.la_may_usb) {
+        (Some(d), _, _) => d.mo_ta_ngan(),
+        (None, true, _) => "KHONG_DOC_DUOC".to_string(),
+        (None, false, true) => "-".to_string(),
+        (None, false, false) => "khong_usb".to_string(),
+    };
+    format!("{} may={} usb={}", hd, may, usb)
 }
 
 /// Vòng theo dõi một job — viết trên trait `Spooler` để test được.
@@ -1053,9 +1113,11 @@ pub fn theo_doi_job_voi(
     let mut con_trong_hang_doi = false;
     // U1/U2: máy USB cục bộ? + lỗi USB ở lần đọc được USB gần nhất.
     let mut usb = UsbCuaJob::default();
+    let mut vet = VetJob::moi(job_id);
 
     loop {
         let vong = sp.doc_vong();
+        vet.ghi("theo_doi", &vong, job_id);
         usb.la_may_usb |= vong.la_may_usb;
         if let Some(d) = &vong.usb {
             usb.loi_cuoi = d.ma_su_co();
@@ -1120,12 +1182,16 @@ pub fn theo_doi_job_voi(
 
         for q in quan_sat {
             if let Some(kl) = bo_suy.them(q) {
-                return ket_thuc(sp, job_id, kl, &bo_suy, su_co_da_thay, con_trong_hang_doi, usb, bao);
+                let kq = ket_thuc(sp, job_id, kl, &bo_suy, su_co_da_thay, con_trong_hang_doi, usb, &mut vet, bao);
+                vet.ket(&kq);
+                return kq;
             }
         }
         if !con_thoi_gian() {
             let kl = bo_suy.het_gio();
-            return ket_thuc(sp, job_id, kl, &bo_suy, su_co_da_thay, con_trong_hang_doi, usb, bao);
+            let kq = ket_thuc(sp, job_id, kl, &bo_suy, su_co_da_thay, con_trong_hang_doi, usb, &mut vet, bao);
+            vet.ket(&kq);
+            return kq;
         }
         sp.cho(POLL_INTERVAL);
     }
@@ -1159,13 +1225,14 @@ fn ket_thuc(
     su_co_da_thay: Option<MaSuCo>,
     con_trong_hang_doi: bool,
     usb: UsbCuaJob,
+    vet: &mut VetJob,
     bao: &dyn Fn(QuanSat),
 ) -> KetQuaIn {
     match kl {
         // PRINTED trên máy USB chỉ nghĩa là byte cuối đã vào BỘ NHỚ máy in —
         // máy hết giấy vẫn giữ đó (giám sát 25/09): máy USB cũng phải qua U2.
         KetLuan::DaIn { qua_vang: false } if !usb.la_may_usb => KetQuaIn::DaIn,
-        KetLuan::DaIn { .. } => match kiem_may_in_sau_khi_roi(sp, bo_suy.nen, bao) {
+        KetLuan::DaIn { .. } => match kiem_may_in_sau_khi_roi(sp, bo_suy.nen, job_id, vet, bao) {
             (SauKhiRoi::Sach, _) => KetQuaIn::DaIn,
             (SauKhiRoi::SuCo(ma), _) => KetQuaIn::KhongRo(LyDo::co_loai(
                 format!(

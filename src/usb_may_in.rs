@@ -67,12 +67,13 @@ pub enum TinhTrangUsb {
     /// Máy báo lỗi (bit3 tắt hoặc bit5 bật): hết giấy / kẹt / mở nắp — hoá
     /// đơn đã gửi xuống đang nằm trong bộ nhớ máy chờ người xử lý.
     Loi(MaSuCo),
-    /// Không lỗi, `STATUS:BUSY` — đang nhận/in.
+    /// Không lỗi, `STATUS` KHÁC `IDLE` (`BUSY`, hoặc giá trị chưa đo — máy đang
+    /// "chuẩn bị in" chẳng hạn) — máy đang làm việc, CHƯA xong.
     DangIn,
     /// Không lỗi, `STATUS:IDLE` — rảnh, không còn gì trong máy.
     Ranh,
-    /// Không lỗi nhưng không biết đang in hay rảnh (máy không có `STATUS`,
-    /// hoặc giá trị chưa đo — vd `SLEEP`). KHÔNG đoán: coi như thiếu tin.
+    /// Không lỗi nhưng không có trường `STATUS` (máy không báo, hoặc hỏi chuỗi
+    /// 1284 trục trặc) — không biết đang in hay rảnh: thiếu tin.
     KhongLoi,
 }
 
@@ -84,12 +85,13 @@ impl DocUsb {
         if self.byte & BIT_KHONG_LOI == 0 {
             return TinhTrangUsb::Loi(MaSuCo::CanXuLy);
         }
-        // Chỉ hai giá trị ĐÃ ĐO mới được nghĩa; giá trị lạ không đoán là "rảnh"
-        // (báo `da_in` sớm) cũng không đoán là "đang in" (treo tới hết giờ).
+        // CHỈ `IDLE` (đã đo) mới là rảnh. Giá trị lạ = máy đang làm việc (25/09:
+        // 0.2.1 báo `da_in` lúc máy HP còn "Preparing print job" — không bao giờ
+        // đoán "xong" từ chữ chưa đo; tệ nhất là xác nhận muộn, không bao giờ sai).
         match self.status.as_deref() {
             Some("IDLE") => TinhTrangUsb::Ranh,
-            Some("BUSY") => TinhTrangUsb::DangIn,
-            _ => TinhTrangUsb::KhongLoi,
+            Some(_) => TinhTrangUsb::DangIn,
+            None => TinhTrangUsb::KhongLoi,
         }
     }
 
@@ -99,6 +101,11 @@ impl DocUsb {
             TinhTrangUsb::Loi(ma) => Some(ma),
             _ => None,
         }
+    }
+
+    /// Dạng ngắn cho vết từng hoá đơn: `0x98/BUSY`, `0x18/-` (không có STATUS).
+    pub fn mo_ta_ngan(&self) -> String {
+        format!("0x{:02X}/{}", self.byte, self.status.as_deref().unwrap_or("-"))
     }
 
     /// `chiTiet` cho nhật ký/ZaloCRM, vd
@@ -151,6 +158,35 @@ pub fn chuoi_1284(bo_dem: &[u8]) -> Option<String> {
     let het = khai.clamp(2, bo_dem.len());
     Some(String::from_utf8_lossy(&bo_dem[2..het]).into_owned())
 }
+
+/// Gộp các dòng nhật ký GIỐNG NHAU liên tiếp mà vẫn giữ mạch thời gian: dòng đổi
+/// thì ghi ngay; dòng giữ nguyên thì cứ `nhip` ghi lại một lần kèm số lần đã
+/// gộp. Dùng cho nhật ký đọc USB liên tục (mỗi 500 ms) và vết từng hoá đơn.
+#[derive(Debug, Default)]
+pub struct GopDong {
+    truoc: Option<String>,
+    lap: usize,
+    luc_ghi: Option<std::time::Instant>,
+}
+
+impl GopDong {
+    /// Dòng CẦN GHI bây giờ (`None` = gộp vào dòng trước).
+    pub fn them(&mut self, dong: &str, bay_gio: std::time::Instant, nhip: std::time::Duration) -> Option<String> {
+        let giong = self.truoc.as_deref() == Some(dong);
+        if giong && self.luc_ghi.is_some_and(|t| bay_gio.saturating_duration_since(t) < nhip) {
+            self.lap += 1;
+            return None;
+        }
+        let ra = if self.lap > 0 { format!("{} [+{} lan doc giong dong truoc]", dong, self.lap) } else { dong.to_string() };
+        self.truoc = Some(dong.to_string());
+        self.lap = 0;
+        self.luc_ghi = Some(bay_gio);
+        Some(ra)
+    }
+}
+
+/// Nhịp tối thiểu ghi lại dòng giữ nguyên (nhật ký USB liên tục, 25/09).
+pub const NHIP_GHI_LAI: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Kết quả một lần hỏi máy in theo cổng.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,8 +251,8 @@ pub fn dang_tam_ngung() -> bool {
 mod win {
     use super::*;
     use crate::nhat_ky;
-    use std::collections::HashSet;
     use std::sync::Mutex;
+    use std::time::Instant;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::FileSystem::{
@@ -232,14 +268,39 @@ mod win {
 
     /// Đường dẫn thiết bị đã dò được cho từng số cổng (dò registry mỗi 500 ms là thừa).
     static DA_DO: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
-    /// Mỗi (việc, cổng) chỉ ghi nhật ký MỘT lần — hàm này bị gọi mỗi 500 ms.
-    static DA_GHI: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
-    fn ghi_mot_lan(su_kien: &str, cong: u32, chu: &str) {
-        let khoa = format!("{}#{}", su_kien, cong);
-        let moi = DA_GHI.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(HashSet::new).insert(khoa);
-        if moi {
-            nhat_ky::ghi(su_kien, &format!("cong=USB{:03} {}", cong, chu));
+    /// Nhật ký USB LIÊN TỤC (chủ yêu cầu 25/09 — để cải thiện sau): MỌI lần hỏi
+    /// đều qua đây; dòng giống nhau liên tiếp được gộp nhưng cứ `NHIP_GHI_LAI`
+    /// ghi lại một lần. Chuỗi IEEE 1284 đầy đủ ghi mỗi khi nó đổi (có thể có
+    /// trường khác ngoài STATUS lúc máy "chuẩn bị in").
+    struct NhatKyCong {
+        cong: u32,
+        gop: GopDong,
+        chuoi_truoc: Option<String>,
+    }
+    static NHAT_KY: Mutex<Vec<NhatKyCong>> = Mutex::new(Vec::new());
+
+    fn ghi_lan_doc(cong: u32, dong: &str, chuoi_1284: Option<&str>) {
+        let mut ds = NHAT_KY.lock().unwrap_or_else(|p| p.into_inner());
+        let vi_tri = match ds.iter().position(|n| n.cong == cong) {
+            Some(i) => i,
+            None => {
+                ds.push(NhatKyCong { cong, gop: GopDong::default(), chuoi_truoc: None });
+                ds.len() - 1
+            }
+        };
+        let n = &mut ds[vi_tri];
+        let dong_ghi = n.gop.them(dong, Instant::now(), NHIP_GHI_LAI);
+        let chuoi_moi = chuoi_1284.filter(|c| n.chuoi_truoc.as_deref() != Some(*c)).map(str::to_string);
+        if let Some(c) = &chuoi_moi {
+            n.chuoi_truoc = Some(c.clone());
+        }
+        drop(ds);
+        if let Some(d) = dong_ghi {
+            nhat_ky::ghi("usb_doc", &format!("cong=USB{:03} {}", cong, d));
+        }
+        if let Some(c) = chuoi_moi {
+            nhat_ky::ghi("usb_1284", &format!("cong=USB{:03} {}", cong, c));
         }
     }
 
@@ -252,9 +313,9 @@ mod win {
         }
     }
 
-    /// Mở thiết bị với quyền 0 (chỉ hỏi trạng thái), đọc byte trạng thái +
-    /// trường STATUS. Không mở được / hỏi byte lỗi → `None`.
-    fn doc_thiet_bi(duong_dan: &str) -> Option<DocUsb> {
+    /// Một lần đọc thiết bị ĐẦY ĐỦ: (DocUsb, chuỗi 1284 thô) hoặc lý do hỏng
+    /// (để nhật ký nói đúng chỗ: mở thiết bị / hỏi byte / hỏi chuỗi).
+    fn doc_thiet_bi(duong_dan: &str) -> Result<(DocUsb, Option<String>), String> {
         let wide: Vec<u16> = duong_dan.encode_utf16().chain(std::iter::once(0)).collect();
         let h = unsafe {
             CreateFileW(
@@ -267,7 +328,7 @@ mod win {
                 HANDLE::default(),
             )
         }
-        .ok()?;
+        .map_err(|e| format!("khong mo duoc thiet bi ({})", e.code().0 & 0xFFFF))?;
         let h = Handle(h);
         let mut byte = [0u8; 1];
         let mut nhan: u32 = 0;
@@ -283,13 +344,13 @@ mod win {
                 None,
             )
         }
-        .ok()?;
+        .map_err(|e| format!("hoi byte trang thai loi ({})", e.code().0 & 0xFFFF))?;
         if nhan < 1 {
-            return None;
+            return Err("hoi byte trang thai: 0 byte".into());
         }
         let mut bo_dem = [0u8; 1024];
         let mut nhan_id: u32 = 0;
-        let status = unsafe {
+        let chuoi = unsafe {
             DeviceIoControl(
                 h.0,
                 IOCTL_USBPRINT_GET_1284_ID,
@@ -302,24 +363,21 @@ mod win {
             )
         }
         .ok()
-        .and_then(|_| chuoi_1284(&bo_dem[..(nhan_id as usize).min(bo_dem.len())]))
-        .and_then(|c| tach_status(&c));
-        Some(DocUsb { byte: byte[0], status })
+        .and_then(|_| chuoi_1284(&bo_dem[..(nhan_id as usize).min(bo_dem.len())]));
+        let status = chuoi.as_deref().and_then(tach_status);
+        Ok((DocUsb { byte: byte[0], status }, chuoi))
     }
 
     /// Mọi (số cổng, đường dẫn) usbmon đã ghi trong registry (kể cả thiết bị
     /// đã rút — người gọi thử mở để biết cái nào còn cắm).
-    fn cac_thiet_bi(cong: u32) -> Vec<(Option<u32>, String)> {
+    fn cac_thiet_bi() -> Result<Vec<(Option<u32>, String)>, String> {
         use winreg::enums::HKEY_LOCAL_MACHINE;
         use winreg::RegKey;
-        let goc = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(KHOA_THIET_BI) {
-            Ok(k) => k,
-            Err(e) => {
-                ghi_mot_lan("usb_khong_doc_duoc_registry", cong, &e.to_string());
-                return Vec::new();
-            }
-        };
-        goc.enum_keys()
+        let goc = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey(KHOA_THIET_BI)
+            .map_err(|e| format!("khong doc duoc registry DeviceClasses ({})", e))?;
+        Ok(goc
+            .enum_keys()
             .filter_map(Result::ok)
             .filter_map(|ten| {
                 let khoa = goc.open_subkey(&ten).ok()?;
@@ -332,42 +390,25 @@ mod win {
                 let so = tham_so.as_ref().and_then(|t| t.get_value::<u32, _>("Port Number").ok());
                 la_usb.then_some((so, duong_dan))
             })
-            .collect()
+            .collect())
     }
 
     /// Dò thiết bị của cổng `USB<cong>`: khoá registry có "Port Number" KHỚP mà mở
-    /// + hỏi được. Không có → `None` (không đoán thiết bị khác).
-    fn do_thiet_bi(cong: u32) -> Option<(String, DocUsb)> {
-        let ds = cac_thiet_bi(cong);
+    /// + hỏi được. Không có → lý do (không đoán thiết bị khác).
+    fn do_thiet_bi(cong: u32) -> Result<(String, DocUsb, Option<String>), String> {
+        let ds = cac_thiet_bi()?;
         let khop = thiet_bi_cua_cong(&ds, cong);
-        let ra = khop.iter().find_map(|d| doc_thiet_bi(d).map(|doc| (d.to_string(), doc)));
-        if ra.is_none() {
-            ghi_mot_lan("usb_khong_tim_thay_thiet_bi", cong, &format!("{} khoa khop so cong", khop.len()));
+        if khop.is_empty() {
+            return Err(format!("registry khong co thiet bi nao mang so cong {} ({} khoa)", cong, ds.len()));
         }
-        ra
-    }
-
-    /// Lần đọc gần nhất của mỗi cổng — chỉ để ghi nhật ký khi trạng thái ĐỔI
-    /// (dòng thời gian thật BUSY/IDLE/lỗi của máy ở cửa hàng, vài dòng mỗi hoá đơn).
-    static LAN_TRUOC: Mutex<Vec<(u32, Option<DocUsb>)>> = Mutex::new(Vec::new());
-
-    fn ghi_neu_doi(cong: u32, doc: Option<&DocUsb>) {
-        let mut ds = LAN_TRUOC.lock().unwrap_or_else(|p| p.into_inner());
-        let truoc = ds.iter_mut().find(|(c, _)| *c == cong);
-        let doi = match &truoc {
-            Some((_, t)) => t.as_ref() != doc,
-            None => true,
-        };
-        if !doi {
-            return;
+        let mut loi = Vec::new();
+        for d in &khop {
+            match doc_thiet_bi(d) {
+                Ok((doc, chuoi)) => return Ok((d.to_string(), doc, chuoi)),
+                Err(e) => loi.push(e),
+            }
         }
-        match truoc {
-            Some((_, t)) => *t = doc.cloned(),
-            None => ds.push((cong, doc.cloned())),
-        }
-        drop(ds);
-        let chu = doc.map_or_else(|| "khong doc duoc thiet bi".to_string(), DocUsb::mo_ta);
-        nhat_ky::ghi("usb_trang_thai", &format!("cong=USB{:03} {}", cong, chu));
+        Err(format!("{} khoa khop so cong, khong mo/hoi duoc: {}", khop.len(), loi.join("; ")))
     }
 
     /// Hỏi máy in (PRINTER_INFO_2W: `may_chu` = pServerName, `thuoc_tinh`,
@@ -380,24 +421,32 @@ mod win {
             return DocCong::TamNgung;
         }
         let da_do = DA_DO.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(s, _)| *s == so).map(|(_, d)| d.clone());
-        let doc = match da_do.as_deref().and_then(doc_thiet_bi) {
-            Some(doc) => Some(doc),
-            None => {
-                // Chưa dò, hoặc rút ra cắm lại có thể đổi đường dẫn — dò lại theo số cổng.
+        let ket_qua = match da_do.as_deref().map(doc_thiet_bi) {
+            Some(Ok(doc)) => Ok(doc),
+            // Chưa dò, hoặc rút ra cắm lại có thể đổi đường dẫn — dò lại theo số cổng.
+            _ => {
                 let moi = do_thiet_bi(so);
                 let mut nho = DA_DO.lock().unwrap_or_else(|p| p.into_inner());
                 nho.retain(|(s, _)| *s != so);
-                if let Some((duong_dan, _)) = &moi {
+                if let Ok((duong_dan, _, _)) = &moi {
                     if da_do.as_deref() != Some(duong_dan.as_str()) {
                         nhat_ky::ghi("usb_thiet_bi", &format!("cong=USB{:03} {}", so, duong_dan));
                     }
                     nho.push((so, duong_dan.clone()));
                 }
-                moi.map(|(_, doc)| doc)
+                moi.map(|(_, doc, chuoi)| (doc, chuoi))
             }
         };
-        ghi_neu_doi(so, doc.as_ref());
-        doc.map_or(DocCong::KhongDocDuoc, DocCong::Doc)
+        match ket_qua {
+            Ok((doc, chuoi)) => {
+                ghi_lan_doc(so, &doc.mo_ta(), chuoi.as_deref());
+                DocCong::Doc(doc)
+            }
+            Err(ly_do) => {
+                ghi_lan_doc(so, &format!("KHONG DOC DUOC: {}", ly_do), None);
+                DocCong::KhongDocDuoc
+            }
+        }
     }
 }
 
@@ -442,11 +491,14 @@ mod tests {
         assert_eq!(doc(0x18, Some("IDLE")).ma_su_co(), None);
     }
 
+    /// Chỉ IDLE là rảnh; chữ lạ = đang làm việc (không bao giờ "xong" sớm);
+    /// thiếu STATUS = thiếu tin.
     #[test]
-    fn status_la_hoac_thieu_khong_doan() {
+    fn status_la_la_dang_lam_viec_thieu_la_thieu_tin() {
         assert_eq!(doc(0x18, None).tinh_trang(), TinhTrangUsb::KhongLoi);
-        assert_eq!(doc(0x18, Some("SLEEP")).tinh_trang(), TinhTrangUsb::KhongLoi);
-        assert_eq!(doc(0x98, Some("PRINTING")).tinh_trang(), TinhTrangUsb::KhongLoi);
+        assert_eq!(doc(0x18, Some("SLEEP")).tinh_trang(), TinhTrangUsb::DangIn);
+        assert_eq!(doc(0x98, Some("PRINTING")).tinh_trang(), TinhTrangUsb::DangIn);
+        assert_eq!(doc(0x18, Some("WARMUP")).tinh_trang(), TinhTrangUsb::DangIn);
     }
 
     #[test]
@@ -531,5 +583,23 @@ mod tests {
         drop(a);
         assert!(dang_tam_ngung(), "còn b");
         drop(b);
+    }
+
+    /// Nhật ký USB liên tục: dòng đổi ghi ngay, dòng giữ nguyên gộp nhưng vẫn
+    /// ghi lại mỗi nhịp kèm số lần đã gộp.
+    #[test]
+    fn gop_dong_giu_mach_thoi_gian() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let nhip = Duration::from_secs(10);
+        let mut g = GopDong::default();
+        assert_eq!(g.them("0x18 IDLE", t0, nhip).as_deref(), Some("0x18 IDLE"));
+        for i in 1..=5 {
+            assert_eq!(g.them("0x18 IDLE", t0 + Duration::from_millis(500 * i), nhip), None);
+        }
+        assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(3), nhip).as_deref(), Some("0x98 BUSY [+5 lan doc giong dong truoc]"));
+        assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(4), nhip), None);
+        // Giữ nguyên quá nhịp → ghi lại.
+        assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(14), nhip).as_deref(), Some("0x98 BUSY [+1 lan doc giong dong truoc]"));
     }
 }
