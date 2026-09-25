@@ -129,19 +129,33 @@ pub enum TinhTrangUsb {
     /// Không lỗi nhưng không có trường `STATUS` (máy không báo, hoặc hỏi chuỗi
     /// 1284 trục trặc) — không biết đang in hay rảnh: thiếu tin.
     KhongLoi,
+    /// Máy HP dòng SPL BẬN nhưng KHÔNG phải bằng chứng đang in một tờ: `05`
+    /// khởi động/làm nóng, hoặc mã pha chưa đo (0.2.7, review): chỉ làm chậm
+    /// kết luận — thức dậy rồi về sẵn sàng mà không `04` KHÔNG phải "đã in".
+    Ban,
+    /// Máy HP dòng SPL mà lần hỏi trạng thái của hãng hỏng / thiếu byte: KHÔNG
+    /// có tin — không được lùi về 1284 STATUS (vô nghĩa trên dòng này).
+    ThieuTin,
 }
 
 impl DocUsb {
     /// Pha máy HP dòng SPL (`None` = máy không có trạng thái của hãng).
+    /// `Loi` CHỈ với đúng chữ ký lỗi đã đo (`byte1 = 03` — "0C 03 02 02" lúc
+    /// khay trống); `02` ở byte 2 mà byte 1 bình thường = mã chưa đo (review:
+    /// một lần đo không đủ để CHẶN in cả cửa hàng).
     pub fn pha_hp(&self) -> Option<PhaHp> {
         let b = byte_hex(self.hang.as_deref()?);
-        let pha = *b.get(2)?;
-        Some(match pha {
+        if b.len() < 8 {
+            return None;
+        }
+        if b[1] == 0x03 {
+            return Some(PhaHp::Loi);
+        }
+        Some(match b[2] {
             0x01 => PhaHp::SanSang,
             0x03 => PhaHp::Ngu,
             0x04 => PhaHp::DangChay,
             0x05 => PhaHp::KhoiDong,
-            0x02 => PhaHp::Loi,
             khac => PhaHp::ChuaDo(khac),
         })
     }
@@ -163,8 +177,14 @@ impl DocUsb {
             return match pha {
                 PhaHp::SanSang | PhaHp::Ngu => TinhTrangUsb::Ranh,
                 PhaHp::Loi => TinhTrangUsb::Loi(MaSuCo::CanXuLy),
-                PhaHp::DangChay | PhaHp::KhoiDong | PhaHp::ChuaDo(_) => TinhTrangUsb::DangIn,
+                // CHỈ `04` là bằng chứng máy đang in một tờ.
+                PhaHp::DangChay => TinhTrangUsb::DangIn,
+                PhaHp::KhoiDong | PhaHp::ChuaDo(_) => TinhTrangUsb::Ban,
             };
+        }
+        // Có hỏi trạng thái của hãng (máy HP dòng SPL) mà không giải được: thiếu tin.
+        if self.hang.is_some() {
+            return TinhTrangUsb::ThieuTin;
         }
         // CHỈ `IDLE` (đã đo) mới là rảnh. Giá trị lạ = máy đang làm việc (25/09:
         // 0.2.1 báo `da_in` lúc máy HP còn "Preparing print job" — không bao giờ
@@ -983,15 +1003,20 @@ mod tests {
         // Đang chạy job mà 1284 báo IDLE (21:43:08.7, 21:46:53.3) → đang in.
         assert_eq!(d("01 01 04 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::DangIn);
         assert_eq!(d("09 01 04 FF 46 00 00 00", "BUSY", day).tinh_trang(), TinhTrangUsb::DangIn);
-        // Khởi động sau nạp giấy (21:46:47) → đang in (chưa xong).
-        assert_eq!(d("01 01 05 FF 46 00 00 00", "BUSY", day).tinh_trang(), TinhTrangUsb::DangIn);
+        // Khởi động sau nạp giấy (21:46:47) → BẬN, không phải bằng chứng in.
+        assert_eq!(d("01 01 05 FF 46 00 00 00", "BUSY", day).tinh_trang(), TinhTrangUsb::Ban);
         assert_eq!(d("01 01 01 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::Ranh);
-        // Khay trống: hết giấy; lỗi hãng mà khay còn giấy: cần xử lý.
+        // Khay trống: hết giấy; chữ ký lỗi (byte1 = 03) mà khay còn giấy: cần xử lý.
         assert_eq!(d("0C 03 02 02 46 00 00 00", "IDLE", Some((150, 0))).tinh_trang(), TinhTrangUsb::Loi(MaSuCo::HetGiay));
         assert_eq!(d("0C 03 02 02 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::Loi(MaSuCo::CanXuLy));
-        // Mã chưa đo → đang làm việc, không bao giờ "xong".
+        // `02` ở byte 2 mà byte 1 bình thường: chưa đo — KHÔNG chặn in.
+        assert_eq!(d("01 01 02 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::Ban);
+        // Mã chưa đo → bận, không bao giờ "xong", không bằng chứng in.
         assert_eq!(d("01 01 07 FF 46 00 00 00", "IDLE", day).pha_hp(), Some(PhaHp::ChuaDo(7)));
-        assert_eq!(d("01 01 07 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::DangIn);
+        assert_eq!(d("01 01 07 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::Ban);
+        // Hỏi trạng thái hãng hỏng ("LOI(31)") / thiếu byte → thiếu tin, KHÔNG lùi về 1284.
+        assert_eq!(d("LOI(31)", "IDLE", day).tinh_trang(), TinhTrangUsb::ThieuTin);
+        assert_eq!(d("01 01", "IDLE", day).tinh_trang(), TinhTrangUsb::ThieuTin);
         // Không có trạng thái hãng (máy khác): luật 1284 cũ.
         let khac = DocUsb { byte: 0x18, status: Some("IDLE".into()), hang: None, khay: None, khay_1: None };
         assert_eq!(khac.pha_hp(), None);

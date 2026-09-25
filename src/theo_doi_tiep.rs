@@ -90,6 +90,9 @@ pub struct JobTheoDoiTiep {
     /// `Some` = job KHÔNG còn trong hàng đợi Windows mà nằm trong BỘ NHỚ máy in
     /// USB (U3) — kết luận theo trạng thái thiết bị, không theo hàng đợi.
     usb: Option<TheoDoiUsb>,
+    /// Số vòng CHỜ đọc được USB để chuyển sang theo dõi qua USB (máy USB mà
+    /// job đã PRINTED / rời hàng đợi nhưng thiết bị chưa đọc được) — 0.2.7.
+    lan_cho_usb: usize,
 }
 
 /// Theo dõi một hoá đơn nằm trong bộ nhớ máy in USB (U3). Máy HP Laser 107 ở
@@ -151,11 +154,19 @@ impl JobTheoDoiTiep {
             ket_luc: None,
             ket_khi_con_thay: None,
             usb: None,
+            lan_cho_usb: 0,
         }
     }
 
     /// Job nằm trong bộ nhớ máy in USB (U3) — `da_thay_loi`: máy đang báo lỗi
     /// lúc giao; `da_thay_in`: máy đã BUSY lúc giao (bận quá hạn).
+    /// Hoá đơn KẸT trong bộ nhớ máy vì MÁY LỖI (theo dõi qua USB và đã thấy
+    /// lỗi) — không phải chỉ in chậm (0.2.7, review): chỉ loại này hiện "trong
+    /// máy in", làm nghi ngờ hoá đơn kế tiếp, và KHÔNG được báo `da_in` lên server.
+    pub fn ket_do_loi(&self) -> bool {
+        self.usb.as_ref().is_some_and(|u| u.da_thay_loi)
+    }
+
     pub fn qua_usb(mut self, da_thay_loi: bool, da_thay_in: bool) -> Self {
         self.usb = Some(TheoDoiUsb { da_thay_loi, da_thay_in, ..TheoDoiUsb::default() });
         self
@@ -287,6 +298,7 @@ impl DanhSachTheoDoiTiep {
                     if da_xac_nhan_qua_usb {
                         if let Some(u) = job.usb.as_mut() {
                             u.da_thay_in = false;
+                            u.sach_chua_thay_in = 0;
                         }
                         con.push_back(job);
                     } else {
@@ -355,7 +367,13 @@ fn xet_mot_job(
     if !cua_ta.is_empty() {
         let status = cua_ta.iter().fold(0, |c, j| c | j.status);
         if status & co::JOB_STATUS_PRINTED != 0 {
-            return Some(KetLuanTiep::DaIn);
+            // Máy USB: PRINTED chỉ nghĩa byte cuối đã vào BỘ NHỚ máy in (như
+            // `spooler::ket_thuc`) — theo dõi tiếp qua USB, không `da_in` (0.2.7).
+            if !usb.la_may_usb {
+                return Some(KetLuanTiep::DaIn);
+            }
+            job.bang_chung.da_thay_in = true;
+            return chuyen_sang_usb(job, usb);
         }
         if cua_ta.iter().any(|j| spooler::da_bat_dau_in(j)) {
             job.bang_chung.da_thay_in = true;
@@ -387,13 +405,8 @@ fn xet_mot_job(
     // HCM) hoặc `Mat` (quản lý in lại → hai tờ khi nạp giấy).
     // Chỉ khi ĐANG đọc được USB: không đọc được (máy tắt, không quyền…) mà vẫn
     // chuyển thì job treo 12 giờ rồi bị nhắc "in lại" (giám sát vòng 2).
-    if usb.la_may_usb && usb.doc.is_some() && !job.bang_chung.da_thay_huy {
-        let u = job.usb.insert(TheoDoiUsb {
-            da_thay_loi: job.ket_khi_con_thay.is_some(),
-            ma_loi: job.ket_khi_con_thay,
-            ..TheoDoiUsb::default()
-        });
-        return xet_qua_usb(u, usb);
+    if usb.la_may_usb && !job.bang_chung.da_thay_huy {
+        return chuyen_sang_usb(job, usb);
     }
     Some(if job.bang_chung.da_thay_huy {
         KetLuanTiep::Mat(spooler::CHU_BI_HUY.into())
@@ -404,6 +417,31 @@ fn xet_mot_job(
     } else {
         KetLuanTiep::DaIn
     })
+}
+
+/// Số vòng chờ đọc được USB (≈ 10 s) trước khi bỏ cuộc — không đọc được
+/// thiết bị thì KHÔNG bao giờ đoán `da_in` (0.2.7, review Codex).
+pub const SO_LAN_CHO_USB: usize = 20;
+
+/// Job của máy USB đã hết đường theo dõi qua hàng đợi (PRINTED / rời hàng
+/// đợi) → theo dõi qua USB. HỎI mà không đọc được thiết bị `SO_LAN_CHO_USB`
+/// lần → `Mat` (kiểm tờ) — bản 0.2.6 rơi về luật cũ và có thể ra `da_in`.
+/// Vòng KHÔNG hỏi (job khác còn đang gửi, worker tạm ngừng đọc) không đếm —
+/// hàng đợi dài không được biến thành "mất hoá đơn"; trần là `GIU_TOI_DA`.
+fn chuyen_sang_usb(job: &mut JobTheoDoiTiep, usb: UsbVong<'_>) -> Option<KetLuanTiep> {
+    if usb.doc.is_none() {
+        if usb.khong_doc_duoc {
+            job.lan_cho_usb += 1;
+        }
+        return (job.lan_cho_usb >= SO_LAN_CHO_USB)
+            .then(|| KetLuanTiep::Mat("khong doc duoc may in USB — khong xac nhan duoc hoa don da in".into()));
+    }
+    let u = job.usb.insert(TheoDoiUsb {
+        da_thay_loi: job.ket_khi_con_thay.is_some(),
+        ma_loi: job.ket_khi_con_thay,
+        ..TheoDoiUsb::default()
+    });
+    xet_qua_usb(u, usb)
 }
 
 /// Một job trong bộ nhớ máy in USB (U3) — THUẦN.
@@ -451,6 +489,13 @@ fn xet_qua_usb(u: &mut TheoDoiUsb, usb: UsbVong<'_>) -> Option<KetLuanTiep> {
             true
         }
         TinhTrangUsb::KhongLoi => !u.co_status,
+        // HP bận không bằng chứng in (05 / mã chưa đo) — chờ; thiếu tin — chờ.
+        TinhTrangUsb::Ban => {
+            u.co_status = true;
+            u.sach_chua_thay_in = 0;
+            return None;
+        }
+        TinhTrangUsb::ThieuTin => return None,
     };
     if !sach {
         return None;
@@ -525,7 +570,7 @@ impl KhoTheoDoiTiep {
             .ds
             .ds
             .iter()
-            .filter(|j| j.la_qua_usb() && j.may_in_that(may_in) == may_in)
+            .filter(|j| j.ket_do_loi() && j.may_in_that(may_in) == may_in)
             .filter_map(|j| crate::state::print_job_id(&j.job_id).map(str::to_string))
             .collect()
     }
@@ -533,7 +578,7 @@ impl KhoTheoDoiTiep {
     /// Còn hoá đơn trong bộ nhớ máy `may_in` chưa có kết luận — máy CHƯA xong
     /// phần việc tồn (0.2.7: chưa báo "bình thường" để server nhả hoá đơn mới).
     pub fn co_hoa_don_trong_may(&self, may_in: &str) -> bool {
-        self.khoa().ds.ds.iter().any(|j| j.la_qua_usb() && j.may_in_that(may_in) == may_in)
+        self.khoa().ds.ds.iter().any(|j| j.ket_do_loi() && j.may_in_that(may_in) == may_in)
     }
 
     /// Luồng mới nhận quyền chủ — luồng cũ (lần chạy mạng trước) mất quyền và tự thoát.
@@ -1264,16 +1309,43 @@ mod tests {
         assert!(matches!(kl, Some(KetLuanTiep::Mat(_))), "{:?}", kl);
     }
 
-    /// Không đọc được USB lúc job rời hàng đợi → KHÔNG chuyển sang USB (treo 12 giờ
-    /// rồi nhắc in lại) — giữ luật cũ.
+    /// 0.2.7 (review Codex): không đọc được USB lúc job rời hàng đợi → CHỜ đọc
+    /// được tối đa `SO_LAN_CHO_USB` vòng (≈ 10 s, không treo 12 giờ) rồi `Mat`
+    /// (kiểm tờ). 0.2.6 rơi về luật cũ và báo `da_in` không bằng chứng.
     #[test]
-    fn u3_khong_doc_duoc_usb_luc_roi_hang_doi_giu_luat_cu() {
+    fn u3_khong_doc_duoc_usb_luc_roi_hang_doi_khong_bao_gio_da_in() {
         let t0 = Instant::now();
         let mut j = moi(da_in(), t0);
         assert_eq!(buoc(&mut j, &vong_may_usb(vec![job(7, JOB_STATUS_PRINTING)]), t0), None);
-        assert_eq!(buoc(&mut j, &vong_usb_mat(), t0), None);
-        assert_eq!(buoc(&mut j, &vong_usb_mat(), t0), Some(KetLuanTiep::DaIn));
+        let mut ra = None;
+        for _ in 0..SO_LAN_VANG_LA_XONG + SO_LAN_CHO_USB {
+            ra = buoc(&mut j, &vong_usb_mat(), t0);
+            if ra.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(ra, Some(KetLuanTiep::Mat(_))), "{:?}", ra);
         assert!(!j.la_qua_usb());
+    }
+
+    /// 0.2.7: máy USB — PRINTED trong hàng đợi chỉ là "byte đã vào bộ nhớ máy"
+    /// → chuyển theo dõi qua USB, KHÔNG `da_in`. Máy mạng thì như cũ.
+    #[test]
+    fn printed_tren_may_usb_khong_phai_da_in() {
+        let t0 = Instant::now();
+        let mut j = moi(da_in(), t0);
+        // Job khác còn đang gửi → chưa hỏi thiết bị: chờ, KHÔNG đếm là "mất".
+        for _ in 0..SO_LAN_CHO_USB * 3 {
+            assert_eq!(buoc(&mut j, &vong_may_usb(vec![job(7, JOB_STATUS_PRINTED), job(8, JOB_STATUS_PRINTING)]), t0), None);
+        }
+        assert!(!j.la_qua_usb());
+        // Hỏi được → chuyển sang theo dõi qua USB; máy đang chạy job 04 → chưa kết luận.
+        let mut v = vong_usb(USB_RANH);
+        v.hang_doi = Some(vec![job(7, JOB_STATUS_PRINTED)]);
+        assert_eq!(buoc(&mut j, &v, t0), None);
+        assert!(j.la_qua_usb(), "chuyển sang USB");
+        let mut j = moi(da_in(), t0);
+        assert_eq!(buoc(&mut j, &vong(1, vec![job(7, JOB_STATUS_PRINTED)]), t0), Some(KetLuanTiep::DaIn), "máy mạng");
     }
 
     /// 0.2.7 — phát lại đúng chuỗi USB của hoá đơn 134 sau khi nạp giấy (sự cố
@@ -1296,5 +1368,14 @@ mod tests {
         assert_eq!(buoc(&mut u, &d("01 01 05 FF 46 00 00 00", "BUSY", 150)), None, "21:46:47 khởi động");
         assert_eq!(buoc(&mut u, &d("01 01 04 FF 46 00 00 00", "IDLE", 150)), None, "21:46:53 — 0.2.6 báo đã in ở đây");
         assert_eq!(buoc(&mut u, &d("01 01 01 FF 46 00 00 00", "IDLE", 150)), Some(KetLuanTiep::DaIn), "về sẵn sàng");
+        // Máy chỉ THỨC DẬY rồi về sẵn sàng, không có `04` → KHÔNG "đã in" (review).
+        let mut u = TheoDoiUsb { da_thay_loi: true, ma_loi: Some(MaSuCo::HetGiay), ..TheoDoiUsb::default() };
+        for h in ["01 01 03 FF 46 00 00 00", "01 01 05 FF 46 00 00 00", "01 01 01 FF 46 00 00 00"] {
+            assert_eq!(buoc(&mut u, &d(h, "BUSY", 150)), None, "{h}");
+        }
+        // Đọc hỏng giữa chừng không bao giờ là "xong".
+        assert_eq!(buoc(&mut u, &d("01 01 04 FF 46 00 00 00", "IDLE", 150)), None);
+        assert_eq!(buoc(&mut u, &d("LOI(31)", "IDLE", 150)), None);
+        assert_eq!(buoc(&mut u, &d("01 01 01 FF 46 00 00 00", "IDLE", 150)), Some(KetLuanTiep::DaIn));
     }
 }

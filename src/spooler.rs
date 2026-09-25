@@ -996,6 +996,11 @@ impl BoSauKhiRoi {
                     return Some(SauKhiRoi::Sach);
                 }
             }
+            // Máy HP bận mà chưa phải bằng chứng in (05 / mã chưa đo): chờ tiếp.
+            Some(TinhTrangUsb::Ban) => {
+                self.co_status = true;
+                self.sach_chua_thay_in = 0;
+            }
             // Máy KHÔNG BAO GIỜ báo STATUS: chỉ biết "không lỗi" — đủ số lần sạch là xong.
             Some(TinhTrangUsb::KhongLoi) if !self.co_status => {
                 self.sach_chua_thay_in += 1;
