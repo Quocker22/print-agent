@@ -22,3 +22,31 @@ pub fn an_khoi_taskbar(hwnd: isize) {
 
 #[cfg(not(windows))]
 pub fn an_khoi_taskbar(_hwnd: isize) {}
+
+/// Nháy cửa sổ cho NV để ý khi máy in có sự cố (hợp đồng v2 §4.4).
+///
+/// Cửa sổ là WS_EX_TOOLWINDOW (không có nút taskbar — xem `an_khoi_taskbar`)
+/// nên phần FLASHW_TRAY không có gì để nháy; cái NV thấy là THANH TIÊU ĐỀ nháy
+/// (FLASHW_CAPTION), kéo dài tới khi cửa sổ được đưa lên trước (TIMERNOFG).
+/// Windows không cho app chạy nền giành focus, nên nháy là cách được phép để
+/// "gọi" người dùng.
+#[cfg(windows)]
+pub fn nhay_cua_so(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FlashWindowEx, FLASHWINFO, FLASHWINFO_FLAGS, FLASHW_ALL, FLASHW_TIMERNOFG,
+    };
+    let info = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd: HWND(hwnd as *mut core::ffi::c_void),
+        dwFlags: FLASHWINFO_FLAGS(FLASHW_ALL.0 | FLASHW_TIMERNOFG.0),
+        uCount: 0,
+        dwTimeout: 0,
+    };
+    unsafe {
+        let _ = FlashWindowEx(&info);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn nhay_cua_so(_hwnd: isize) {}

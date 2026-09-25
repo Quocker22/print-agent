@@ -11,7 +11,7 @@ import { Button, LineEdit, ComboBox, ScrollView, CheckBox } from "std-widgets.sl
 import "../assets/font-regular.ttf";
 import "../assets/font-semibold.ttf";
 
-export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool }
+export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool, khong_ro: bool, luc: string }
 
 export component MainWindow inherits Window {
     title: "Incokit Print Agent";
@@ -24,6 +24,15 @@ export component MainWindow inherits Window {
     in property <string> server: "";
     in property <string> may_in: "";
     in property <[JobRow]> jobs: [];
+    // Dải cảnh báo sự cố máy in (hợp đồng v2 §4.4) — Rust bật/tắt theo
+    // view_model::canh_bao. canh_bao_loi: đỏ (không in được) / vàng (mực yếu).
+    // Hai dòng: tiêu đề (hoá đơn nào, chuyện gì) + việc cần làm / ai in lại.
+    in property <bool> canh_bao_hien: false;
+    in property <bool> canh_bao_loi: true;
+    in property <string> canh_bao_tieu_de: "";
+    in property <string> canh_bao_chi_tiet: "";
+    // Dòng nhỏ dưới thẻ trạng thái (không phải dải đỏ) — vd server bản cũ (R12).
+    in property <string> thong_bao_phu: "";
     in-out property <string> f_server: "";
     in-out property <string> f_token: "";
     in-out property <string> f_may_in: "";
@@ -39,6 +48,7 @@ export component MainWindow inherits Window {
     in property <string> loi_tu_khoi_dong: "";
     callback luu();
     callback in_thu();
+    callback da_hieu();
     callback doi_tu_khoi_dong(bool);
 
     VerticalLayout {
@@ -64,6 +74,44 @@ export component MainWindow inherits Window {
             }
         }
 
+        // Dải cảnh báo — hiện tới khi máy in về bình thường. Dấu "!" vẽ bằng
+        // hình tròn + chữ thay cho ký tự ⚠: font nhúng Be Vietnam Pro không có
+        // glyph đó, máy shop thiếu font dự phòng sẽ hiện ô vuông.
+        if root.canh_bao_hien: Rectangle {
+            background: root.canh_bao_loi ? #FCE8E8 : #FFF6E0;
+            border-radius: 10px; border-width: 1px;
+            border-color: root.canh_bao_loi ? #E8A0A0 : #F2CC80;
+            HorizontalLayout {
+                padding: 12px; spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 22px; height: 22px; border-radius: 11px;
+                        background: root.canh_bao_loi ? #C0392B : #D68910;
+                        Text { text: "!"; color: white; font-size: 14px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 4px; horizontal-stretch: 1;
+                    Text {
+                        text: root.canh_bao_tieu_de;
+                        color: root.canh_bao_loi ? #8E1B12 : #7A5200;
+                        font-size: 13px; font-weight: 600; wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.canh_bao_chi_tiet;
+                        color: root.canh_bao_loi ? #8E1B12 : #7A5200;
+                        font-size: 12px; wrap: word-wrap;
+                    }
+                }
+                // NV đã đọc → tắt dải (dải cũng tự tắt khi hoá đơn in xong).
+                VerticalLayout {
+                    alignment: center;
+                    Button { text: "Đã hiểu"; clicked => { root.da_hieu(); } }
+                }
+            }
+        }
+
         // Status card
         Rectangle {
             background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
@@ -77,6 +125,10 @@ export component MainWindow inherits Window {
                     Text { text: "Máy in"; color: #69727F; font-size: 13px; }
                     Text { text: root.may_in; color: #1B2432; font-size: 13px; font-weight: 500; }
                 }
+                if root.thong_bao_phu != "": Text {
+                    text: root.thong_bao_phu;
+                    color: #7A5200; font-size: 11px; wrap: word-wrap;
+                }
             }
         }
 
@@ -87,19 +139,22 @@ export component MainWindow inherits Window {
             height: 160px;
             ScrollView {
                 VerticalLayout {
+                    // Dòng 1: số hoá đơn · khách (hoặc id job đã cắt token) + giờ.
+                    // Dòng 2: nhãn trạng thái — "Lỗi: <nhãn>" có thể dài nên nằm
+                    // riêng một dòng, cắt "…" nếu vượt bề ngang.
                     for j in root.jobs: Rectangle {
-                        height: 44px;
-                        HorizontalLayout {
-                            padding: 11px; spacing: 10px; alignment: space-between;
-                            VerticalLayout {
-                                Text { text: j.so_hoa_don; color: #1B2432; font-size: 13px; font-weight: 500; }
-                                Text { text: j.khach; color: #69727F; font-size: 11px; }
+                        height: 48px;
+                        VerticalLayout {
+                            padding-left: 11px; padding-right: 11px; padding-top: 6px; padding-bottom: 6px; spacing: 2px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: j.so_hoa_don; color: #1B2432; font-size: 13px; font-weight: 500; overflow: elide; horizontal-stretch: 1; }
+                                Text { text: j.luc; color: #69727F; font-size: 11px; horizontal-stretch: 0; vertical-alignment: center; }
                             }
-                            Rectangle {
-                                background: j.da_in ? #E7F6EC : #FCE8E8; border-radius: 12px;
-                                HorizontalLayout { padding-left: 9px; padding-right: 9px;
-                                    Text { text: j.badge; color: j.da_in ? #16A34A : #C0392B; font-size: 11px; font-weight: 600; vertical-alignment: center; }
-                                }
+                            Text {
+                                text: j.badge;
+                                color: j.da_in ? #16A34A : (j.khong_ro ? #B7791F : #C0392B);
+                                font-size: 11px; font-weight: 600; overflow: elide;
                             }
                         }
                     }

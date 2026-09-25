@@ -7,17 +7,22 @@
 //! "job", in qua driver Windows, emit "ket-qua". Tự reconnect khi mất kết nối.
 //! Có UI Slint + tray icon (kiểu Tailscale: chạy ẩn ở khay hệ thống).
 //!
-//! Giao thức CHỐT (khớp backend/src/modules/ai/may-in/agent-ws.ts):
-//!   - namespace "/print-agent", auth {token} (server tra token → máy + chi nhánh)
-//!   - server→agent event "job": {loai:"in", job:{id,pdfBase64,paperSize,tray,copies}}
-//!   - agent→server event "ket-qua": {jobId, trangThai:"da_in"|"loi", loiCuoi?}
+//! Giao thức: xem đầu net.rs (hợp đồng v2 — `cau-hinh`, `su-co`,
+//! `trang-thai-may-in`, `thong-tin-app`, `ket-qua` có `khong_ro`/`loai`).
 
+mod bao_cao;
 mod config;
+mod hop_thu_di;
 mod job;
+mod mot_ban;
 mod net;
+mod nhat_ky;
 mod printing;
 mod spooler;
 mod state;
+mod su_co;
+mod theo_doi_tiep;
+mod thoi_gian;
 mod ui;
 mod taskbar_win;
 mod tu_khoi_dong;
@@ -56,6 +61,16 @@ fn duong_dan_config() -> String {
 }
 
 fn main() -> Result<()> {
+    // Một máy một bản app (R7c): bản thứ hai (tự khởi động + NV bấm đúp) báo
+    // ngắn rồi thoát, không mở kết nối thứ hai cùng token.
+    let _khoa_mot_ban = match mot_ban::giu_mot_ban() {
+        Ok(k) => k,
+        Err(o_dau) => {
+            mot_ban::bao_da_chay(o_dau);
+            return Ok(());
+        }
+    };
+
     let config_path = duong_dan_config();
 
     // Đọc config nếu có; KHÔNG bail như bản CLI cũ — nếu thiếu/lỗi, mở UI với
@@ -76,15 +91,14 @@ fn main() -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let trang_thai = Arc::new(Mutex::new(TrangThaiChung::default()));
+    // Đường gửi lên backend dùng chung cho mọi lần chạy thread net (R4/R7):
+    // kết quả job in dở lúc bấm Lưu vẫn đi qua kết nối mới.
+    let duong_gui = Arc::new(hop_thu_di::DuongGui::default());
 
     // Chỉ spawn thread net nếu config hợp lệ — tránh chay_net cố nối server
     // rỗng (server_url="") ngay từ đầu, gây log lỗi rối mắt trước khi người
     // dùng kịp nhập gì.
-    if hop_le {
-        let cfg_net = cfg.clone();
-        let trang_thai_net = trang_thai.clone();
-        std::thread::spawn(move || net::chay_net(cfg_net, trang_thai_net));
-    }
+    let net_dang_chay = hop_le.then(|| net::khoi_chay(cfg.clone(), trang_thai.clone(), duong_gui.clone(), None));
 
     // Mô hình MỚI (kiểu Tailscale): cửa sổ LUÔN ẨN lúc khởi động, kể cả khi
     // CHƯA có config hợp lệ — icon tray là điểm vào duy nhất, người dùng tự
@@ -96,6 +110,6 @@ fn main() -> Result<()> {
     // anyhow::Result<()>. slint::PlatformError impl std::error::Error (feature
     // "std", đã bật mặc định) nên anyhow's blanket `impl From<E: Error+Send+
     // Sync+'static> for anyhow::Error` cho `?` chuyển thẳng, không cần map tay.
-    ui::chay_ui(cfg, trang_thai)?;
+    ui::chay_ui(cfg, trang_thai, duong_gui, net_dang_chay)?;
     Ok(())
 }

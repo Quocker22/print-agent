@@ -39,17 +39,21 @@
 //! BackendSelector ngay đầu chay_ui(), TRƯỚC khi tạo MainWindow.
 
 use crate::config::{self, Config};
+use crate::hop_thu_di::DuongGui;
 use crate::job;
-use crate::net;
+use crate::net::{self, DieuKhienNet};
+use crate::nhat_ky;
 use crate::printing;
 use crate::state::TrangThaiChung;
-use crate::taskbar_win::an_khoi_taskbar;
-use crate::view_model::build_view_model;
+use crate::taskbar_win::{an_khoi_taskbar, nhay_cua_so};
+use crate::view_model::{build_view_model, nen_bat_cua_so, CanhBao};
 use raw_window_handle::HasWindowHandle;
 use slint::{CloseRequestResponse, ModelRc, Timer, TimerMode, VecModel};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -81,6 +85,11 @@ fn config_path() -> std::path::PathBuf {
 /// ra khỏi khe + 1 chấm đèn nhỏ. Toàn bộ nét vẽ dùng màu trạng thái để icon khay
 /// nhìn là thấy ngay xanh/đỏ; giấy để trắng cho tương phản.
 fn icon_may_in(r: u8, g: u8, b: u8) -> Icon {
+    icon_may_in_ve(r, g, b, false)
+}
+
+/// Như `icon_may_in`; `cham_than` = vẽ dấu "!" trắng trên thân (icon sự cố).
+fn icon_may_in_ve(r: u8, g: u8, b: u8, cham_than: bool) -> Icon {
     const N: u32 = 32;
     let mau = image::Rgba([r, g, b, 255]);
     let trang = image::Rgba([255, 255, 255, 255]);
@@ -122,6 +131,11 @@ fn icon_may_in(r: u8, g: u8, b: u8) -> Icon {
     fill(&mut set, 12, 28, 17, 28, mau);
     // Chấm đèn nguồn trên thân (trắng) để icon sinh động.
     fill(&mut set, 23, 15, 24, 16, trang);
+    if cham_than {
+        // "!" giữa thân: vạch dọc + chấm.
+        fill(&mut set, 15, 14, 16, 19, trang);
+        fill(&mut set, 15, 21, 16, 22, trang);
+    }
 
     Icon::from_rgba(img.into_raw(), N, N).expect("icon RGBA hợp lệ (buffer đúng NxN*4 byte)")
 }
@@ -132,6 +146,12 @@ fn icon_xanh() -> Icon {
 
 fn icon_do() -> Icon {
     icon_may_in(0xc0, 0x39, 0x2b) // đỏ — mất kết nối
+}
+
+/// Cam + dấu "!" — máy in có sự cố. KHÁC màu đỏ "mất kết nối" để NV không
+/// nhầm hai chuyện (sự cố thì phải ra máy in, mất kết nối thì không).
+fn icon_canh_bao() -> Icon {
+    icon_may_in_ve(0xe6, 0x7e, 0x22, true)
 }
 
 /// Danh sách khay cố định cho ComboBox "Khay" — khớp printing::tray_sang_bin
@@ -189,8 +209,14 @@ fn model_co_gia_tri_hien_tai(mut ds: Vec<String>, hien_tai: &str) -> ModelRc<sli
 /// vòng lặp UI (main thread), không chia sẻ với thread net.
 struct Tray {
     tray_icon: Option<TrayIcon>,
-    /// Icon hiện đang hiển thị — tránh set_icon() mỗi tick (bài học #2).
-    da_noi_hien_thi: Option<bool>,
+    /// (đã nối, tiêu đề cảnh báo đang báo, pha nháy) đang hiển thị — tránh
+    /// set_icon() mỗi tick (bài học #2); chỉ gọi khi bộ ba này đổi.
+    hien_thi: Option<(bool, Option<String>, bool)>,
+    /// Dựng sẵn một lần: lúc nháy set_icon ~0,6 s/lần, không dựng lại RGBA +
+    /// HICON mỗi lần (Icon clone chỉ tăng Arc — tray-icon tự DestroyIcon bản cũ).
+    icon_xanh: Icon,
+    icon_mat_noi: Icon,
+    icon_su_co: Icon,
     menu_trang_thai: Option<MenuItem>,
     menu_server: Option<MenuItem>,
     menu_may_in: Option<MenuItem>,
@@ -228,7 +254,10 @@ impl Tray {
 
         Self {
             tray_icon,
-            da_noi_hien_thi: None,
+            hien_thi: None,
+            icon_xanh: icon_xanh(),
+            icon_mat_noi: icon_do(),
+            icon_su_co: icon_canh_bao(),
             menu_trang_thai: Some(menu_trang_thai),
             menu_server: Some(menu_server),
             menu_may_in: Some(menu_may_in),
@@ -237,24 +266,44 @@ impl Tray {
 
     /// Cập nhật icon + mục trạng thái trong menu — chỉ khi trạng thái ĐỔI
     /// (bài học #2, giữ nguyên logic bản egui cũ).
-    fn cap_nhat(&mut self, da_noi: bool) {
-        if self.da_noi_hien_thi == Some(da_noi) {
+    ///
+    /// Có sự cố mức lỗi (hợp đồng v2 §4.4): icon NHÁY giữa icon sự cố và icon
+    /// kết nối theo `pha_nhay`; tooltip + dòng trạng thái trong menu nêu sự cố.
+    /// Cảnh báo vàng (mực yếu) chỉ đổi chữ, không nháy.
+    fn cap_nhat(&mut self, da_noi: bool, canh_bao: Option<&CanhBao>, pha_nhay: bool) {
+        let nhay = pha_nhay && canh_bao.is_some_and(|c| c.loi);
+        let khoa_cb = canh_bao.map(|c| c.tieu_de.clone());
+        if self.hien_thi.as_ref().is_some_and(|(d, k, n)| *d == da_noi && *k == khoa_cb && *n == nhay) {
             return;
         }
-        self.da_noi_hien_thi = Some(da_noi);
+        let doi_chu = self.hien_thi.as_ref().map(|(d, k, _)| (*d, k.clone())) != Some((da_noi, khoa_cb.clone()));
+        self.hien_thi = Some((da_noi, khoa_cb, nhay));
+        let ket_noi = if da_noi { "đã kết nối" } else { "mất kết nối" };
         if let Some(tray) = &self.tray_icon {
-            let icon = if da_noi { icon_xanh() } else { icon_do() };
-            let _ = tray.set_icon(Some(icon));
-            let tooltip = if da_noi {
-                "Incokit Print Agent — đã kết nối"
+            let icon = if nhay {
+                &self.icon_su_co
+            } else if da_noi {
+                &self.icon_xanh
             } else {
-                "Incokit Print Agent — mất kết nối"
+                &self.icon_mat_noi
             };
-            let _ = tray.set_tooltip(Some(tooltip));
+            let _ = tray.set_icon(Some(icon.clone()));
+            if doi_chu {
+                let tooltip = match canh_bao {
+                    Some(cb) => format!("Incokit Print Agent — {} — {}", ket_noi, cb.tieu_de),
+                    None => format!("Incokit Print Agent — {}", ket_noi),
+                };
+                let _ = tray.set_tooltip(Some(tooltip));
+            }
         }
-        if let Some(mi) = &self.menu_trang_thai {
-            let nhan = if da_noi { "● Đã kết nối" } else { "● Mất kết nối" };
-            mi.set_text(nhan);
+        if doi_chu {
+            if let Some(mi) = &self.menu_trang_thai {
+                let nhan = if da_noi { "● Đã kết nối" } else { "● Mất kết nối" };
+                match canh_bao {
+                    Some(cb) => mi.set_text(format!("{} — {}", nhan, cb.tieu_de)),
+                    None => mi.set_text(nhan),
+                }
+            }
         }
     }
 
@@ -269,12 +318,9 @@ impl Tray {
         }
         // Ép vẽ lại icon + text trạng thái theo config mới (thread net mới
         // chưa kịp báo da_noi=true/false) — giữ nguyên bản egui cũ.
-        self.da_noi_hien_thi = None;
+        self.hien_thi = None;
     }
 }
-
-/// PDF giả tối thiểu hợp lệ dùng cho "In thử" — giữ nguyên từ bản egui cũ.
-const PDF_GIA: &[u8] = b"%PDF-1.4\n% in thu tu Incokit Print Agent\n";
 
 /// Map view_model::JobRow (logic thuần, đã test) → ui::JobRow (struct Slint
 /// sinh ra từ .slint) — CHỈ đổi kiểu String→SharedString qua .into(), không
@@ -287,6 +333,8 @@ fn jobs_sang_model(jobs: Vec<crate::view_model::JobRow>) -> ModelRc<JobRow> {
             khach: j.khach.into(),
             badge: j.badge.into(),
             da_in: j.da_in,
+            khong_ro: j.khong_ro,
+            luc: j.luc.into(),
         })
         .collect();
     ModelRc::new(VecModel::from(hang))
@@ -294,19 +342,47 @@ fn jobs_sang_model(jobs: Vec<crate::view_model::JobRow>) -> ModelRc<JobRow> {
 
 /// Bơm ViewModel (build_view_model) vào properties MainWindow — điểm DUY NHẤT
 /// map trạng thái → hiển thị, gọi từ Timer mỗi tick và ngay sau khi Lưu.
-fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung) {
+/// Trả cảnh báo đang hiện để tray/nháy cửa sổ dùng chung đúng một nguồn.
+fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung) -> Option<CanhBao> {
     let vm = build_view_model(cfg, t);
     w.set_da_noi(vm.da_noi);
     w.set_trang_thai_text(vm.trang_thai_text.into());
     w.set_server(vm.server.into());
     w.set_may_in(vm.may_in.into());
     w.set_jobs(jobs_sang_model(vm.jobs));
+    w.set_canh_bao_hien(vm.canh_bao.is_some());
+    if let Some(cb) = &vm.canh_bao {
+        w.set_canh_bao_loi(cb.loi);
+        // Font nhúng (Be Vietnam Pro) không có glyph ⚠ — cửa sổ đã vẽ dấu "!"
+        // bằng hình tròn, nên bỏ ký tự này ở đây (khay/tooltip giữ nguyên).
+        w.set_canh_bao_tieu_de(cb.tieu_de.trim_start_matches('⚠').trim_start().into());
+        w.set_canh_bao_chi_tiet(cb.chi_tiet.as_str().into());
+    }
+    w.set_thong_bao_phu(vm.thong_bao_phu.unwrap_or_default().into());
+    vm.canh_bao
 }
 
-/// Chạy UI Slint + tray icon. Gọi từ main() SAU KHI đã spawn thread net.
+/// HWND thật của cửa sổ (chỉ có SAU khi window manager tạo cửa sổ — xem bài
+/// học #6). `None` trên máy không phải Windows.
+fn hwnd_cua(w: &MainWindow) -> Option<isize> {
+    let handle = w.window().window_handle();
+    let handle = handle.window_handle().ok()?;
+    match handle.as_raw() {
+        raw_window_handle::RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+
+/// Chạy UI Slint + tray icon. Gọi từ main() SAU KHI đã spawn thread net
+/// (`net_dang_chay` = điều khiển của nó, None khi chưa có config hợp lệ).
 /// Cửa sổ khởi động ẨN (mô hình tray-first) — xem bài học #6 ở doc-comment
 /// đầu file cho lý do show() ngắn 1 nhịp để lấy HWND rồi hide() ngay.
-pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Result<(), slint::PlatformError> {
+pub fn chay_ui(
+    cfg: Arc<Config>,
+    trang_thai: Arc<Mutex<TrangThaiChung>>,
+    duong_gui: Arc<DuongGui>,
+    net_dang_chay: Option<DieuKhienNet>,
+) -> Result<(), slint::PlatformError> {
     // Ép software renderer TRƯỚC khi tạo MainWindow — máy shop GPU ảo VMware,
     // GPU render sẽ chết như egui/wgpu cũ (xem context: "Software renderer
     // BẮT BUỘC — gốc bệnh egui"). renderer-software là default feature crate
@@ -319,13 +395,19 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
 
     let window = MainWindow::new()?;
 
-    // cfg/trang_thai hiện đang dùng — RefCell vì chỉ đụng trên main thread
-    // (Timer + callback Slint đều chạy main thread), đổi được khi bấm Lưu
-    // (spawn thread net mới trỏ Mutex mới — xem doc-comment struct App bản cũ,
-    // giữ nguyên chiến lược "Mutex mới mỗi lần Lưu" thay vì cố dừng thread cũ).
+    // cfg hiện đang dùng — RefCell vì chỉ đụng trên main thread (Timer +
+    // callback Slint đều chạy main thread), đổi được khi bấm Lưu. Thread net
+    // CŨ thì DỪNG HẲN qua `net_dang_chay` (R7a) — bản trước để nó chạy tiếp:
+    // hai kết nối cùng token, hai worker in.
+    //
+    // `trang_thai` thì GIỮ NGUYÊN một Arc suốt đời app (T7, giám sát vòng 3):
+    // bản trước dựng Mutex MỚI mỗi lần Lưu — kết quả của job worker cũ đang in
+    // dở, `xac_nhan_in_sau`/`mat_dau` của luồng theo dõi tiếp (danh sách sống
+    // qua Lưu) rơi vào trạng thái cũ không ai hiện: NV không thấy dải, "In gần
+    // đây" mất dòng. Lưu chỉ đổi cấu hình + quên kết nối/máy in cũ
+    // (`TrangThaiChung::doi_cau_hinh`).
     let cfg_dang_dung: Rc<RefCell<Arc<Config>>> = Rc::new(RefCell::new(cfg.clone()));
-    let trang_thai_dang_doc: Rc<RefCell<Arc<Mutex<TrangThaiChung>>>> =
-        Rc::new(RefCell::new(trang_thai.clone()));
+    let net_dang_chay: Rc<RefCell<Option<DieuKhienNet>>> = Rc::new(RefCell::new(net_dang_chay));
 
     // Bơm giá trị ban đầu vào form Cấu hình — token giờ dán tay từ trang
     // ZaloCRM (gen 1 token riêng mỗi máy), KHÔNG còn hằng nhúng lúc build,
@@ -346,7 +428,9 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
     // hiển thị sai làm người dùng tưởng chưa bật rồi bấm tắt mất (xem
     // tu_khoi_dong::dang_bat, nó còn đối chiếu đúng đường dẫn exe đang chạy).
     window.set_f_tu_khoi_dong(crate::tu_khoi_dong::dang_bat());
-    bom_view_model(&window, &cfg, &trang_thai.lock().expect("mutex trang_thai không bị poison"));
+    // Mutex hỏng (một luồng panic lúc giữ khoá) vẫn đọc tiếp được dữ liệu —
+    // giao diện KHÔNG được chết theo (R11e).
+    bom_view_model(&window, &cfg, &trang_thai.lock().unwrap_or_else(|p| p.into_inner()));
 
     // Tray phải dựng trên CÙNG thread + TRƯỚC khi event loop chạy (bài học #1).
     let tray = Rc::new(RefCell::new(Tray::moi(&cfg)));
@@ -395,14 +479,16 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
 
     // Bài học #4 (on_luu): đọc form → dựng Config mới (token đọc THẲNG từ
     // form f_token — mỗi máy dán token riêng gen từ trang ZaloCRM, không còn
-    // hằng nhúng lúc build) → ghi config.ini → spawn thread net MỚI với Mutex
-    // trạng thái MỚI → trỏ mọi tham chiếu đang dùng (cfg_dang_dung/
-    // trang_thai_dang_doc) sang cái mới → cập nhật tray.
+    // hằng nhúng lúc build) → ghi config.ini → DỪNG HẲN thread net cũ rồi
+    // chạy thread net MỚI trên CÙNG trạng thái (R7a/T7 — việc chờ nằm trên
+    // thread net mới, giao diện không bị chặn) → cập nhật tray.
     {
         let w_weak = window.as_weak();
         let cfg_dang_dung = cfg_dang_dung.clone();
-        let trang_thai_dang_doc = trang_thai_dang_doc.clone();
+        let trang_thai = trang_thai.clone();
         let tray = tray.clone();
+        let net_dang_chay = net_dang_chay.clone();
+        let duong_gui = duong_gui.clone();
         window.on_luu(move || {
             let Some(w) = w_weak.upgrade() else { return };
 
@@ -428,20 +514,16 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
             match std::fs::write(config_path(), config::ghi_config(&cfg_moi)) {
                 Ok(()) => {
                     let cfg_moi = Arc::new(cfg_moi);
-                    let trang_thai_moi = Arc::new(Mutex::new(TrangThaiChung::default()));
-                    {
-                        let cfg_net = cfg_moi.clone();
-                        let trang_thai_net = trang_thai_moi.clone();
-                        std::thread::spawn(move || net::chay_net(cfg_net, trang_thai_net));
-                    }
+                    let cu = net_dang_chay.borrow_mut().take();
+                    // `khoi_chay` bật cờ dừng của bản cũ NGAY (đồng bộ) — từ
+                    // đây bản cũ thôi ghi trạng thái kết nối — rồi mới đặt lại.
+                    *net_dang_chay.borrow_mut() =
+                        Some(net::khoi_chay(cfg_moi.clone(), trang_thai.clone(), duong_gui.clone(), cu));
+                    let mut t = trang_thai.lock().unwrap_or_else(|p| p.into_inner());
+                    t.doi_cau_hinh();
                     tray.borrow_mut().cap_nhat_cfg(&cfg_moi);
                     *cfg_dang_dung.borrow_mut() = cfg_moi.clone();
-                    *trang_thai_dang_doc.borrow_mut() = trang_thai_moi.clone();
-                    bom_view_model(
-                        &w,
-                        &cfg_moi,
-                        &trang_thai_moi.lock().expect("mutex trang_thai không bị poison"),
-                    );
+                    bom_view_model(&w, &cfg_moi, &t);
                 }
                 Err(e) => {
                     w.set_trang_thai_text(format!("Ghi config.ini lỗi: {}", e).into());
@@ -450,23 +532,54 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
         });
     }
 
-    // Bài học #4 (on_in_thu): in_pdf với PDF giả, tôn trọng AGENT_DRY_RUN —
-    // giữ nguyên hành vi bản egui cũ (không tự ép dry-run ở đây).
+    // Bài học #4 (on_in_thu): in_pdf với PDF 1 trang HỢP LỆ (R11d — bản cũ
+    // PDF_GIA không phải PDF, Sumatra từ chối), tôn trọng AGENT_DRY_RUN.
+    // Chạy trên LUỒNG RIÊNG (R11d): Sumatra + theo dõi spooler tới ~15 s, chạy
+    // trên luồng giao diện là cửa sổ đơ, NV tưởng app treo rồi tắt đi.
     {
         let cfg_dang_dung = cfg_dang_dung.clone();
+        let dang_in_thu = Arc::new(AtomicBool::new(false));
         window.on_in_thu(move || {
-            let cfg = cfg_dang_dung.borrow().clone();
-            // "in-thu" (test) không phải job thật từ server nên không có
-            // job_id — dùng id tạm chỉ để spooler.rs (Phase 1 xác nhận in)
-            // có chuỗi khớp document name khi poll.
-            let kq = printing::in_pdf(PDF_GIA, &cfg.printer_name, &cfg.paper_size, &cfg.tray, 1, "in-thu");
-            match kq {
-                job::KetQuaIn::DaIn => {}
-                job::KetQuaIn::Loi(e) => eprintln!("[print-agent] in thử lỗi: {}", e),
-                job::KetQuaIn::KhongRo(ly_do) => {
-                    eprintln!("[print-agent] in thử không rõ kết quả: {}", ly_do)
-                }
+            // Bấm liền nhiều lần chỉ in một bản.
+            if dang_in_thu.swap(true, Ordering::SeqCst) {
+                return;
             }
+            let cfg = cfg_dang_dung.borrow().clone();
+            let co = dang_in_thu.clone();
+            let da_spawn = std::thread::Builder::new().name("in-thu".into()).spawn(move || {
+                // "in-thu" (test) không phải job thật từ server nên không có
+                // job_id — dùng id tạm chỉ để spooler.rs có chuỗi khớp
+                // document name khi poll.
+                let kq = printing::in_pdf(
+                    &printing::pdf_in_thu(), &cfg.printer_name, &cfg.paper_size, &cfg.tray, 1, "in-thu", None, None, &|_| {},
+                );
+                let chu = match &kq {
+                    job::KetQuaIn::DaIn => "da_in".to_string(),
+                    job::KetQuaIn::Loi(e) => format!("loi {}", e),
+                    job::KetQuaIn::KhongRo(ly_do) => format!("khong_ro {}", ly_do),
+                };
+                eprintln!("[print-agent] in thử: {}", chu);
+                nhat_ky::ghi("in_thu", &format!("may_in={} {}", cfg.printer_name, chu));
+                co.store(false, Ordering::SeqCst);
+            });
+            if da_spawn.is_err() {
+                dang_in_thu.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
+    // Nút "Đã hiểu" trên dải cảnh báo (R1): NV đã đọc — tắt dải hoá đơn, ẩn
+    // dải sự cố máy in tới khi trạng thái máy in đổi.
+    {
+        let w_weak = window.as_weak();
+        let cfg_dang_dung = cfg_dang_dung.clone();
+        let trang_thai = trang_thai.clone();
+        window.on_da_hieu(move || {
+            let Some(w) = w_weak.upgrade() else { return };
+            let mut t = trang_thai.lock().unwrap_or_else(|p| p.into_inner());
+            // Tắt DẢI ĐANG HIỆN (T6) — dải kế tiếp (nếu có) hiện lên.
+            t.da_hieu();
+            bom_view_model(&w, &cfg_dang_dung.borrow(), &t);
         });
     }
 
@@ -481,10 +594,8 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
         let w_weak = window.as_weak();
         Timer::single_shot(std::time::Duration::from_millis(0), move || {
             if let Some(w) = w_weak.upgrade() {
-                if let Ok(handle) = w.window().window_handle().window_handle() {
-                    if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
-                        an_khoi_taskbar(h.hwnd.get());
-                    }
+                if let Some(hwnd) = hwnd_cua(&w) {
+                    an_khoi_taskbar(hwnd);
                 }
                 let _ = w.hide();
             }
@@ -500,7 +611,13 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
         let w_weak = window.as_weak();
         let tray = tray.clone();
         let cfg_dang_dung = cfg_dang_dung.clone();
-        let trang_thai_dang_doc = trang_thai_dang_doc.clone();
+        let trang_thai = trang_thai.clone();
+        // Nháy icon khay: đổi pha mỗi 2 tick (~0,6 s) — đủ nhanh để mắt bắt,
+        // đủ chậm để không tốn CPU dựng icon.
+        let so_tick = Cell::new(0_u32);
+        // Cảnh báo ở tick trước (tiêu đề) + lần gần nhất TỰ mở cửa sổ (view_model::nen_bat_cua_so).
+        let canh_bao_truoc: RefCell<Option<String>> = RefCell::new(None);
+        let lan_bat_cuoi: Cell<Option<Instant>> = Cell::new(None);
         timer.start(TimerMode::Repeated, std::time::Duration::from_millis(300), move || {
             // Rút cạn TrayIconEvent (bài học #4: không đọc nội dung, chỉ để
             // channel không phình — with_menu_on_left_click(true) tự lo phần
@@ -524,13 +641,28 @@ pub fn chay_ui(cfg: Arc<Config>, trang_thai: Arc<Mutex<TrangThaiChung>>) -> Resu
             // time như bản egui cũ (request_repaint_after 500ms → đây 300ms).
             if let Some(w) = w_weak.upgrade() {
                 let cfg = cfg_dang_dung.borrow().clone();
-                let t = trang_thai_dang_doc.borrow().clone();
-                let da_noi = {
-                    let t = t.lock().expect("mutex trang_thai không bị poison");
-                    bom_view_model(&w, &cfg, &t);
-                    t.da_noi
+                let (da_noi, canh_bao) = {
+                    let t = trang_thai.lock().unwrap_or_else(|p| p.into_inner());
+                    let canh_bao = bom_view_model(&w, &cfg, &t);
+                    (t.da_noi, canh_bao)
                 };
-                tray.borrow_mut().cap_nhat(da_noi);
+                so_tick.set(so_tick.get().wrapping_add(1));
+                let pha_nhay = (so_tick.get() / 2).is_multiple_of(2);
+                tray.borrow_mut().cap_nhat(da_noi, canh_bao.as_ref(), pha_nhay);
+
+                // BÁO NGAY trên máy shop: sự cố mới → mở cửa sổ (có dải đỏ) và
+                // nháy thanh tiêu đề. App chỉ sống ở khay, mà Windows 10/11
+                // thường giấu icon khay vào "^" — chỉ nháy icon là NV có thể
+                // không bao giờ thấy.
+                let bay_gio = Instant::now();
+                if nen_bat_cua_so(canh_bao_truoc.borrow().as_deref(), canh_bao.as_ref(), lan_bat_cuoi.get(), bay_gio) {
+                    let _ = w.show();
+                    if let Some(hwnd) = hwnd_cua(&w) {
+                        nhay_cua_so(hwnd);
+                    }
+                    lan_bat_cuoi.set(Some(bay_gio));
+                }
+                *canh_bao_truoc.borrow_mut() = canh_bao.map(|c| c.tieu_de);
             }
         });
     }
