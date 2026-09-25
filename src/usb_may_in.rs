@@ -31,10 +31,13 @@
 //! bao giờ đọc/ghi dữ liệu in. Không chen vào lúc spooler đẩy byte xuống cổng:
 //! spooler.rs chỉ gọi khi mọi job trong hàng đợi đã gửi xong (`hang_doi_cho_doc_usb`),
 //! và worker tạm ngừng mọi lần đọc trong lúc Sumatra nộp job (`TamNgungDocUsb`).
-//! Chỉ máy in CỤC BỘ trên đúng một cổng `USBnnn`, thiết bị tìm theo ĐÚNG số
-//! cổng usbmon ghi trong registry — không bao giờ đoán "máy USB duy nhất đang
-//! cắm" (cửa hàng có thể cắm thêm máy in tem/bill: đọc nhầm là báo `da_in`
-//! cho hoá đơn đang kẹt trong máy HP).
+//! Chỉ máy in CỤC BỘ trên đúng một cổng `USBnnn`. Tìm thiết bị (0.2.3): (1) số
+//! cổng usbmon ghi trong registry — tài khoản THƯỜNG không đọc được khoá đó
+//! (đo ở HCM 25/09: "0 khoa", app chạy không quyền quản trị); (2) danh sách
+//! thiết bị máy in USB ĐANG CẮM (SetupAPI — tài khoản thường xem được) mà
+//! chuỗi 1284 có model TRÙNG tên driver của máy in Windows, và chỉ khi đúng MỘT
+//! thiết bị trùng. Không bao giờ đoán "máy USB duy nhất đang cắm" (cửa hàng có
+//! thể cắm thêm máy in tem/bill: đọc nhầm là báo `da_in` cho hoá đơn đang kẹt).
 
 // Phần Win32 chỉ chạy trên Windows; trên Mac phần thuần chỉ chạy trong test.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -125,14 +128,35 @@ impl DocUsb {
     }
 }
 
-/// Trường `STATUS:` của chuỗi IEEE 1284 (`KHOA:giá trị;` nối nhau), viết hoa.
-/// Khoá so không phân biệt hoa thường; giá trị rỗng coi như không có.
-pub fn tach_status(chuoi_1284: &str) -> Option<String> {
+/// Giá trị trường `khoa` (một trong các tên) của chuỗi IEEE 1284 (`KHOA:giá
+/// trị;` nối nhau), đã cắt khoảng trắng. Khoá so không phân biệt hoa thường;
+/// giá trị rỗng coi như không có.
+pub fn tach_truong<'a>(chuoi_1284: &'a str, khoa_can: &[&str]) -> Option<&'a str> {
     chuoi_1284.split(';').find_map(|cap| {
         let (khoa, gia_tri) = cap.split_once(':')?;
         let gia_tri = gia_tri.trim();
-        (khoa.trim().eq_ignore_ascii_case("STATUS") && !gia_tri.is_empty()).then(|| gia_tri.to_ascii_uppercase())
+        (khoa_can.iter().any(|k| khoa.trim().eq_ignore_ascii_case(k)) && !gia_tri.is_empty()).then_some(gia_tri)
     })
+}
+
+/// Trường `STATUS:` của chuỗi IEEE 1284, viết hoa.
+pub fn tach_status(chuoi_1284: &str) -> Option<String> {
+    tach_truong(chuoi_1284, &["STATUS"]).map(str::to_ascii_uppercase)
+}
+
+/// Chuỗi 1284 của thiết bị có phải ĐÚNG model của máy in Windows (tên driver)
+/// không — `MDL`/`MODEL`, có hoặc không kèm hãng (`MFG`) phía trước. So sau khi
+/// gộp khoảng trắng, không phân biệt hoa thường; KHÔNG so "chứa" (máy in tem
+/// "HP Laser 107w" ≠ driver "HP Laser 103 107 108").
+pub fn khop_model(chuoi_1284: &str, ten_driver: &str) -> bool {
+    let chuan = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let driver = chuan(ten_driver);
+    let Some(mdl) = tach_truong(chuoi_1284, &["MDL", "MODEL"]).map(chuan) else { return false };
+    if driver.is_empty() {
+        return false;
+    }
+    let mfg = tach_truong(chuoi_1284, &["MFG", "MANUFACTURER"]).map(chuan);
+    driver == mdl || mfg.is_some_and(|m| driver == format!("{} {}", m, mdl))
 }
 
 /// Số cổng của cổng USB ảo: `USB001` → 1. Chỉ đúng MỘT cổng dạng `USB` + chữ
@@ -393,27 +417,102 @@ mod win {
             .collect())
     }
 
-    /// Dò thiết bị của cổng `USB<cong>`: khoá registry có "Port Number" KHỚP mà mở
-    /// + hỏi được. Không có → lý do (không đoán thiết bị khác).
-    fn do_thiet_bi(cong: u32) -> Result<(String, DocUsb, Option<String>), String> {
-        let ds = cac_thiet_bi()?;
-        let khop = thiet_bi_cua_cong(&ds, cong);
-        if khop.is_empty() {
-            return Err(format!("registry khong co thiet bi nao mang so cong {} ({} khoa)", cong, ds.len()));
+    /// Đường dẫn mọi thiết bị máy in USB ĐANG CẮM (SetupAPI, GUID_DEVINTERFACE_USBPRINT
+    /// — tài khoản thường xem được như Device Manager).
+    fn thiet_bi_dang_cam() -> Result<Vec<String>, String> {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+            SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO,
+            SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
+        };
+        use windows::Win32::Foundation::HWND;
+        struct Tap(HDEVINFO);
+        impl Drop for Tap {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetupDiDestroyDeviceInfoList(self.0);
+                }
+            }
         }
+        let guid = windows::core::GUID::from_u128(0x28d78fad_5a12_11d1_ae5b_0000f803a8c2);
+        let tap = unsafe { SetupDiGetClassDevsW(Some(&guid), PCWSTR::null(), HWND::default(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE) }
+            .map_err(|e| format!("SetupDiGetClassDevs loi ({})", e.code().0 & 0xFFFF))?;
+        let tap = Tap(tap);
+        let mut ra = Vec::new();
+        for i in 0..64u32 {
+            let mut d = SP_DEVICE_INTERFACE_DATA { cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32, ..Default::default() };
+            if unsafe { SetupDiEnumDeviceInterfaces(tap.0, None, &guid, i, &mut d) }.is_err() {
+                break;
+            }
+            let mut can: u32 = 0;
+            let _ = unsafe { SetupDiGetDeviceInterfaceDetailW(tap.0, &d, None, 0, Some(&mut can), None) };
+            if !(8..=8192).contains(&can) {
+                continue;
+            }
+            // Bộ đệm căn 4 byte (SP_DEVICE_INTERFACE_DETAIL_DATA_W có u32 đầu).
+            let mut bo_dem = vec![0u32; (can as usize).div_ceil(4)];
+            let p = bo_dem.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+            unsafe {
+                (*p).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            }
+            if unsafe { SetupDiGetDeviceInterfaceDetailW(tap.0, &d, Some(p), can, None, None) }.is_err() {
+                continue;
+            }
+            // DevicePath bắt đầu ngay sau cbSize (u32), kết thúc bằng \0, nằm trong `can` byte.
+            let so_u16 = (can as usize - 4) / 2;
+            let chu = unsafe { std::slice::from_raw_parts((bo_dem.as_ptr() as *const u8).add(4) as *const u16, so_u16) };
+            let het = chu.iter().position(|&c| c == 0).unwrap_or(so_u16);
+            ra.push(String::from_utf16_lossy(&chu[..het]));
+        }
+        Ok(ra)
+    }
+
+    /// Dò thiết bị của cổng `USB<cong>` (máy in Windows dùng driver `ten_driver`):
+    /// (1) khoá registry có "Port Number" KHỚP mà mở + hỏi được; (2) không có →
+    /// thiết bị ĐANG CẮM có model trùng tên driver, chỉ khi đúng MỘT cái. Không
+    /// có → lý do đủ hai đường (không đoán thiết bị khác).
+    fn do_thiet_bi(cong: u32, ten_driver: &str) -> Result<(String, DocUsb, Option<String>), String> {
         let mut loi = Vec::new();
-        for d in &khop {
+        match cac_thiet_bi() {
+            Ok(ds) => {
+                let khop = thiet_bi_cua_cong(&ds, cong);
+                for d in &khop {
+                    match doc_thiet_bi(d) {
+                        Ok((doc, chuoi)) => return Ok((d.to_string(), doc, chuoi)),
+                        Err(e) => loi.push(e),
+                    }
+                }
+                loi.insert(0, format!("registry: {} khoa, {} khop so cong {}", ds.len(), khop.len(), cong));
+            }
+            Err(e) => loi.insert(0, format!("registry: {}", e)),
+        }
+        let dang_cam = thiet_bi_dang_cam()?;
+        let mut trung = Vec::new();
+        let mut model_khac = Vec::new();
+        for d in &dang_cam {
             match doc_thiet_bi(d) {
-                Ok((doc, chuoi)) => return Ok((d.to_string(), doc, chuoi)),
+                Ok((doc, Some(chuoi))) if khop_model(&chuoi, ten_driver) => trung.push((d.clone(), doc, Some(chuoi))),
+                Ok((_, chuoi)) => model_khac.push(chuoi.as_deref().and_then(|c| tach_truong(c, &["MDL", "MODEL"])).unwrap_or("?").to_string()),
                 Err(e) => loi.push(e),
             }
         }
-        Err(format!("{} khoa khop so cong, khong mo/hoi duoc: {}", khop.len(), loi.join("; ")))
+        if trung.len() == 1 {
+            return Ok(trung.remove(0));
+        }
+        Err(format!(
+            "{}; dang cam {} thiet bi, {} trung model \"{}\" (model khac: {})",
+            loi.join("; "),
+            dang_cam.len(),
+            trung.len(),
+            ten_driver,
+            if model_khac.is_empty() { "-".to_string() } else { model_khac.join(", ") }
+        ))
     }
 
     /// Hỏi máy in (PRINTER_INFO_2W: `may_chu` = pServerName, `thuoc_tinh`,
-    /// `cong` = pPortName). Không phải máy USB cục bộ → `KhongPhaiUsb`.
-    pub fn doc_theo_cong(may_chu: &str, thuoc_tinh: u32, cong: &str) -> DocCong {
+    /// `cong` = pPortName, `ten_driver` = pDriverName). Không phải máy USB cục bộ
+    /// → `KhongPhaiUsb`.
+    pub fn doc_theo_cong(may_chu: &str, thuoc_tinh: u32, cong: &str, ten_driver: &str) -> DocCong {
         let Some(so) = la_cong_usb_cuc_bo(may_chu, thuoc_tinh, cong) else {
             return DocCong::KhongPhaiUsb;
         };
@@ -425,7 +524,7 @@ mod win {
             Some(Ok(doc)) => Ok(doc),
             // Chưa dò, hoặc rút ra cắm lại có thể đổi đường dẫn — dò lại theo số cổng.
             _ => {
-                let moi = do_thiet_bi(so);
+                let moi = do_thiet_bi(so, ten_driver);
                 let mut nho = DA_DO.lock().unwrap_or_else(|p| p.into_inner());
                 nho.retain(|(s, _)| *s != so);
                 if let Ok((duong_dan, _, _)) = &moi {
@@ -455,7 +554,7 @@ pub use win::doc_theo_cong;
 
 /// Mac/dev: không có thiết bị USB Windows để đọc.
 #[cfg(not(windows))]
-pub fn doc_theo_cong(_may_chu: &str, _thuoc_tinh: u32, _cong: &str) -> DocCong {
+pub fn doc_theo_cong(_may_chu: &str, _thuoc_tinh: u32, _cong: &str, _ten_driver: &str) -> DocCong {
     DocCong::KhongPhaiUsb
 }
 
@@ -601,5 +700,21 @@ mod tests {
         assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(4), nhip), None);
         // Giữ nguyên quá nhịp → ghi lại.
         assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(14), nhip).as_deref(), Some("0x98 BUSY [+1 lan doc giong dong truoc]"));
+    }
+
+    /// Khớp model thiết bị với driver máy in Windows — chuỗi 1284 THẬT của máy HCM.
+    #[test]
+    fn khop_model_theo_chuoi_that() {
+        let hp = "MFG:HP;CMD:SPL,URF,FWV,PIC,EXT,PWGRaster;PRN:4ZB79A;MDL:HP Laser 103 107 108;CLS:PRINTER;CID:HPLJPCLMSMV1;MODE:SPL3,R000105;STATUS:IDLE;";
+        assert!(khop_model(hp, "HP Laser 103 107 108"));
+        assert!(khop_model(hp, "  hp laser  103 107 108 "));
+        assert!(!khop_model(hp, "HP LaserJet Pro 4003"));
+        assert!(!khop_model(hp, "HP Laser 107"), "không so 'chứa'");
+        assert!(!khop_model(hp, ""));
+        // Hãng tách riêng MFG, driver ghi cả hãng.
+        assert!(khop_model("MFG:Brother;MDL:HL-L2320D series;", "Brother HL-L2320D series"));
+        assert!(!khop_model("MFG:Xprinter;MDL:XP-365B;", "HP Laser 103 107 108"));
+        assert!(!khop_model("MFG:HP;CLS:PRINTER;", "HP Laser 103 107 108"), "không có MDL");
+        assert_eq!(tach_truong(hp, &["MDL", "MODEL"]), Some("HP Laser 103 107 108"));
     }
 }

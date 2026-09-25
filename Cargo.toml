@@ -1,6 +1,6 @@
 [package]
 name = "print-agent"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Agent in hoá đơn: nhận job từ ZaloCRM qua socket.io, in qua driver Windows"
 license = "AGPL-3.0-or-later"
@@ -44,6 +44,8 @@ image = { version = "0.25", default-features = false }
 # Win32_Storage_FileSystem + Win32_System_IO: CreateFileW/DeviceIoControl — hỏi
 # thẳng máy in USB "đang lỗi / đang in / rảnh" (src/usb_may_in.rs). Máy HP Laser
 # 107 ở HCM hết giấy mà Windows vẫn báo rảnh (25/09).
+# Win32_Devices_DeviceAndDriverInstallation: SetupAPI — danh sách máy in USB đang
+# cắm; tài khoản thường KHÔNG đọc được khoá registry DeviceClasses (đo HCM 25/09).
 winreg = "0.52"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
@@ -55,6 +57,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_Devices_DeviceAndDriverInstallation",
 ] }
 
 [build-dependencies]

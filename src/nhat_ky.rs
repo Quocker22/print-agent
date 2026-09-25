@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! File nhật ký cục bộ `%LOCALAPPDATA%\print-agent\logs\print-agent-YYYY-MM-DD.log`
-//! — mỗi dòng một sự kiện, giữ 14 ngày (hợp đồng v2 §4.5).
+//! File nhật ký cục bộ `%LOCALAPPDATA%\print-agent\logs\print-agent-YYYY-MM-DD.txt`
+//! — mỗi dòng một sự kiện, giữ 14 ngày (hợp đồng v2 §4.5). Đuôi `.txt` (0.2.3,
+//! chủ yêu cầu): bấm đúp là mở bằng Notepad; nút "Nhật ký" trên app mở file hôm
+//! nay. File `.log` của bản cũ vẫn được dọn theo 14 ngày.
 //!
 //! VÌ SAO CẦN: trước bản này app chỉ in ra stderr, mà mở bằng double-click thì
 //! không ai thấy stderr (handoff §12.1) — shop kêu "không in được" là không có
@@ -27,7 +29,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 const TIEN_TO: &str = "print-agent-";
-const DUOI: &str = ".log";
+const DUOI: &str = ".txt";
+/// Đuôi của bản ≤ 0.2.2 — chỉ để dọn file cũ.
+const DUOI_CU: &str = ".log";
 /// Giữ file của 14 ngày gần nhất (kể cả hôm nay).
 const SO_NGAY_GIU: u64 = 14;
 /// Token ngắn hơn ngưỡng này không đem đi thay — thay chuỗi 2–3 ký tự là nát
@@ -54,6 +58,17 @@ fn thu_muc() -> Option<PathBuf> {
     {
         None
     }
+}
+
+/// File nhật ký của HÔM NAY (giờ UTC như tên file) — cho nút "Nhật ký" trên app.
+/// `None` khi không có thư mục nhật ký (không phải Windows).
+pub fn file_hom_nay() -> Option<PathBuf> {
+    Some(thu_muc()?.join(ten_file(&thoi_gian::ngay_utc(SystemTime::now()))))
+}
+
+/// Thư mục nhật ký (mở bằng Explorer khi file hôm nay chưa có).
+pub fn thu_muc_nhat_ky() -> Option<PathBuf> {
+    thu_muc()
 }
 
 /// Đăng ký một chuỗi bí mật (token máy in) để luồng ghi thay bằng `***`.
@@ -131,7 +146,8 @@ fn ghi_vao(dir: &Path, luc: SystemTime, su_kien: &str, noi_dung: &str) -> std::i
 /// Ngày trong tên file nhật ký của app, `None` nếu không đúng mẫu — chỉ đụng
 /// file do chính app đặt tên, không bao giờ xoá file lạ trong thư mục.
 fn ngay_cua_file(ten: &str) -> Option<&str> {
-    let ngay = ten.strip_prefix(TIEN_TO)?.strip_suffix(DUOI)?;
+    let than = ten.strip_prefix(TIEN_TO)?;
+    let ngay = than.strip_suffix(DUOI).or_else(|| than.strip_suffix(DUOI_CU))?;
     let b = ngay.as_bytes();
     let dung_mau = b.len() == 10
         && b.iter().enumerate().all(|(i, c)| if i == 4 || i == 7 { *c == b'-' } else { c.is_ascii_digit() });
@@ -190,7 +206,7 @@ mod tests {
         let dir = thu_muc_tam("ghi");
         ghi_vao(&dir, hom_nay(), "ket_noi", "server=x").unwrap();
         ghi_vao(&dir, hom_nay() + Duration::from_secs(1), "ket_qua", "da_in").unwrap();
-        let noi_dung = std::fs::read_to_string(dir.join("print-agent-2026-09-24.log")).unwrap();
+        let noi_dung = std::fs::read_to_string(dir.join("print-agent-2026-09-24.txt")).unwrap();
         let dong: Vec<&str> = noi_dung.lines().collect();
         assert_eq!(dong.len(), 2);
         assert!(dong[0].ends_with("\tket_noi\tserver=x"));
@@ -200,8 +216,9 @@ mod tests {
 
     #[test]
     fn nhan_dung_mau_ten_file() {
-        assert_eq!(ngay_cua_file("print-agent-2026-09-10.log"), Some("2026-09-10"));
-        for ten in ["print-agent-2026-9-10.log", "print-agent-2026-09-10.txt", "khac-2026-09-10.log",
+        assert_eq!(ngay_cua_file("print-agent-2026-09-10.txt"), Some("2026-09-10"));
+        assert_eq!(ngay_cua_file("print-agent-2026-09-10.log"), Some("2026-09-10"), "file của bản cũ vẫn dọn được");
+        for ten in ["print-agent-2026-9-10.log", "print-agent-2026-09-10.csv", "khac-2026-09-10.log",
                     "print-agent-abcd-ef-gh.log", "print-agent-2026-09-100.log"] {
             assert_eq!(ngay_cua_file(ten), None, "{}", ten);
         }

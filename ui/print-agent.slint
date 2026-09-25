@@ -48,6 +48,7 @@ export component MainWindow inherits Window {
     in property <string> loi_tu_khoi_dong: "";
     callback luu();
     callback in_thu();
+    callback mo_nhat_ky();
     callback da_hieu();
     callback doi_tu_khoi_dong(bool);
 
@@ -201,6 +202,7 @@ export component MainWindow inherits Window {
         HorizontalLayout {
             spacing: 10px;
             Button { text: "In thử"; clicked => { root.in_thu(); } }
+            Button { text: "Nhật ký"; clicked => { root.mo_nhat_ky(); } }
             Button { text: "Lưu"; primary: true; clicked => { root.luu(); } }
         }
     }

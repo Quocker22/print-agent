@@ -1587,9 +1587,10 @@ mod win {
         }
     }
 
-    /// (PRINTER_INFO_2W.Status, .Attributes, .pPortName, .pServerName) đọc trong
-    /// CÙNG một lần GetPrinterW (None nếu query lỗi). Cổng + máy chủ cho U1.
-    fn doc_co_may_in(h: &PrinterHandle) -> Option<(u32, u32, String, String)> {
+    /// (PRINTER_INFO_2W.Status, .Attributes, .pPortName, .pServerName,
+    /// .pDriverName) đọc trong CÙNG một lần GetPrinterW (None nếu query lỗi).
+    /// Cổng + máy chủ + driver cho U1.
+    fn doc_co_may_in(h: &PrinterHandle) -> Option<(u32, u32, String, String, String)> {
         let can = std::mem::size_of::<PRINTER_INFO_2W>();
         let mut needed: u32 = 0;
         // Lần gọi 1: chỉ để lấy kích thước buffer cần (luôn lỗi INSUFFICIENT_BUFFER).
@@ -1612,7 +1613,8 @@ mod win {
         // pPortName/pServerName trỏ vào `buf` — còn sống tới hết hàm.
         let cong = unsafe { pwstr_to_string(info.pPortName) };
         let may_chu = unsafe { pwstr_to_string(info.pServerName) };
-        Some((info.Status, info.Attributes, cong, may_chu))
+        let driver = unsafe { pwstr_to_string(info.pDriverName) };
+        Some((info.Status, info.Attributes, cong, may_chu, driver))
     }
 
     /// EnumJobs cấp độ 2 (JOB_INFO_2W), đọc CHẶT (R5b): lần hỏi kích thước lỗi
@@ -1707,18 +1709,18 @@ mod win {
                     let may_in = doc_co_may_in(&h);
                     let hang_doi = doc_danh_sach_job(&h);
                     let la_may_usb =
-                        may_in.as_ref().is_some_and(|(_, a, cong, may_chu)| usb::la_cong_usb_cuc_bo(may_chu, *a, cong).is_some());
+                        may_in.as_ref().is_some_and(|(_, a, cong, may_chu, _)| usb::la_cong_usb_cuc_bo(may_chu, *a, cong).is_some());
                     // U1: hỏi thẳng thiết bị USB CHỈ khi mọi job đã gửi xong (không
                     // chen vào lúc spooler đang đẩy byte xuống cổng).
                     let doc = match (&may_in, &hang_doi) {
-                        (Some((_, a, cong, may_chu)), Some(jobs)) if la_may_usb && hang_doi_cho_doc_usb(jobs) => {
-                            usb::doc_theo_cong(may_chu, *a, cong)
+                        (Some((_, a, cong, may_chu, driver)), Some(jobs)) if la_may_usb && hang_doi_cho_doc_usb(jobs) => {
+                            usb::doc_theo_cong(may_chu, *a, cong, driver)
                         }
                         _ => DocCong::KhongPhaiUsb,
                     };
                     VongDoc {
-                        co_may_in: may_in.as_ref().map(|(s, _, _, _)| *s),
-                        thuoc_tinh_may_in: may_in.as_ref().map_or(0, |(_, a, _, _)| *a),
+                        co_may_in: may_in.as_ref().map(|(s, _, _, _, _)| *s),
+                        thuoc_tinh_may_in: may_in.as_ref().map_or(0, |(_, a, _, _, _)| *a),
                         hang_doi,
                         khong_tim_thay_may_in: false,
                         la_may_usb,

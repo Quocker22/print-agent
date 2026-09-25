@@ -568,6 +568,25 @@ pub fn chay_ui(
         });
     }
 
+    // Nút "Nhật ký" (0.2.3, chủ yêu cầu): mở file nhật ký HÔM NAY bằng Notepad —
+    // NV/kỹ thuật không phải gõ lệnh PowerShell. Chưa có file (chưa có dòng nào
+    // hôm nay) thì mở thư mục nhật ký. Chỉ mở để ĐỌC, không đụng nội dung.
+    window.on_mo_nhat_ky(move || {
+        let ket_qua = match nhat_ky::file_hom_nay() {
+            Some(f) if f.exists() => std::process::Command::new("notepad.exe").arg(&f).spawn().map(|_| ()),
+            _ => match nhat_ky::thu_muc_nhat_ky() {
+                Some(d) => {
+                    let _ = std::fs::create_dir_all(&d);
+                    std::process::Command::new("explorer.exe").arg(&d).spawn().map(|_| ())
+                }
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = ket_qua {
+            eprintln!("[print-agent] không mở được nhật ký: {}", e);
+        }
+    });
+
     // Nút "Đã hiểu" trên dải cảnh báo (R1): NV đã đọc — tắt dải hoá đơn, ẩn
     // dải sự cố máy in tới khi trạng thái máy in đổi.
     {
