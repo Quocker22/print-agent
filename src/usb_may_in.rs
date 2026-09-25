@@ -55,13 +55,19 @@ const BIT_KHONG_LOI: u8 = 0x08;
 const BIT_HET_GIAY: u8 = 0x20;
 
 /// Một lần đọc thiết bị USB.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocUsb {
     /// Byte của `IOCTL_USBPRINT_GET_LPT_STATUS`.
     pub byte: u8,
     /// Trường `STATUS:` trong chuỗi IEEE 1284, viết hoa, đã cắt khoảng trắng —
     /// `None` khi máy không có trường này (hoặc hỏi chuỗi 1284 lỗi).
     pub status: Option<String>,
+    /// Trạng thái RIÊNG của hãng (hex) — chỉ máy HP dòng SPL (gốc Samsung):
+    /// vendor GET 0x02 như "HP Printer Status" (shj2msm.exe) hỏi. CHỈ GHI NHẬT KÝ
+    /// để giải mã (25/09) — chưa dùng để quyết.
+    pub hang: Option<String>,
+    /// Vendor GET 0x0A wValue 0x0005 (sức chứa / mức giấy khay), hex.
+    pub khay: Option<String>,
 }
 
 /// Tình trạng máy suy ra từ một lần đọc.
@@ -106,9 +112,15 @@ impl DocUsb {
         }
     }
 
-    /// Dạng ngắn cho vết từng hoá đơn: `0x98/BUSY`, `0x18/-` (không có STATUS).
+    /// Dạng ngắn cho vết từng hoá đơn: `0x98/BUSY`, `0x18/-` (không có STATUS),
+    /// kèm `h=<hex>` trạng thái riêng của hãng khi có.
     pub fn mo_ta_ngan(&self) -> String {
-        format!("0x{:02X}/{}", self.byte, self.status.as_deref().unwrap_or("-"))
+        let mut s = format!("0x{:02X}/{}", self.byte, self.status.as_deref().unwrap_or("-"));
+        if let Some(h) = &self.hang {
+            s.push_str(" h=");
+            s.push_str(h);
+        }
+        s
     }
 
     /// `chiTiet` cho nhật ký/ZaloCRM, vd
@@ -118,6 +130,10 @@ impl DocUsb {
         if let Some(st) = &self.status {
             s.push_str(" STATUS:");
             s.push_str(st);
+        }
+        if let Some(h) = &self.hang {
+            s.push_str(" hang=");
+            s.push_str(h);
         }
         match self.tinh_trang() {
             TinhTrangUsb::Loi(MaSuCo::HetGiay) => s.push_str(" — máy in báo hết giấy qua USB"),
@@ -196,12 +212,27 @@ pub struct GopDong {
 impl GopDong {
     /// Dòng CẦN GHI bây giờ (`None` = gộp vào dòng trước).
     pub fn them(&mut self, dong: &str, bay_gio: std::time::Instant, nhip: std::time::Duration) -> Option<String> {
+        self.them_gioi_han(dong, bay_gio, nhip, std::time::Duration::ZERO)
+    }
+
+    /// Như `them`, nhưng dòng ĐỔI cũng chỉ ghi khi đã cách lần ghi trước ít nhất
+    /// `toi_thieu` — dữ liệu đổi liên tục (bộ đếm trong trạng thái của hãng) không
+    /// làm phình nhật ký; trạng thái mới vẫn được ghi ở lần đọc kế tiếp đủ hạn.
+    pub fn them_gioi_han(
+        &mut self,
+        dong: &str,
+        bay_gio: std::time::Instant,
+        nhip: std::time::Duration,
+        toi_thieu: std::time::Duration,
+    ) -> Option<String> {
         let giong = self.truoc.as_deref() == Some(dong);
-        if giong && self.luc_ghi.is_some_and(|t| bay_gio.saturating_duration_since(t) < nhip) {
+        let tu_lan_ghi = self.luc_ghi.map(|t| bay_gio.saturating_duration_since(t));
+        let chua_du = tu_lan_ghi.is_some_and(|d| d < toi_thieu);
+        if (giong && tu_lan_ghi.is_some_and(|d| d < nhip)) || (!giong && chua_du) {
             self.lap += 1;
             return None;
         }
-        let ra = if self.lap > 0 { format!("{} [+{} lan doc giong dong truoc]", dong, self.lap) } else { dong.to_string() };
+        let ra = if self.lap > 0 { format!("{} [+{} lan doc da gop]", dong, self.lap) } else { dong.to_string() };
         self.truoc = Some(dong.to_string());
         self.lap = 0;
         self.luc_ghi = Some(bay_gio);
@@ -211,6 +242,29 @@ impl GopDong {
 
 /// Nhịp tối thiểu ghi lại dòng giữ nguyên (nhật ký USB liên tục, 25/09).
 pub const NHIP_GHI_LAI: std::time::Duration = std::time::Duration::from_secs(10);
+/// Dòng `usb_doc` đổi cũng chỉ ghi tối đa một dòng mỗi chừng này.
+pub const GHI_USB_TOI_THIEU: std::time::Duration = std::time::Duration::from_secs(2);
+/// Dòng `usb_khay` (255 byte hex) chỉ ghi khi đổi, tối đa một dòng mỗi chừng này.
+pub const GHI_KHAY_TOI_THIEU: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `IOCTL_USBPRINT_VENDOR_GET_COMMAND` (usbprint.h, index 15).
+pub const IOCTL_USBPRINT_VENDOR_GET_COMMAND: u32 = 0x0022_003C;
+
+/// Chỉ hỏi trạng thái riêng của hãng với máy HP dòng SPL (gốc Samsung, vd HP
+/// Laser 103/107/108): đúng loại máy mà "HP Printer Status" hỏi bằng vendor GET
+/// 0x02 / 0x0A. Hãng khác KHÔNG hỏi — nghĩa của lệnh vendor khác nhau theo hãng.
+/// (Lệnh 0x05/0x0200 của dòng này là HUỶ MỌI JOB — không bao giờ gửi.)
+pub fn hoi_duoc_trang_thai_hang(chuoi_1284: &str) -> bool {
+    let mfg_hp = tach_truong(chuoi_1284, &["MFG", "MANUFACTURER"]).is_some_and(|m| m.eq_ignore_ascii_case("HP"));
+    let spl = tach_truong(chuoi_1284, &["CMD", "COMMAND SET"])
+        .is_some_and(|c| c.split(',').any(|x| x.trim().eq_ignore_ascii_case("SPL")));
+    mfg_hp && spl
+}
+
+/// Byte → hex cách nhau khoảng trắng.
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02X}", x)).collect::<Vec<_>>().join(" ")
+}
 
 /// Kết quả một lần hỏi máy in theo cổng.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,21 +354,25 @@ mod win {
     struct NhatKyCong {
         cong: u32,
         gop: GopDong,
+        gop_khay: GopDong,
         chuoi_truoc: Option<String>,
     }
     static NHAT_KY: Mutex<Vec<NhatKyCong>> = Mutex::new(Vec::new());
 
-    fn ghi_lan_doc(cong: u32, dong: &str, chuoi_1284: Option<&str>) {
+    fn ghi_lan_doc(cong: u32, dong: &str, chuoi_1284: Option<&str>, khay: Option<&str>) {
         let mut ds = NHAT_KY.lock().unwrap_or_else(|p| p.into_inner());
         let vi_tri = match ds.iter().position(|n| n.cong == cong) {
             Some(i) => i,
             None => {
-                ds.push(NhatKyCong { cong, gop: GopDong::default(), chuoi_truoc: None });
+                ds.push(NhatKyCong { cong, gop: GopDong::default(), gop_khay: GopDong::default(), chuoi_truoc: None });
                 ds.len() - 1
             }
         };
         let n = &mut ds[vi_tri];
-        let dong_ghi = n.gop.them(dong, Instant::now(), NHIP_GHI_LAI);
+        let bay_gio = Instant::now();
+        let dong_ghi = n.gop.them_gioi_han(dong, bay_gio, NHIP_GHI_LAI, GHI_USB_TOI_THIEU);
+        // Khay: chỉ khi ĐỔI (nhịp ghi lại dài = không ghi lại dòng giữ nguyên).
+        let khay_ghi = khay.and_then(|k| n.gop_khay.them_gioi_han(k, bay_gio, std::time::Duration::from_secs(3600), GHI_KHAY_TOI_THIEU));
         let chuoi_moi = chuoi_1284.filter(|c| n.chuoi_truoc.as_deref() != Some(*c)).map(str::to_string);
         if let Some(c) = &chuoi_moi {
             n.chuoi_truoc = Some(c.clone());
@@ -325,6 +383,9 @@ mod win {
         }
         if let Some(c) = chuoi_moi {
             nhat_ky::ghi("usb_1284", &format!("cong=USB{:03} {}", cong, c));
+        }
+        if let Some(k) = khay_ghi {
+            nhat_ky::ghi("usb_khay", &format!("cong=USB{:03} {}", cong, k));
         }
     }
 
@@ -389,7 +450,36 @@ mod win {
         .ok()
         .and_then(|_| chuoi_1284(&bo_dem[..(nhan_id as usize).min(bo_dem.len())]));
         let status = chuoi.as_deref().and_then(tach_status);
-        Ok((DocUsb { byte: byte[0], status }, chuoi))
+        // Trạng thái riêng của hãng — chỉ HP dòng SPL (xem hoi_duoc_trang_thai_hang).
+        let (hang, khay) = if chuoi.as_deref().is_some_and(hoi_duoc_trang_thai_hang) {
+            (vendor_get(&h, [0x02, 0x00, 0x00], 64), vendor_get(&h, [0x0A, 0x00, 0x05], 255))
+        } else {
+            (None, None)
+        };
+        Ok((DocUsb { byte: byte[0], status, hang, khay }, chuoi))
+    }
+
+    /// Một vendor GET trên đường điều khiển (EP0) — không đi vào luồng in.
+    /// `vao` = {bRequest, wValue cao, wValue thấp}. Lỗi → `LOI(<mã>)`.
+    fn vendor_get(h: &Handle, vao: [u8; 3], kich_thuoc: usize) -> Option<String> {
+        let mut ra = vec![0u8; kich_thuoc];
+        let mut nhan: u32 = 0;
+        let kq = unsafe {
+            DeviceIoControl(
+                h.0,
+                IOCTL_USBPRINT_VENDOR_GET_COMMAND,
+                Some(vao.as_ptr().cast()),
+                3,
+                Some(ra.as_mut_ptr().cast()),
+                kich_thuoc as u32,
+                Some(&mut nhan),
+                None,
+            )
+        };
+        Some(match kq {
+            Ok(()) => hex(&ra[..(nhan as usize).min(kich_thuoc)]),
+            Err(e) => format!("LOI({})", e.code().0 & 0xFFFF),
+        })
     }
 
     /// Mọi (số cổng, đường dẫn) usbmon đã ghi trong registry (kể cả thiết bị
@@ -538,11 +628,11 @@ mod win {
         };
         match ket_qua {
             Ok((doc, chuoi)) => {
-                ghi_lan_doc(so, &doc.mo_ta(), chuoi.as_deref());
+                ghi_lan_doc(so, &doc.mo_ta(), chuoi.as_deref(), doc.khay.as_deref());
                 DocCong::Doc(doc)
             }
             Err(ly_do) => {
-                ghi_lan_doc(so, &format!("KHONG DOC DUOC: {}", ly_do), None);
+                ghi_lan_doc(so, &format!("KHONG DOC DUOC: {}", ly_do), None, None);
                 DocCong::KhongDocDuoc
             }
         }
@@ -563,7 +653,7 @@ mod tests {
     use super::*;
 
     fn doc(byte: u8, status: Option<&str>) -> DocUsb {
-        DocUsb { byte, status: status.map(str::to_string) }
+        DocUsb { byte, status: status.map(str::to_string), ..Default::default() }
     }
 
     #[test]
@@ -696,10 +786,10 @@ mod tests {
         for i in 1..=5 {
             assert_eq!(g.them("0x18 IDLE", t0 + Duration::from_millis(500 * i), nhip), None);
         }
-        assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(3), nhip).as_deref(), Some("0x98 BUSY [+5 lan doc giong dong truoc]"));
+        assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(3), nhip).as_deref(), Some("0x98 BUSY [+5 lan doc da gop]"));
         assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(4), nhip), None);
         // Giữ nguyên quá nhịp → ghi lại.
-        assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(14), nhip).as_deref(), Some("0x98 BUSY [+1 lan doc giong dong truoc]"));
+        assert_eq!(g.them("0x98 BUSY", t0 + Duration::from_secs(14), nhip).as_deref(), Some("0x98 BUSY [+1 lan doc da gop]"));
     }
 
     /// Khớp model thiết bị với driver máy in Windows — chuỗi 1284 THẬT của máy HCM.
@@ -716,5 +806,32 @@ mod tests {
         assert!(!khop_model("MFG:Xprinter;MDL:XP-365B;", "HP Laser 103 107 108"));
         assert!(!khop_model("MFG:HP;CLS:PRINTER;", "HP Laser 103 107 108"), "không có MDL");
         assert_eq!(tach_truong(hp, &["MDL", "MODEL"]), Some("HP Laser 103 107 108"));
+    }
+
+    /// Chỉ HP dòng SPL mới bị hỏi trạng thái riêng (vendor GET) — chuỗi thật HCM.
+    #[test]
+    fn chi_hp_spl_moi_hoi_trang_thai_hang() {
+        let hp108 = "MFG:HP;CMD:SPL,URF,FWV,PIC,EXT,PWGRaster;PRN:4ZB79A;MDL:HP Laser 103 107 108;CLS:PRINTER;STATUS:IDLE;";
+        assert!(hoi_duoc_trang_thai_hang(hp108));
+        assert!(!hoi_duoc_trang_thai_hang("MFG:HP;CMD:PJL,PCL,PCLXL,URF;MDL:HP LaserJet Pro 4003;"), "HP không SPL");
+        assert!(!hoi_duoc_trang_thai_hang("MFG:Samsung;CMD:SPL;MDL:M2020;"), "không phải HP");
+        assert!(!hoi_duoc_trang_thai_hang("MFG:Xprinter;CMD:ESC/POS;"));
+        assert_eq!(hex(&[0x02, 0xAB, 0x00]), "02 AB 00");
+        let d = DocUsb { byte: 0x98, status: Some("BUSY".into()), hang: Some("00 01".into()), khay: Some("0A".into()) };
+        assert_eq!(d.mo_ta_ngan(), "0x98/BUSY h=00 01");
+        assert!(d.mo_ta().contains("hang=00 01") && !d.mo_ta().contains("khay"), "khay ghi dòng riêng");
+    }
+
+    /// Dòng đổi liên tục (bộ đếm trong trạng thái của hãng) không ghi dày hơn `toi_thieu`.
+    #[test]
+    fn gop_dong_gioi_han_dong_doi_lien_tuc() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let (nhip, toi_thieu) = (Duration::from_secs(10), Duration::from_secs(2));
+        let mut g = GopDong::default();
+        assert!(g.them_gioi_han("a0", t0, nhip, toi_thieu).is_some());
+        assert!(g.them_gioi_han("a1", t0 + Duration::from_millis(500), nhip, toi_thieu).is_none(), "đổi nhưng chưa đủ 2 s");
+        assert!(g.them_gioi_han("a2", t0 + Duration::from_millis(1000), nhip, toi_thieu).is_none());
+        assert_eq!(g.them_gioi_han("a3", t0 + Duration::from_millis(2000), nhip, toi_thieu).as_deref(), Some("a3 [+2 lan doc da gop]"));
     }
 }

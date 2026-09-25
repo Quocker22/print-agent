@@ -1870,7 +1870,7 @@ pub(crate) mod gia {
     pub fn vong_usb((byte, status): (u8, &str)) -> VongDoc {
         VongDoc {
             la_may_usb: true,
-            usb: Some(crate::usb_may_in::DocUsb { byte, status: Some(status.to_string()) }),
+            usb: Some(crate::usb_may_in::DocUsb { byte, status: Some(status.to_string()), ..Default::default() }),
             ..vong(0, vec![])
         }
     }
@@ -3335,7 +3335,7 @@ mod tests {
     /// giấy hỏng — bản 0.2.1 báo `da_in`. Nay là thiếu tin, chờ tiếp.
     #[test]
     fn g5_status_thieu_sau_busy_khong_phai_in_xong() {
-        let thieu = VongDoc { usb: Some(DocUsb { byte: 0x98, status: None }), ..vong_usb(USB_DANG_IN) };
+        let thieu = VongDoc { usb: Some(DocUsb { byte: 0x98, status: None, ..Default::default() }), ..vong_usb(USB_DANG_IN) };
         let mut vongs = vec![vong_may_usb(vec![job(7, JOB_STATUS_PRINTING)])];
         vongs.extend(std::iter::repeat_n(vong_usb(USB_DANG_IN), 3));
         vongs.push(thieu);

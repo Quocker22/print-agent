@@ -1073,7 +1073,7 @@ mod tests {
     fn u3_may_khong_status_du_lan_sach_la_da_in_kem_ghi_chu() {
         let t0 = Instant::now();
         let mut j = moi_usb(true, t0);
-        let khong_status = |byte: u8| VongDoc { usb: Some(DocUsb { byte, status: None }), ..vong_usb(USB_RANH) };
+        let khong_status = |byte: u8| VongDoc { usb: Some(DocUsb { byte, status: None, ..Default::default() }), ..vong_usb(USB_RANH) };
         assert_eq!(buoc(&mut j, &khong_status(0x10), t0), None, "lỗi");
         for _ in 0..spooler::SO_LAN_USB_KHONG_THAY_IN - 1 {
             assert_eq!(buoc(&mut j, &khong_status(0x18), t0), None);
@@ -1131,7 +1131,7 @@ mod tests {
         let t0 = Instant::now();
         let mut j = moi_usb(true, t0);
         assert_eq!(buoc(&mut j, &vong_usb(USB_DANG_IN), t0), None);
-        let thieu = VongDoc { usb: Some(DocUsb { byte: 0x98, status: None }), ..vong_usb(USB_DANG_IN) };
+        let thieu = VongDoc { usb: Some(DocUsb { byte: 0x98, status: None, ..Default::default() }), ..vong_usb(USB_DANG_IN) };
         for _ in 0..20 {
             assert_eq!(buoc(&mut j, &thieu, t0), None);
         }
