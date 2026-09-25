@@ -1151,6 +1151,11 @@ fn chay_gui_nhat_ky(duong_gui: Arc<DuongGui>, dung: Arc<AtomicBool>) {
     let mut nghi = NHIP_NHAT_KY;
     let mut loi_truoc: Option<String> = None;
     while !dung.load(Ordering::SeqCst) {
+        // Lệnh huỷ / bỏ theo dõi đang chờ ack: nhường (một ack sống mỗi kết nối).
+        if duong_gui.co_uu_tien() {
+            ngu_tung_khuc(&dung, Duration::from_millis(500));
+            continue;
+        }
         let (lo, bo_qua) = nhat_ky::lay_lo_gui(LO_NHAT_KY);
         if lo.is_empty() && bo_qua == 0 {
             ngu_tung_khuc(&dung, NHIP_NHAT_KY);
@@ -1225,6 +1230,7 @@ pub fn khoi_chay_yeu_cau_hang_doi(
     let ids: Vec<String> = muc.iter().map(|m| m.id.clone()).collect();
     let (dg, tt) = (duong_gui.clone(), trang_thai.clone());
     let da_spawn = std::thread::Builder::new().name("yeu-cau-hang-doi".into()).spawn(move || {
+        let _uu_tien = dg.giu_uu_tien();
         for m in &muc {
             // Bấm Lưu (cấu hình khác) giữa loạt: trạng thái đã dựng lại — thôi, không
             // gửi thêm yêu cầu nào người dùng không còn thấy.

@@ -208,9 +208,32 @@ struct TrangThaiGui {
 #[derive(Default)]
 pub struct DuongGui {
     inner: Mutex<TrangThaiGui>,
+    /// Số yêu cầu hàng đợi (huỷ / bỏ theo dõi) đang chạy — luồng gửi nhật ký
+    /// nhường (một ack sống mỗi kết nối: lô nhật ký chậm không được bắt lệnh huỷ chờ).
+    uu_tien: std::sync::atomic::AtomicUsize,
+}
+
+/// Giữ quyền ưu tiên tới khi rơi khỏi phạm vi.
+pub struct UuTien<'a>(&'a DuongGui);
+
+impl Drop for UuTien<'_> {
+    fn drop(&mut self) {
+        self.0.uu_tien.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl DuongGui {
+    /// Yêu cầu hàng đợi bắt đầu — luồng nhật ký nhường tới khi thả.
+    pub fn giu_uu_tien(&self) -> UuTien<'_> {
+        self.uu_tien.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        UuTien(self)
+    }
+
+    /// Có yêu cầu hàng đợi đang chạy không.
+    pub fn co_uu_tien(&self) -> bool {
+        self.uu_tien.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     fn khoa(&self) -> std::sync::MutexGuard<'_, TrangThaiGui> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }

@@ -422,7 +422,9 @@ export component MainWindow inherits Window {
         if !root.cau_hinh_mo: Text { text: "IN GẦN ĐÂY"; color: #69727F; font-size: 12px; font-weight: 600; }
         if !root.cau_hinh_mo: Rectangle {
             background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
-            height: root.hd_hien ? 98px : 160px;
+            // Hàng đợi hiện: còn MỘT dòng (cuộn xem thêm) — ca nặng nhất (dải đỏ nhiều
+            // dòng + hàng đợi + loạt) vẫn vừa màn 1366×768 có thanh taskbar.
+            height: root.hd_hien ? 50px : 160px;
             ScrollView {
                 VerticalLayout {
                     // Dòng 1: số hoá đơn · khách (hoặc id job đã cắt token) + giờ.

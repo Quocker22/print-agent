@@ -49,7 +49,9 @@ pub const SO_LAN_GUI_TOI_DA: u32 = 3;
 /// Nghỉ giữa hai lần hỏi.
 pub const NGHI_HOI_LAI: Duration = Duration::from_secs(3);
 /// Nút xác nhận bỏ qua cú bấm tới sớm hơn chừng này sau khi hộp mở (bấm đúp).
-pub const CHONG_BAM_DUP: Duration = Duration::from_millis(500);
+/// 900 ms = mức CHẬM NHẤT Windows cho đặt thời gian bấm đúp (mặc định 500 ms) —
+/// người thật cần lâu hơn thế để đọc câu hỏi.
+pub const CHONG_BAM_DUP: Duration = Duration::from_millis(900);
 
 /// Câu giải thích "Vì sao không huỷ được?" — cùng lời với server (§8.2).
 pub const VI_SAO_DANG_IN: &str =
@@ -665,7 +667,10 @@ impl HangDoiApp {
                 // Chưa rõ: nói đúng điều ảnh chụp mới nhất cho biết về hoá đơn.
                 Some(ThaoTac::ChuaRo { loai }) => {
                     let viec = if *loai == LoaiViec::Huy { "huỷ" } else { "bỏ" };
-                    let chu = if con_trong_anh && *loai == LoaiViec::Huy && huy_duoc(muc) {
+                    let chu = if !self.cua_ket_noi_nay {
+                        // Ảnh chụp cũ (trước khi mất kết nối) không nói được gì.
+                        format!("Chưa rõ đã {} được chưa — ZaloCRM không trả lời. Đang chờ hàng đợi mới để biết.", viec)
+                    } else if con_trong_anh && *loai == LoaiViec::Huy && huy_duoc(muc) {
                         "Chưa rõ đã huỷ được chưa — ZaloCRM không trả lời. Hoá đơn VẪN đang chờ trong hàng đợi: \
                          bấm \"Huỷ lại\" để hỏi lại."
                             .to_string()
@@ -682,6 +687,7 @@ impl HangDoiApp {
                 }
             };
             let co_nut_huy_lai = con_trong_anh
+                && self.cua_ket_noi_nay
                 && huy_duoc(muc)
                 && matches!(tt, Some(ThaoTac::ThatBai { loai: LoaiViec::Huy, .. } | ThaoTac::ChuaRo { loai: LoaiViec::Huy }));
             DongHangDoi {
@@ -771,6 +777,17 @@ impl HangDoiApp {
     }
 }
 
+/// Ack đúng LOẠI yêu cầu: huỷ có `trangThaiMoi`, và huỷ `ok:true` chỉ với `cach`
+/// `chua_gui`/`da_huy_truoc` (hợp đồng §8.2); bỏ theo dõi thì không có `trangThaiMoi`.
+/// Ack trễ của yêu cầu khác loại cho CÙNG hoá đơn (trùng id ack 1/999) không được
+/// thành "Đã huỷ".
+fn ack_dung_loai(loai: LoaiViec, kq: &bao_cao::KetQuaHuy) -> bool {
+    match loai {
+        LoaiViec::Huy => kq.la_ack_huy && (!kq.ok || kq.cach == "chua_gui" || kq.cach == "da_huy_truoc"),
+        LoaiViec::BoTheoDoi => !kq.la_ack_huy,
+    }
+}
+
 /// Gửi MỘT yêu cầu tới khi có câu trả lời chắc chắn, hoặc hết hạn. Huỷ / bỏ
 /// theo dõi lặp lại là AN TOÀN (server: `da_huy_truoc` / điều kiện `khong_ro`)
 /// nên hết giờ chờ ack thì hỏi lại thay vì bỏ ngang ở "chưa rõ".
@@ -798,9 +815,9 @@ pub fn gui_yeu_cau(
         lan += 1;
         bao_lan(lan, da_gui);
         match dg.gui_ack_ro(loai.su_kien(), serde_json::json!({ "printJobId": id }), CanHoTro::HangDoi, CHO_ACK) {
-            Ok(v) => match bao_cao::doc_ket_qua_huy(&v) {
-                Some(kq) if kq.id == id && kq.ok => return KetCuc::Duoc { cach: kq.cach, noi_dung: kq.noi_dung },
-                Some(kq) if kq.id == id => return KetCuc::KhongDuoc { loi: kq.loi, noi_dung: kq.noi_dung },
+            Ok(v) => match bao_cao::doc_ket_qua_huy(&v).filter(|kq| kq.id == id && ack_dung_loai(loai, kq)) {
+                Some(kq) if kq.ok => return KetCuc::Duoc { cach: kq.cach, noi_dung: kq.noi_dung },
+                Some(kq) => return KetCuc::KhongDuoc { loi: kq.loi, noi_dung: kq.noi_dung },
                 _ => {
                     da_gui += 1;
                     ly_do = "tra loi khong dung hoa don".into();
@@ -1253,7 +1270,7 @@ mod tests {
 
     #[test]
     fn gui_ok_mot_lan() {
-        let (dg, cong) = duong(vec![Ok(json!({"id": "a", "ok": true, "cach": "chua_gui", "noiDung": "Đã huỷ"}))], true);
+        let (dg, cong) = duong(vec![Ok(json!({"id": "a", "ok": true, "trangThaiMoi": "da_huy", "cach": "chua_gui", "noiDung": "Đã huỷ"}))], true);
         let (kc, lan) = chay(&dg, LoaiViec::Huy);
         assert_eq!(kc, KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: "Đã huỷ".into() });
         assert_eq!(lan, 1);
@@ -1267,14 +1284,28 @@ mod tests {
         let (dg, cong) = duong(
             vec![
                 Ok(json!({"ok": true, "soDong": 5})),
-                Ok(json!({"id": "khac", "ok": true, "cach": "chua_gui", "noiDung": "Đã huỷ"})),
-                Ok(json!({"id": "a", "ok": false, "loi": "DANG_IN", "noiDung": "đang in"})),
+                // Ack trễ của "bỏ theo dõi" CÙNG hoá đơn (không có trangThaiMoi) — không phải câu trả lời huỷ.
+                Ok(json!({"id": "a", "ok": true, "noiDung": "Đã bỏ khỏi hàng đợi"})),
+                Ok(json!({"id": "a", "ok": false, "trangThaiMoi": "dang_gui", "loi": "DANG_IN", "noiDung": "đang in"})),
             ],
             true,
         );
         let (kc, _) = chay(&dg, LoaiViec::Huy);
         assert_eq!(kc, KetCuc::KhongDuoc { loi: "DANG_IN".into(), noi_dung: "đang in".into() });
         assert_eq!(cong.da_gui.lock().unwrap().len(), 3);
+        // Ack huỷ của hoá đơn KHÁC, hay ok:true mà cach lạ → không tin.
+        let (dg, _) = duong(
+            vec![
+                Ok(json!({"id": "khac", "ok": true, "trangThaiMoi": "da_huy", "cach": "chua_gui", "noiDung": "Đã huỷ"})),
+                Ok(json!({"id": "a", "ok": true, "trangThaiMoi": "da_huy", "cach": "la", "noiDung": "?"})),
+                Ok(json!({"id": "a", "ok": true, "trangThaiMoi": "da_huy", "cach": "da_huy_truoc", "noiDung": ""})),
+            ],
+            true,
+        );
+        assert_eq!(chay(&dg, LoaiViec::Huy).0, KetCuc::Duoc { cach: "da_huy_truoc".into(), noi_dung: String::new() });
+        // Bỏ theo dõi không nhận ack của lệnh huỷ.
+        let (dg, _) = duong(vec![Ok(json!({"id": "a", "ok": true, "trangThaiMoi": "da_huy", "cach": "chua_gui", "noiDung": "x"}))], true);
+        assert!(matches!(chay(&dg, LoaiViec::BoTheoDoi).0, KetCuc::ChuaRo { .. }));
         // Chỉ toàn ack lạ → chưa rõ, không bao giờ "được".
         let (dg, _) = duong(vec![Ok(json!({"ok": true, "soDong": 1})); 3], true);
         assert!(matches!(chay(&dg, LoaiViec::Huy).0, KetCuc::ChuaRo { .. }));
@@ -1284,7 +1315,7 @@ mod tests {
     #[test]
     fn het_gio_hoi_lai_ra_cau_tra_loi_chac() {
         let (dg, _) = duong(
-            vec![Err("het gio cho ack".into()), Ok(json!({"id": "a", "ok": true, "cach": "da_huy_truoc", "noiDung": ""}))],
+            vec![Err("het gio cho ack".into()), Ok(json!({"id": "a", "ok": true, "trangThaiMoi": "da_huy", "cach": "da_huy_truoc", "noiDung": ""}))],
             true,
         );
         let (kc, lan) = chay(&dg, LoaiViec::Huy);
@@ -1294,7 +1325,7 @@ mod tests {
 
     #[test]
     fn khong_duoc_tra_ngay_khong_hoi_lai() {
-        let (dg, cong) = duong(vec![Ok(json!({"id": "a", "ok": false, "loi": "DA_IN", "noiDung": "đã in"}))], true);
+        let (dg, cong) = duong(vec![Ok(json!({"id": "a", "ok": false, "trangThaiMoi": "da_in", "loi": "DA_IN", "noiDung": "đã in"}))], true);
         let (kc, _) = chay(&dg, LoaiViec::Huy);
         assert_eq!(kc, KetCuc::KhongDuoc { loi: "DA_IN".into(), noi_dung: "đã in".into() });
         assert_eq!(cong.da_gui.lock().unwrap().len(), 1);

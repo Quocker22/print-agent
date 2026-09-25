@@ -109,6 +109,10 @@ pub fn doc_hang_doi(v: &Value) -> HangDoiServer {
 pub struct KetQuaHuy {
     /// `print_jobs.id` server trả — PHẢI khớp id đã hỏi (ack trùng id, xem net.rs CongSocket).
     pub id: String,
+    /// Ack của `yeu-cau-huy` LUÔN có khoá `trangThaiMoi` (null hoặc chuỗi); ack của
+    /// `yeu-cau-bo-theo-doi` thì không — phân biệt câu trả lời trễ của yêu cầu KHÁC
+    /// loại cho cùng hoá đơn (ack trùng id, giám sát vòng 2).
+    pub la_ack_huy: bool,
     pub ok: bool,
     /// `chua_gui` | `da_huy_truoc` (huỷ) — rỗng với bỏ theo dõi.
     pub cach: String,
@@ -120,7 +124,14 @@ pub struct KetQuaHuy {
 /// Ack → `KetQuaHuy`. Ack lạ (không có `ok`) ⇒ `None` (người gọi coi là "chưa rõ").
 pub fn doc_ket_qua_huy(v: &Value) -> Option<KetQuaHuy> {
     let ok = v.get("ok").and_then(Value::as_bool)?;
-    Some(KetQuaHuy { id: chu(v, "id"), ok, cach: chu(v, "cach"), loi: chu(v, "loi"), noi_dung: chu(v, "noiDung") })
+    Some(KetQuaHuy {
+        id: chu(v, "id"),
+        la_ack_huy: v.get("trangThaiMoi").is_some(),
+        ok,
+        cach: chu(v, "cach"),
+        loi: chu(v, "loi"),
+        noi_dung: chu(v, "noiDung"),
+    })
 }
 
 /// `su-co`: `{jobId, loai, chiTiet?, mayIn, luc}`.
