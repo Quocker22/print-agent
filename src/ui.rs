@@ -197,12 +197,28 @@ fn liet_ke_may_in() -> Vec<String> {
 /// Ghép giá trị `hien_tai` (từ config) vào đầu `ds` nếu chưa có — để ComboBox
 /// luôn hiển thị đúng cấu hình đang lưu kể cả khi máy in đó không còn trong
 /// danh sách liệt kê (đã tháo, đổi tên...). Trả về ModelRc để set vào .slint.
-fn model_co_gia_tri_hien_tai(mut ds: Vec<String>, hien_tai: &str) -> ModelRc<slint::SharedString> {
+fn model_co_gia_tri_hien_tai(ds: &[String]) -> ModelRc<slint::SharedString> {
+    let hang: Vec<slint::SharedString> = ds.iter().map(|s| s.as_str().into()).collect();
+    ModelRc::new(VecModel::from(hang))
+}
+
+/// Danh sách cho ComboBox + VỊ TRÍ của giá trị cấu hình trong đó (0.2.3). Giá
+/// trị chưa có trong danh sách (máy in đã tháo/đổi tên) được ghép vào đầu.
+/// VÌ SAO cần vị trí: ComboBox chỉ gắn `current-value` thì tự nhảy về mục đầu
+/// (vd "Microsoft XPS Document Writer") — NV bấm Lưu là đổi máy in (HCM 25/09:
+/// app nối lên với máy XPS lúc 15:19).
+fn ds_va_vi_tri(mut ds: Vec<String>, hien_tai: &str) -> (Vec<String>, i32) {
     if !hien_tai.is_empty() && !ds.iter().any(|s| s == hien_tai) {
         ds.insert(0, hien_tai.to_string());
     }
-    let hang: Vec<slint::SharedString> = ds.into_iter().map(Into::into).collect();
-    ModelRc::new(VecModel::from(hang))
+    let vi_tri = ds.iter().position(|s| s == hien_tai).unwrap_or(0) as i32;
+    (ds, vi_tri)
+}
+
+/// Giá trị đang chọn: theo VỊ TRÍ trong danh sách Rust giữ; vị trí hỏng thì lấy
+/// chữ ComboBox đang hiện.
+fn gia_tri_chon(ds: &[String], vi_tri: i32, chu_hien: &str) -> String {
+    usize::try_from(vi_tri).ok().and_then(|i| ds.get(i)).cloned().unwrap_or_else(|| chu_hien.trim().to_string())
 }
 
 /// Trạng thái tray-icon (icon/menu) — tách khỏi state chung vì chỉ dùng trong
@@ -417,13 +433,17 @@ pub fn chay_ui(
     // 2 ComboBox: đổ danh sách TRƯỚC (máy in thật từ Get-Printer, khay cố định),
     // ghép giá trị config hiện tại vào nếu thiếu để không mất cấu hình cũ, RỒI
     // mới set current-value = giá trị config (ComboBox current-value <=> f_*).
-    window.set_ds_may_in(model_co_gia_tri_hien_tai(liet_ke_may_in(), &cfg.printer_name));
-    window.set_ds_khay(model_co_gia_tri_hien_tai(
-        DANH_SACH_KHAY.iter().map(|s| s.to_string()).collect(),
-        &cfg.tray,
-    ));
+    let (ds_may_in, i_may_in) = ds_va_vi_tri(liet_ke_may_in(), &cfg.printer_name);
+    let (ds_khay, i_khay) = ds_va_vi_tri(DANH_SACH_KHAY.iter().map(|s| s.to_string()).collect(), &cfg.tray);
+    window.set_ds_may_in(model_co_gia_tri_hien_tai(&ds_may_in));
+    window.set_ds_khay(model_co_gia_tri_hien_tai(&ds_khay));
+    // Thứ tự: danh sách → vị trí → chữ (ComboBox tự đặt chữ theo vị trí khi nạp).
+    window.set_i_may_in(i_may_in);
+    window.set_i_khay(i_khay);
     window.set_f_may_in(cfg.printer_name.clone().into());
     window.set_f_tray(cfg.tray.clone().into());
+    let ds_may_in = Rc::new(ds_may_in);
+    let ds_khay = Rc::new(ds_khay);
     // Đọc registry để ô tick hiện ĐÚNG CHIỀU thực tế, không mặc định false —
     // hiển thị sai làm người dùng tưởng chưa bật rồi bấm tắt mất (xem
     // tu_khoi_dong::dang_bat, nó còn đối chiếu đúng đường dẫn exe đang chạy).
@@ -489,14 +509,16 @@ pub fn chay_ui(
         let tray = tray.clone();
         let net_dang_chay = net_dang_chay.clone();
         let duong_gui = duong_gui.clone();
+        let ds_may_in = ds_may_in.clone();
+        let ds_khay = ds_khay.clone();
         window.on_luu(move || {
             let Some(w) = w_weak.upgrade() else { return };
 
             let cfg_moi = Config {
                 server_url: w.get_f_server().trim().to_string(),
                 token: w.get_f_token().trim().to_string(),
-                printer_name: w.get_f_may_in().trim().to_string(),
-                tray: w.get_f_tray().trim().to_string(),
+                printer_name: gia_tri_chon(&ds_may_in, w.get_i_may_in(), &w.get_f_may_in()),
+                tray: gia_tri_chon(&ds_khay, w.get_i_khay(), &w.get_f_tray()),
                 paper_size: cfg_dang_dung.borrow().paper_size.clone(),
             };
 
@@ -708,4 +730,25 @@ pub fn chay_ui(
     window.show()?;
     slint::run_event_loop_until_quit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_chon {
+    use super::*;
+
+    /// HCM 25/09: ô Máy in tự nhảy về mục đầu ("Microsoft XPS Document Writer"),
+    /// bấm Lưu là đổi máy in. Vị trí phải trỏ đúng máy đang cấu hình.
+    #[test]
+    fn vi_tri_dung_may_dang_cau_hinh() {
+        let ds = vec!["Microsoft XPS Document Writer".to_string(), "Fax".into(), "HP Laser 103 107 108".into()];
+        let (ds, i) = ds_va_vi_tri(ds, "HP Laser 103 107 108");
+        assert_eq!(i, 2);
+        assert_eq!(gia_tri_chon(&ds, i, "Microsoft XPS Document Writer"), "HP Laser 103 107 108");
+        // Máy trong cấu hình không còn trong Windows → ghép vào đầu, vị trí 0.
+        let (ds, i) = ds_va_vi_tri(vec!["Fax".into()], "HP cu");
+        assert_eq!((ds[0].as_str(), i), ("HP cu", 0));
+        // Vị trí hỏng → chữ đang hiện.
+        assert_eq!(gia_tri_chon(&ds, 9, " Fax "), "Fax");
+        assert_eq!(gia_tri_chon(&ds, -1, "Fax"), "Fax");
+    }
 }

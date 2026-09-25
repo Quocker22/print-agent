@@ -42,6 +42,11 @@ export component MainWindow inherits Window {
     // đồng bộ ngược về f_may_in/f_tray để on_luu đọc như cũ.
     in property <[string]> ds_may_in: [];
     in property <[string]> ds_khay: [];
+    // Vị trí đang chọn trong 2 danh sách — Rust đặt đúng vị trí của cấu hình
+    // (0.2.3: chỉ gắn current-value thì ComboBox tự nhảy về mục ĐẦU danh sách —
+    // "Microsoft XPS Document Writer" — bấm Lưu là đổi máy in). Lưu đọc theo vị trí.
+    in-out property <int> i_may_in: 0;
+    in-out property <int> i_khay: 0;
     // Tự khởi động cùng Windows. Rust đọc registry lúc mở cửa sổ để đặt đúng
     // chiều, và ghi lại khi người dùng bấm (xem src/tu_khoi_dong.rs).
     in-out property <bool> f_tu_khoi_dong: false;
@@ -176,11 +181,13 @@ export component MainWindow inherits Window {
                 Text { text: "Máy in"; color: #69727F; font-size: 11px; }
                 ComboBox {
                     model: root.ds_may_in;
+                    current-index <=> root.i_may_in;
                     current-value <=> root.f_may_in;
                 }
                 Text { text: "Khay"; color: #69727F; font-size: 11px; }
                 ComboBox {
                     model: root.ds_khay;
+                    current-index <=> root.i_khay;
                     current-value <=> root.f_tray;
                 }
                 // Bấm là áp dụng NGAY, không chờ nút Lưu: đây là cài đặt của
