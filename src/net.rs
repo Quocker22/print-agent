@@ -156,13 +156,7 @@ impl CongGui for CongSocket {
         let (gui, nhan) = mpsc::channel::<serde_json::Value>();
         khoa(&self.0)
             .emit_with_ack(su_kien, gia_tri, cho, move |p: Payload, _c: RawClient| {
-                let v = match p {
-                    Payload::Text(mut ds) if !ds.is_empty() => ds.swap_remove(0),
-                    #[allow(deprecated)]
-                    Payload::String(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
-                    _ => serde_json::Value::Null,
-                };
-                let _ = gui.send(v);
+                let _ = gui.send(gia_tri_ack(p));
             })
             .map_err(|e| e.to_string())?;
         nhan.recv_timeout(cho).map_err(|_| "het gio cho ack".to_string())
@@ -1090,6 +1084,26 @@ pub fn khoi_chay(
 /// Chạy vòng đời kết nối socket.io — GỌI TỪ THREAD RIÊNG (qua `khoi_chay`).
 /// Mỗi lần đổi trạng thái (nối/mất/job xong/lỗi) đều cập nhật `trang_thai`
 /// để UI (thread khác) đọc thấy ngay ở frame kế tiếp. Thoát khi `dung` bật.
+/// Giá trị ack ĐẦU TIÊN server trả (`ack({ok:true})` → `{ok:true}`).
+///
+/// rust_socketio 0.6 (`handle_ack`) dựng `Payload::from(packet.data)` — data của
+/// gói ack là chuỗi MẢNG các đối số (`[{"ok":true}]`), nên payload thành
+/// `Text([ Array([{ok:true}]) ])`: phải bóc thêm một lớp mảng. Lấy thẳng phần tử
+/// đầu (bản đầu 0.2.4) là thấy `[...]`, không có `ok` → coi như hỏng → gửi lại
+/// cùng lô mãi (soát trước khi lên prod 25/09).
+fn gia_tri_ack(p: Payload) -> serde_json::Value {
+    let dau = match p {
+        Payload::Text(mut ds) if !ds.is_empty() => ds.swap_remove(0),
+        #[allow(deprecated)]
+        Payload::String(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    };
+    match dau {
+        serde_json::Value::Array(mut ds) if !ds.is_empty() => ds.swap_remove(0),
+        v => v,
+    }
+}
+
 /// Số dòng tối đa một lô `nhat-ky-app` (hợp đồng: 1..500).
 const LO_NHAT_KY: usize = 500;
 /// Nhịp gửi nhật ký khi rảnh; còn nhiều dòng thì gửi lô kế ngay.
@@ -2224,6 +2238,43 @@ mod tests {
         let v = e.lock().unwrap()[0].1.clone();
         let ct = v["chiTiet"].as_str().unwrap_or_default().to_string();
         assert!(ct.contains("bộ nhớ máy in") && !ct.contains("hàng đợi Windows"), "{}", ct);
+    }
+
+    /// Ack từ rust_socketio 0.6: data gói ack là CHUỖI MẢNG đối số → Text([Array[obj]]).
+    #[test]
+    fn gia_tri_ack_boc_lop_mang_cua_rust_socketio() {
+        use serde_json::json;
+        // Đúng như handle_ack dựng: Payload::from(String "[{...}]").
+        let p = Payload::from(r#"[{"ok":true,"soDong":5}]"#.to_string());
+        assert_eq!(gia_tri_ack(p), json!({"ok": true, "soDong": 5}));
+        assert_eq!(gia_tri_ack(Payload::Text(vec![json!({"ok": false, "loi": "QUA_TAI"})])), json!({"ok": false, "loi": "QUA_TAI"}));
+        assert_eq!(gia_tri_ack(Payload::Text(vec![])), serde_json::Value::Null);
+        assert_eq!(gia_tri_ack(Payload::from(vec![1u8, 2])), serde_json::Value::Null);
+    }
+
+    /// ĐẦU-CUỐI (chạy tay): client rust_socketio THẬT gửi `nhat-ky-app` kèm ack tới một
+    /// server socket.io 4.x thật trả `ack({ok:true,...})` như backend ZaloCRM.
+    /// `ACK_URL=http://127.0.0.1:47811 cargo test -- --ignored ack_dau_cuoi`
+    #[test]
+    #[ignore]
+    fn ack_dau_cuoi_voi_server_socketio_that() {
+        let url = std::env::var("ACK_URL").expect("ACK_URL");
+        let client = ClientBuilder::new(url)
+            .namespace("/print-agent")
+            .transport_type(TransportType::Websocket)
+            .connect()
+            .expect("connect");
+        let (gui, nhan) = mpsc::channel::<serde_json::Value>();
+        let lo = vec![nhat_ky::DongGui { luc: std::time::SystemTime::now(), su_kien: "thu".into(), noi_dung: "a".into() }];
+        client
+            .emit_with_ack("nhat-ky-app", payload_nhat_ky(&lo, 0), Duration::from_secs(5), move |p: Payload, _c: RawClient| {
+                let _ = gui.send(gia_tri_ack(p));
+            })
+            .expect("emit");
+        let v = nhan.recv_timeout(Duration::from_secs(5)).expect("ack");
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["soDong"], 1);
+        let _ = client.disconnect();
     }
 
     /// 0.2.4: payload `nhat-ky-app` đúng hợp đồng (luc ISO ms, suKien, noiDung, boQua, phienBan).
