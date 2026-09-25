@@ -20,6 +20,7 @@
 
 use crate::bao_cao::{self, BoLocSuCo};
 use crate::config::Config;
+use crate::hang_doi;
 use crate::hop_thu_di::{CanHoTro, CongGui, DuongGui, KetQuaGui, ThuDi};
 use crate::job;
 use crate::nhat_ky;
@@ -1169,6 +1170,73 @@ fn chay_gui_nhat_ky(duong_gui: Arc<DuongGui>, dung: Arc<AtomicBool>) {
     }
 }
 
+/// Hỏi `lay-hang-doi` NGAY khi kết nối mới báo hỗ trợ `hang_doi`, rồi mỗi
+/// `NHIP_LAM_MOI`. Gửi thẳng (không hộp thư đi) — mất kết nối thì thôi.
+fn chay_lam_moi_hang_doi(duong_gui: Arc<DuongGui>, dung: Arc<AtomicBool>) {
+    let mut the_he_da_hoi: Option<u64> = None;
+    let mut luc_hoi = Instant::now();
+    while !dung.load(Ordering::SeqCst) {
+        if let Some(the_he) = duong_gui.the_he_ho_tro(CanHoTro::HangDoi) {
+            if the_he_da_hoi != Some(the_he) || luc_hoi.elapsed() >= hang_doi::NHIP_LAM_MOI {
+                let _ = duong_gui.gui_ngay("lay-hang-doi", serde_json::json!({}), CanHoTro::HangDoi);
+                the_he_da_hoi = Some(the_he);
+                luc_hoi = Instant::now();
+            }
+        }
+        ngu_tung_khuc(&dung, Duration::from_secs(1));
+    }
+}
+
+/// Gửi yêu cầu huỷ / bỏ theo dõi cho `muc` (TUẦN TỰ, một luồng riêng — không
+/// bao giờ trên luồng giao diện hay callback socket). Mỗi hoá đơn: nhật ký
+/// `huy_yeu_cau` → hỏi server (hỏi lại khi hết giờ) → kết cục vào trạng thái
+/// + nhật ký `huy_ket_qua`/`bo_theo_doi` (`ok=true`/`ok=false` đầu dòng, §8.9).
+///
+/// Xong hết thì hỏi ảnh chụp mới.
+pub fn khoi_chay_yeu_cau_hang_doi(
+    duong_gui: Arc<DuongGui>,
+    trang_thai: Arc<Mutex<TrangThaiChung>>,
+    loai: hang_doi::LoaiViec,
+    muc: Vec<bao_cao::MucHangDoi>,
+) {
+    if muc.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = muc.iter().map(|m| m.id.clone()).collect();
+    let (dg, tt) = (duong_gui.clone(), trang_thai.clone());
+    let da_spawn = std::thread::Builder::new().name("yeu-cau-hang-doi".into()).spawn(move || {
+        for m in &muc {
+            let (su_kien_yc, su_kien_kq) = match loai {
+                hang_doi::LoaiViec::Huy => ("huy_yeu_cau", "huy_ket_qua"),
+                hang_doi::LoaiViec::BoTheoDoi => ("bo_theo_doi_yeu_cau", "bo_theo_doi"),
+            };
+            nhat_ky::ghi(su_kien_yc, &format!("so={} id={}", m.so_hoa_don, m.id));
+            let kc = hang_doi::gui_yeu_cau(
+                &dg,
+                loai,
+                &m.id,
+                &mut |lan| khoa(&tt).hang_doi.bao_lan(&m.id, lan),
+                &mut |d| std::thread::sleep(d),
+                &Instant::now,
+            );
+            nhat_ky::ghi(su_kien_kq, &kc.dong_nhat_ky(m));
+            let mut t = khoa(&tt);
+            t.hang_doi.ket_thuc(&m.id, loai, &kc, Instant::now());
+            if loai == hang_doi::LoaiViec::Huy && matches!(kc, hang_doi::KetCuc::Duoc { .. }) {
+                t.ghi_da_huy(&m.id, &m.so_hoa_don, m.ten_khach.clone(), gio_hien_tai());
+            }
+        }
+        let _ = dg.gui_ngay("lay-hang-doi", serde_json::json!({}), CanHoTro::HangDoi);
+    });
+    if da_spawn.is_err() {
+        // Không có luồng thì không gửi gì — nói thẳng là CHƯA làm.
+        let mut t = khoa(&trang_thai);
+        for id in &ids {
+            t.hang_doi.ket_thuc(id, loai, &hang_doi::KetCuc::ChuaGui { ly_do: "khong tao duoc luong".into() }, Instant::now());
+        }
+    }
+}
+
 /// Ngủ `tong` theo từng khúc 500 ms — cờ dừng (bấm Lưu) có hiệu lực nhanh.
 fn ngu_tung_khuc(dung: &AtomicBool, tong: Duration) {
     let mut con = tong;
@@ -1239,6 +1307,15 @@ fn chay_net(
         let (dg, d) = (duong_gui.clone(), dung.clone());
         if let Err(e) = std::thread::Builder::new().name("gui-nhat-ky".into()).spawn(move || chay_gui_nhat_ky(dg, d)) {
             eprintln!("[print-agent] không spawn được luồng gửi nhật ký: {}", e);
+        }
+    }
+
+    // Luồng hỏi ảnh chụp hàng đợi (v5.1 §8.7): ngay khi kết nối mới báo hỗ trợ,
+    // rồi mỗi `NHIP_LAM_MOI` — server chỉ đẩy khi đổi, app tự biết ảnh còn tươi.
+    {
+        let (dg, d) = (duong_gui.clone(), dung.clone());
+        if let Err(e) = std::thread::Builder::new().name("hang-doi".into()).spawn(move || chay_lam_moi_hang_doi(dg, d)) {
+            eprintln!("[print-agent] không spawn được luồng hàng đợi: {}", e);
         }
     }
 
@@ -1340,6 +1417,8 @@ fn chay_net(
                     t.da_noi = true;
                     t.thong_bao_cuoi = None;
                     t.tu_choi_ket_noi = None;
+                    // Ảnh chụp hàng đợi cũ chỉ để xem tới khi kết nối này gửi ảnh mới.
+                    t.hang_doi.ket_noi_moi();
                 }
                 // Kết nối MỚI: quên hoTro của kết nối trước (§2); mọi event sau
                 // đây đi qua socket này (R4).
@@ -1372,18 +1451,38 @@ fn chay_net(
                 }
                 let ho_tro = bao_cao::doc_cau_hinh(&payload_dau(payload));
                 dg.nhan_cau_hinh(ho_tro);
-                khoa(&tt).server_ban_cu = false;
+                {
+                    let mut t = khoa(&tt);
+                    t.server_ban_cu = false;
+                    t.hang_doi.nhan_cau_hinh(ho_tro.hang_doi);
+                }
                 eprintln!("[print-agent] cau-hinh: {:?}", ho_tro);
                 nhat_ky::ghi(
                     "cau_hinh",
                     &format!(
-                        "khong_ro={} su_co={} trang_thai_may_in={}",
-                        ho_tro.khong_ro, ho_tro.su_co, ho_tro.trang_thai_may_in
+                        "khong_ro={} su_co={} trang_thai_may_in={} nhat_ky_app={} hang_doi={}",
+                        ho_tro.khong_ro, ho_tro.su_co, ho_tro.trang_thai_may_in, ho_tro.nhat_ky_app, ho_tro.hang_doi
                     ),
                 );
                 // Xả hộp thư đi + đọc máy in là I/O — KHÔNG làm trong callback
                 // (bài học 14–17/09: chặn callback là mất ping).
                 let _ = gm.send(LenhMayIn::CoCauHinh);
+            }
+        };
+
+        // Ảnh chụp hàng đợi server (v5.1 §8.7) — chỉ ghi trạng thái (khoá ngắn),
+        // nhật ký một dòng khi SỐ LƯỢNG đổi.
+        let on_hang_doi = {
+            let (tt, co) = (trang_thai.clone(), co.clone());
+            move |payload: Payload, _socket: RawClient| {
+                if da_nghi(&co) {
+                    return;
+                }
+                let anh = bao_cao::doc_hang_doi(&payload_dau(payload));
+                let doi = khoa(&tt).hang_doi.nhan_anh(anh, Instant::now());
+                if let Some(tom_tat) = doi {
+                    nhat_ky::ghi("hang_doi", &tom_tat);
+                }
             }
         };
 
@@ -1397,6 +1496,7 @@ fn chay_net(
             .on("open", on_open)
             .on("close", on_close)
             .on("cau-hinh", on_cau_hinh)
+            .on("hang-doi", on_hang_doi)
             .connect();
 
         match ket_noi {
@@ -1553,7 +1653,7 @@ mod tests {
     }
 
     fn du_ho_tro() -> HoTro {
-        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false }
+        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false, hang_doi: false }
     }
 
     /// In xong → ghi trạng thái cho UI + emit "ket-qua" đúng một lần.
@@ -2278,6 +2378,125 @@ mod tests {
         let v = nhan.recv_timeout(Duration::from_secs(5)).expect("ack");
         assert_eq!(v["ok"], true, "{v}");
         assert_eq!(v["soDong"], 1);
+        let _ = client.disconnect();
+    }
+
+    /// ĐẦU-CUỐI hàng đợi v5.1 (chạy tay): NGUYÊN ngăn mạng thật của app
+    /// (`khoi_chay` → callback `cau-hinh`/`hang-doi`, luồng hỏi lại, luồng gửi yêu
+    /// cầu) nối vào server socket.io 4.x giả theo hợp đồng (scratch `mock-hd/server.js`).
+    /// `HD_URL=http://127.0.0.1:47812 cargo test -- --ignored hang_doi_dau_cuoi --nocapture`
+    #[test]
+    #[ignore]
+    fn hang_doi_dau_cuoi_voi_server_socketio_that() {
+        use crate::hang_doi::{KetCuc, LoaiViec};
+        let url = std::env::var("HD_URL").expect("HD_URL");
+        let cfg = Arc::new(Config {
+            server_url: url,
+            token: "tok-e2e".into(),
+            printer_name: "HP e2e".into(),
+            tray: "Tự động".into(),
+            paper_size: "A5".into(),
+        });
+        let tt = Arc::new(Mutex::new(TrangThaiChung::default()));
+        let dg = Arc::new(DuongGui::default());
+        let _dk = khoi_chay(cfg, tt.clone(), dg.clone(), None);
+        let cho = |mo_ta: &str, dk: &dyn Fn(&TrangThaiChung) -> bool| {
+            let het = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < het {
+                if dk(&khoa(&tt)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("hết giờ chờ: {mo_ta}");
+        };
+        let khoi = |t: &TrangThaiChung| t.hang_doi.khoi(t.da_noi, None, Instant::now(), &|_| String::new());
+
+        // 1. Nối + cau-hinh (hang_doi) + ảnh chụp đầu tiên: 3 đang chờ, 1 chưa xác nhận.
+        cho("ảnh chụp đầu", &|t| khoi(t).dong.len() == 4 && khoi(t).dong[0].bat_nut);
+        assert!(dg.the_he_ho_tro(CanHoTro::HangDoi).is_some(), "cau-hinh báo hang_doi");
+        {
+            let k = khoi(&khoa(&tt));
+            assert_eq!(k.tieu_de, "HÀNG ĐỢI (3) · 1 chưa xác nhận");
+            assert!(k.dai_tam_giu.starts_with("2 hoá đơn đang chờ"));
+        }
+
+        // 2. Huỷ a1 qua đúng đường giao diện: bấm → xác nhận → luồng gửi yêu cầu.
+        let m = {
+            let mut t = khoa(&tt);
+            assert!(t.hang_doi.bam_huy("a1", true));
+            t.hang_doi.bat_dau("a1", LoaiViec::Huy, true).expect("xác nhận")
+        };
+        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, vec![m]);
+        cho("Đã huỷ a1", &|t| khoi(t).dong.iter().any(|d| d.id == "a1" && d.che_do == hang_doi::CheDo::DaHuy));
+        cho("server bỏ a1 khỏi ảnh chụp", &|t| khoi(t).tieu_de == "HÀNG ĐỢI (2) · 1 chưa xác nhận");
+        assert_eq!(khoa(&tt).jobs[0].trang_thai, job::DA_HUY, "In gần đây ghi Đã huỷ");
+
+        // 3. Huỷ lệnh đang gửi: giao diện không cho; hỏi thẳng server → KHÔNG huỷ được (DANG_IN).
+        assert!(!khoa(&tt).hang_doi.clone().bam_huy("d1", true));
+        let kc = hang_doi::gui_yeu_cau(&dg, LoaiViec::Huy, "d1", &mut |_| {}, &mut |d| std::thread::sleep(d), &Instant::now);
+        assert!(matches!(&kc, KetCuc::KhongDuoc { loi, .. } if loi == "DANG_IN"), "{kc:?}");
+
+        // 4. Bỏ theo dõi k1 (chưa xác nhận): Vì sao? → Bỏ khỏi hàng đợi → xác nhận.
+        let m = {
+            let mut t = khoa(&tt);
+            assert!(t.hang_doi.bam_vi_sao("k1"));
+            assert!(t.hang_doi.bam_bo("k1", true));
+            t.hang_doi.bat_dau("k1", LoaiViec::BoTheoDoi, true).expect("xác nhận bỏ")
+        };
+        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::BoTheoDoi, vec![m]);
+        cho("Đã bỏ k1", &|t| khoi(t).dong.iter().any(|d| d.id == "k1" && d.che_do == hang_doi::CheDo::DaBo));
+        cho("server bỏ k1", &|t| khoi(t).tieu_de == "HÀNG ĐỢI (2)");
+
+        // 5. Huỷ cả loạt còn lại (a2) qua "Huỷ cả N".
+        let ds = {
+            let mut t = khoa(&tt);
+            // a2 là lệnh tạm giữ duy nhất còn lại.
+            assert!(t.hang_doi.bam_huy_ca(true));
+            t.hang_doi.bat_dau_loat(true)
+        };
+        assert_eq!(ds.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a2"]);
+        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, ds);
+        cho("tổng kết loạt", &|t| khoi(t).loat_chu == "Đã huỷ 1/1 lệnh in");
+
+        // 6. Server có nhận `lay-hang-doi` (luồng hỏi lại + sau mỗi yêu cầu).
+        let dem = dg.gui_ack("dem", serde_json::json!({}), CanHoTro::HangDoi, Duration::from_secs(5)).expect("dem");
+        eprintln!("server đếm: {dem}");
+        assert!(dem["lay"].as_u64().unwrap_or(0) >= 1, "{dem}");
+        assert_eq!(dem["huy"], 3, "{dem}");
+        assert_eq!(dem["bo"], 1, "{dem}");
+    }
+
+    /// ĐẦU-CUỐI (chạy tay, ~70 s): server nhận `yeu-cau-huy` mà KHÔNG ack → app hỏi
+    /// lại đủ 3 lần rồi kết luận CHƯA RÕ (không bao giờ "Đã huỷ"), luồng không treo.
+    /// `HD_URL=http://127.0.0.1:47812 cargo test -- --ignored hang_doi_khong_ack --nocapture`
+    #[test]
+    #[ignore]
+    fn hang_doi_khong_ack_la_chua_ro() {
+        use crate::hang_doi::{KetCuc, LoaiViec};
+        let url = std::env::var("HD_URL").expect("HD_URL");
+        let dg = DuongGui::default();
+        // Cổng thật là RawClient của callback "open" — y như chay_net.
+        let (gui_raw, nhan_raw) = mpsc::channel::<RawClient>();
+        let gui_raw = Mutex::new(gui_raw);
+        let client = ClientBuilder::new(url)
+            .namespace("/print-agent")
+            .auth(serde_json::json!({ "token": "tok-e2e" }))
+            .transport_type(TransportType::Websocket)
+            .on("open", move |_p: Payload, raw: RawClient| {
+                let _ = khoa(&gui_raw).send(raw);
+            })
+            .connect()
+            .expect("connect");
+        let raw = nhan_raw.recv_timeout(Duration::from_secs(5)).expect("open");
+        dg.mo_ket_noi(Arc::new(CongSocket(Mutex::new(raw))), Instant::now());
+        dg.nhan_cau_hinh(HoTro { hang_doi: true, ..HoTro::default() });
+        let bat_dau = Instant::now();
+        let mut lan_cuoi = 0;
+        let kc = hang_doi::gui_yeu_cau(&dg, LoaiViec::Huy, "im_lang", &mut |n| lan_cuoi = n, &mut |d| std::thread::sleep(d), &Instant::now);
+        eprintln!("kết cục {:?} sau {:?}, {} lần", kc, bat_dau.elapsed(), lan_cuoi);
+        assert!(matches!(kc, KetCuc::ChuaRo { .. }), "{kc:?}");
+        assert_eq!(lan_cuoi, hang_doi::SO_LAN_GUI_TOI_DA);
         let _ = client.disconnect();
     }
 

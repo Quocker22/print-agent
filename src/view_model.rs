@@ -25,6 +25,8 @@ pub struct JobRow {
     pub khong_ro: bool,
     /// Đang xử lý (gửi xuống / chờ in ra) — tô xanh dương.
     pub dang_xu_ly: bool,
+    /// Đã huỷ (không in) — tô xám.
+    pub da_huy: bool,
     pub luc: String,
 }
 
@@ -80,8 +82,20 @@ fn nhan_va_viec(ma: Option<MaSuCo>) -> (&'static str, &'static str) {
 ///
 /// T4 (giám sát vòng 3): "sẽ tự in lại" CHỈ với mã không tiêu lượt thử
 /// (`MaSuCo::khong_tieu_luot`) — mã khác backend thử vài lần rồi `that_bai`.
+#[cfg(test)]
 pub fn nhan_job(trang_thai: &str, loai: Option<MaSuCo>, sau_khac_phuc: bool) -> String {
+    nhan_job_co_hang_doi(trang_thai, loai, sau_khac_phuc, false)
+}
+
+/// `nhan_job` khi server có hàng đợi (v5.1): hoá đơn app từ chối vì hết giấy
+/// nằm trong khối "HÀNG ĐỢI" phía trên — dòng lịch sử chỉ trỏ tới đó (hàng
+/// đợi mới là nơi huỷ được, và là sự thật hiện tại của hoá đơn).
+pub fn nhan_job_co_hang_doi(trang_thai: &str, loai: Option<MaSuCo>, sau_khac_phuc: bool, co_hang_doi: bool) -> String {
     let dau = match trang_thai {
+        job::DA_HUY => return "Đã huỷ — không in".into(),
+        job::LOI if co_hang_doi && loai == Some(MaSuCo::HetGiay) => {
+            return "Chưa in: Hết giấy — đã trả về hàng đợi".into()
+        }
         job::DA_IN if sau_khac_phuc => return "Đã in (sau khi khắc phục)".into(),
         job::DA_IN => return "Đã in".into(),
         job::DANG_GUI => return "Đang gửi xuống máy in…".into(),
@@ -100,7 +114,7 @@ pub fn nhan_job(trang_thai: &str, loai: Option<MaSuCo>, sau_khac_phuc: bool) -> 
     }
 }
 
-fn dong_job(j: &JobLog) -> JobRow {
+fn dong_job(j: &JobLog, co_hang_doi: bool) -> JobRow {
     let so_hoa_don = match &j.khach {
         Some(k) if !k.is_empty() => format!("{} · {}", j.so_hoa_don, k),
         _ => j.so_hoa_don.clone(),
@@ -111,11 +125,12 @@ fn dong_job(j: &JobLog) -> JobRow {
         badge: match j.ban_da_in {
             // T9: in thiếu bản — nói đúng số bản, không "đang chờ trong máy in".
             Some((k, n)) if j.trang_thai == job::KHONG_RO => printing::chu_thieu_ban(k, n),
-            _ => nhan_job(&j.trang_thai, j.loai, j.sau_khac_phuc),
+            _ => nhan_job_co_hang_doi(&j.trang_thai, j.loai, j.sau_khac_phuc, co_hang_doi),
         },
         da_in: j.trang_thai == job::DA_IN,
         khong_ro: j.trang_thai == job::KHONG_RO || (j.trang_thai == job::LOI && j.loai == Some(MaSuCo::HetGiay)),
         dang_xu_ly: j.trang_thai == job::DANG_GUI || j.trang_thai == job::CHO_MAY_IN,
+        da_huy: j.trang_thai == job::DA_HUY,
         luc: j.luc.clone(),
     }
 }
@@ -281,7 +296,7 @@ pub fn build_view_model(cfg: &Config, t: &TrangThaiChung) -> ViewModel {
         da_noi: t.da_noi,
         server: cfg.server_url.clone(),
         may_in: format!("{} · {}", cfg.printer_name, cfg.paper_size),
-        jobs: t.jobs.iter().map(dong_job).collect(),
+        jobs: t.jobs.iter().map(|j| dong_job(j, t.hang_doi.ho_tro())).collect(),
         canh_bao: canh_bao(t, &cfg.printer_name),
         thong_bao_phu: match &t.tu_choi_ket_noi {
             Some(ly_do) => Some(chu_tu_choi_ket_noi(ly_do)),
@@ -602,5 +617,19 @@ mod tests {
         // chập chờn: vừa bật xong, tắt rồi lại có → chờ đủ khoảng nghỉ
         assert!(!nen_bat_cua_so(None, Some(&het_giay), Some(t0), t0 + Duration::from_secs(30)));
         assert!(nen_bat_cua_so(None, Some(&het_giay), Some(t0), t0 + KHOANG_NGHI_BAT_CUA_SO));
+    }
+
+    /// v5.1: "Đã huỷ" xám; hết giấy khi có hàng đợi trỏ về hàng đợi; không có
+    /// hàng đợi (backend cũ) giữ câu 0.2.5.
+    #[test]
+    fn nhan_da_huy_va_het_giay_co_hang_doi() {
+        assert_eq!(nhan_job(job::DA_HUY, None, false), "Đã huỷ — không in");
+        assert_eq!(
+            nhan_job_co_hang_doi(job::LOI, Some(MaSuCo::HetGiay), false, true),
+            "Chưa in: Hết giấy — đã trả về hàng đợi"
+        );
+        assert_eq!(nhan_job(job::LOI, Some(MaSuCo::HetGiay), false), "Chờ giấy — nạp giấy vào khay là tự in");
+        let r = dong_job(&dong("INV/1", None, job::DA_HUY, None), true);
+        assert!(r.da_huy && !r.da_in && !r.khong_ro && !r.dang_xu_ly);
     }
 }

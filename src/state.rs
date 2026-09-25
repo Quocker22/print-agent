@@ -5,6 +5,7 @@
 //! UI timer thread (đọc mỗi 300ms để cập nhật giao diện). Mutex đơn giản, khoá
 //! ngắn (chỉ trong lúc đọc/ghi struct), không giữ khoá qua I/O nên không đáng lo tranh chấp.
 
+use crate::hang_doi::HangDoiApp;
 use crate::job;
 use crate::su_co::{MaSuCo, MucDo};
 
@@ -111,6 +112,15 @@ pub struct TrangThaiChung {
     /// Server từ chối kết nối (CONNECT_ERROR — token sai / bị thu hồi / DB
     /// backend lỗi, R-I). Hiện dòng nhỏ tới khi nối được; nhật ký ghi một lần.
     pub tu_choi_ket_noi: Option<String>,
+    /// Hàng đợi server giữ + huỷ / bỏ theo dõi (hợp đồng v5.1 §8, 0.2.6).
+    pub hang_doi: HangDoiApp,
+}
+
+/// `print_jobs.id` của một job id backend gửi (`<id>-<13 chữ số ms>`, 25/09).
+/// Id kiểu khác (backend cũ nhét token) → `None`.
+pub fn print_job_id(job_id: &str) -> Option<&str> {
+    let (dau, duoi) = job_id.rsplit_once('-')?;
+    (duoi.len() == 13 && duoi.bytes().all(|b| b.is_ascii_digit()) && !dau.is_empty()).then_some(dau)
 }
 
 /// Số job log tối đa giữ trong bộ nhớ — tránh Vec phình vô hạn khi agent chạy lâu ngày.
@@ -134,6 +144,21 @@ impl TrangThaiChung {
             so_hoa_don: so_hoa_don.to_string(),
             khach,
             trang_thai: job::DANG_GUI.into(),
+            luc,
+            ..Default::default()
+        });
+    }
+
+    /// Hoá đơn vừa được huỷ CHẮC CHẮN từ app (ack `ok:true`): "In gần đây" thay
+    /// mọi dòng cũ của cùng hoá đơn (vd "Chờ giấy…" lúc bị từ chối) bằng MỘT
+    /// dòng "Đã huỷ" — không để câu "nạp giấy là tự in" nằm cạnh hoá đơn đã huỷ.
+    pub fn ghi_da_huy(&mut self, id_print_job: &str, so_hoa_don: &str, khach: Option<String>, luc: String) {
+        self.jobs.retain(|j| print_job_id(&j.job_id) != Some(id_print_job));
+        self.them_job(JobLog {
+            job_id: format!("huy:{}", id_print_job),
+            so_hoa_don: so_hoa_don.to_string(),
+            khach,
+            trang_thai: job::DA_HUY.into(),
             luc,
             ..Default::default()
         });
@@ -347,6 +372,8 @@ impl TrangThaiChung {
         self.may_in_da_hieu = None;
         self.server_ban_cu = false;
         self.tu_choi_ket_noi = None;
+        // Server / token mới có thể là máy in KHÁC — hàng đợi cũ không còn của máy này.
+        self.hang_doi = HangDoiApp::default();
     }
 }
 
@@ -612,5 +639,26 @@ mod tests {
         let j2 = t.jobs.iter().find(|j| j.job_id == "j2").unwrap();
         assert_eq!((j2.trang_thai.as_str(), j2.loai), ("khong_ro", Some(MaSuCo::KhongXacNhan)));
         assert_eq!(t.dai_moi_nhat().map(|d| d.ma), Some(Some(MaSuCo::KhongXacNhan)));
+    }
+
+    #[test]
+    fn print_job_id_tu_job_id() {
+        assert_eq!(print_job_id("cmg0abc123-1790000000123"), Some("cmg0abc123"));
+        assert_eq!(print_job_id("a-b-1790000000123"), Some("a-b"));
+        assert_eq!(print_job_id("token_INV_2026-17900"), None);
+        assert_eq!(print_job_id("-1790000000123"), None);
+        assert_eq!(print_job_id("abc"), None);
+    }
+
+    /// Huỷ từ app: dòng "Chờ giấy" cũ của cùng hoá đơn nhường chỗ cho "Đã huỷ".
+    #[test]
+    fn ghi_da_huy_thay_dong_cu_cung_hoa_don() {
+        let mut t = TrangThaiChung::default();
+        t.them_job(JobLog { job_id: "p1-1790000000001".into(), so_hoa_don: "INV/1".into(), trang_thai: job::LOI.into(), ..Default::default() });
+        t.them_job(JobLog { job_id: "p2-1790000000002".into(), so_hoa_don: "INV/2".into(), trang_thai: job::DA_IN.into(), ..Default::default() });
+        t.ghi_da_huy("p1", "INV/1", None, "18:50:00".into());
+        assert_eq!(t.jobs.len(), 2);
+        assert_eq!((t.jobs[0].so_hoa_don.as_str(), t.jobs[0].trang_thai.as_str()), ("INV/1", job::DA_HUY));
+        assert_eq!(t.jobs[1].so_hoa_don, "INV/2");
     }
 }

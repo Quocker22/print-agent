@@ -43,6 +43,10 @@ pub enum CanHoTro {
     /// `nhat-ky-app` — KHÔNG BAO GIỜ vào hộp thư đi (trần 200 thư: nhật ký dồn
     /// vào là đẩy mất `ket-qua`); bộ đệm riêng ở nhat_ky.rs, gửi qua `gui_ack`.
     NhatKyApp,
+    /// `lay-hang-doi`, `yeu-cau-huy`, `yeu-cau-bo-theo-doi` (hợp đồng v5.1 §8.7)
+    /// — KHÔNG BAO GIỜ vào hộp thư đi: yêu cầu huỷ gửi muộn sau khi nối lại là
+    /// huỷ một việc người dùng đã thôi chờ; gửi qua `gui_ngay`/`gui_ack_ro`.
+    HangDoi,
 }
 
 impl CanHoTro {
@@ -53,6 +57,7 @@ impl CanHoTro {
             CanHoTro::SuCo => h.su_co,
             CanHoTro::TrangThaiMayIn => h.trang_thai_may_in,
             CanHoTro::NhatKyApp => h.nhat_ky_app,
+            CanHoTro::HangDoi => h.hang_doi,
         }
     }
 
@@ -175,6 +180,15 @@ pub trait CongGui: Send + Sync {
     }
 }
 
+/// Lỗi của `gui_ack_ro`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoiGuiAck {
+    /// Chưa rời máy: chưa kết nối / backend chưa báo hỗ trợ.
+    ChuaGui(String),
+    /// Đã emit (hoặc emit lỗi giữa chừng) mà không có ack — server có thể đã làm.
+    SauKhiGui(String),
+}
+
 #[derive(Default)]
 struct TrangThaiGui {
     cong: Option<Arc<dyn CongGui>>,
@@ -230,19 +244,45 @@ impl DuongGui {
         }
     }
 
+    /// Cổng của kết nối hiện tại nếu nó đã báo hỗ trợ `can`.
+    fn cong_ho_tro(&self, can: CanHoTro) -> Result<Arc<dyn CongGui>, String> {
+        let k = self.khoa();
+        match (&k.cong, k.ho_tro) {
+            (Some(c), Some(h)) if can.duoc_gui(h) => Ok(c.clone()),
+            (None, _) => Err("chua ket noi".into()),
+            _ => Err("backend chua ho tro".into()),
+        }
+    }
+
     /// Gửi NGAY kèm ack qua kết nối hiện tại, KHÔNG cất hộp thư đi: chưa kết nối /
     /// kết nối chưa báo hỗ trợ `can` → `Err` để người gọi (bộ đệm nhật ký) tự giữ
     /// lại. Không giữ khoá trong lúc chờ ack.
     pub fn gui_ack(&self, su_kien: &str, gia_tri: Value, can: CanHoTro, cho: Duration) -> Result<Value, String> {
-        let cong = {
-            let k = self.khoa();
-            match (&k.cong, k.ho_tro) {
-                (Some(c), Some(h)) if can.duoc_gui(h) => c.clone(),
-                (None, _) => return Err("chua ket noi".into()),
-                _ => return Err("backend chua ho tro".into()),
-            }
-        };
-        cong.emit_ack(su_kien, gia_tri, cho)
+        self.gui_ack_ro(su_kien, gia_tri, can, cho).map_err(|e| match e {
+            LoiGuiAck::ChuaGui(s) | LoiGuiAck::SauKhiGui(s) => s,
+        })
+    }
+
+    /// Như `gui_ack` nhưng nói rõ lỗi xảy ra TRƯỚC hay SAU khi yêu cầu có thể đã
+    /// rời máy — huỷ lệnh in cần biết: chưa gửi = CHẮC CHẮN chưa huỷ; đã gửi mà
+    /// không có trả lời = CHƯA RÕ (server có thể đã huỷ).
+    pub fn gui_ack_ro(&self, su_kien: &str, gia_tri: Value, can: CanHoTro, cho: Duration) -> Result<Value, LoiGuiAck> {
+        let cong = self.cong_ho_tro(can).map_err(LoiGuiAck::ChuaGui)?;
+        cong.emit_ack(su_kien, gia_tri, cho).map_err(LoiGuiAck::SauKhiGui)
+    }
+
+    /// Gửi NGAY không ack, KHÔNG cất hộp thư đi (chưa kết nối / chưa hỗ trợ → `Err`).
+    pub fn gui_ngay(&self, su_kien: &str, gia_tri: Value, can: CanHoTro) -> Result<(), String> {
+        self.cong_ho_tro(can)?.emit(su_kien, gia_tri)
+    }
+
+    /// Kết nối hiện tại đã nhận `cau-hinh` báo hỗ trợ `can` — trả thế hệ kết nối.
+    pub fn the_he_ho_tro(&self, can: CanHoTro) -> Option<u64> {
+        let k = self.khoa();
+        match (&k.cong, k.ho_tro) {
+            (Some(_), Some(h)) if k.co_cau_hinh && can.duoc_gui(h) => Some(k.the_he),
+            _ => None,
+        }
     }
 
     /// Callback "open": kết nối mới — QUÊN hoTro của kết nối trước (§2). Trả thế hệ.
@@ -347,7 +387,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn du() -> HoTro {
-        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false }
+        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false, hang_doi: false }
     }
 
     #[test]

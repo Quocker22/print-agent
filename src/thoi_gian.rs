@@ -55,6 +55,69 @@ pub fn ngay_utc_truoc(t: SystemTime, so_ngay: u64) -> String {
     ngay_utc(t.checked_sub(lui).unwrap_or(UNIX_EPOCH))
 }
 
+/// (năm, tháng, ngày) lịch Gregory → số ngày kể từ 1970-01-01.
+fn so_ngay_tu_ngay(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Giây epoch của một chuỗi ISO UTC `YYYY-MM-DDTHH:MM[:SS…]` (server gửi
+/// `toISOString()`). Chuỗi lạ → `None`.
+pub fn giay_tu_iso(iso: &str) -> Option<i64> {
+    let b = iso.as_bytes();
+    if b.len() < 16 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' {
+        return None;
+    }
+    let so = |a: usize, z: usize| iso.get(a..z)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi) = (so(0, 4)?, so(5, 7)?, so(8, 10)?, so(11, 13)?, so(14, 16)?);
+    let s = if b.len() >= 19 && b[16] == b':' { so(17, 19)? } else { 0 };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        return None;
+    }
+    Some(so_ngay_tu_ngay(y, mo, d) * 86_400 + h * 3_600 + mi * 60 + s)
+}
+
+/// Giờ hiện của mốc ISO UTC theo giờ máy (`lech_phut` = giờ máy − UTC): "HH:MM"
+/// nếu cùng ngày với `bay_gio` (giờ máy), khác ngày thì "DD/MM HH:MM". Chuỗi lạ → "".
+pub fn gio_may_tu_iso(iso: &str, lech_phut: i64, bay_gio: SystemTime) -> String {
+    let Some(giay) = giay_tu_iso(iso) else { return String::new() };
+    let dia_phuong = giay + lech_phut * 60;
+    let (_, m, d) = ngay_tu_so_ngay(dia_phuong.div_euclid(86_400));
+    let s = dia_phuong.rem_euclid(86_400);
+    let hom_nay = (tach(bay_gio).0 + lech_phut * 60).div_euclid(86_400);
+    if dia_phuong.div_euclid(86_400) == hom_nay {
+        format!("{:02}:{:02}", s / 3_600, (s % 3_600) / 60)
+    } else {
+        format!("{:02}/{:02} {:02}:{:02}", d, m, s / 3_600, (s % 3_600) / 60)
+    }
+}
+
+/// Giờ máy lệch UTC bao nhiêu phút (Việt Nam: 420). Đọc lại mỗi lần gọi — máy
+/// đổi múi giờ thì giờ hiện đổi theo, không phải khởi động lại app.
+#[cfg(windows)]
+pub fn lech_gio_may_phut() -> i64 {
+    use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    // SAFETY: hai hàm chỉ trả SYSTEMTIME, không có điều kiện trước.
+    let (dp, utc) = unsafe { (GetLocalTime(), GetSystemTime()) };
+    let phut = |t: &windows::Win32::Foundation::SYSTEMTIME| {
+        so_ngay_tu_ngay(t.wYear as i64, t.wMonth as i64, t.wDay as i64) * 1_440 + t.wHour as i64 * 60 + t.wMinute as i64
+    };
+    // Hai lần đọc có thể vắt qua ranh phút — làm tròn về bội 15 phút (múi giờ nào cũng vậy).
+    let lech = phut(&dp) - phut(&utc);
+    (lech as f64 / 15.0).round() as i64 * 15
+}
+
+/// Ngoài Windows (test / Mac): giờ Việt Nam.
+#[cfg(not(windows))]
+pub fn lech_gio_may_phut() -> i64 {
+    420
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +153,22 @@ mod tests {
     fn truoc_1970_khong_panic() {
         assert_eq!(ngay_utc(UNIX_EPOCH - Duration::from_secs(10)), "1970-01-01");
         assert_eq!(ngay_utc_truoc(luc(5), 14), "1970-01-01");
+    }
+
+    #[test]
+    fn iso_sang_gio_may() {
+        // 2026-09-25T11:45:00Z = 18:45 giờ VN.
+        let bay_gio = luc(giay_tu_iso("2026-09-25T12:00:00.000Z").unwrap() as u64);
+        assert_eq!(gio_may_tu_iso("2026-09-25T11:45:00.000Z", 420, bay_gio), "18:45");
+        // 16:59Z hôm trước (VN 23:59 ngày 24) → khác ngày.
+        assert_eq!(gio_may_tu_iso("2026-09-24T16:59:00.000Z", 420, bay_gio), "24/09 23:59");
+        // 17:00Z ngày 24 = 00:00 ngày 25 VN → cùng ngày.
+        assert_eq!(gio_may_tu_iso("2026-09-24T17:00:00Z", 420, bay_gio), "00:00");
+        assert_eq!(gio_may_tu_iso("rác", 420, bay_gio), "");
+        assert_eq!(gio_may_tu_iso("2026-13-01T00:00:00Z", 420, bay_gio), "");
+        // Khứ hồi với iso_utc.
+        let t = luc(1_790_000_000);
+        assert_eq!(giay_tu_iso(&iso_utc(t)), Some(1_790_000_000));
+        assert_eq!(giay_tu_iso("2000-02-29T00:00:00Z"), Some(951_782_400));
     }
 }

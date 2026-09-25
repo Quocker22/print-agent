@@ -38,7 +38,9 @@
 //! (xem Cargo.toml + doc-comment ở đó) — ép chọn tường minh bằng
 //! BackendSelector ngay đầu chay_ui(), TRƯỚC khi tạo MainWindow.
 
+use crate::bao_cao::MucHangDoi;
 use crate::config::{self, Config};
+use crate::hang_doi::{self, CheDo, LoaiViec, MauDong, NutDong};
 use crate::hop_thu_di::DuongGui;
 use crate::job;
 use crate::net::{self, DieuKhienNet};
@@ -48,12 +50,12 @@ use crate::state::TrangThaiChung;
 use crate::taskbar_win::{an_khoi_taskbar, nhay_cua_so};
 use crate::view_model::{build_view_model, nen_bat_cua_so, CanhBao};
 use raw_window_handle::HasWindowHandle;
-use slint::{CloseRequestResponse, ModelRc, Timer, TimerMode, VecModel};
+use slint::{CloseRequestResponse, Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -351,16 +353,96 @@ fn jobs_sang_model(jobs: Vec<crate::view_model::JobRow>) -> ModelRc<JobRow> {
             da_in: j.da_in,
             khong_ro: j.khong_ro,
             dang_xu_ly: j.dang_xu_ly,
+            da_huy: j.da_huy,
             luc: j.luc.into(),
         })
         .collect();
     ModelRc::new(VecModel::from(hang))
 }
 
+/// hang_doi::DongHangDoi (logic thuần, đã test) → QueueRow của Slint. Chỉ đổi kiểu.
+fn dong_hang_doi_sang_slint(d: &hang_doi::DongHangDoi) -> QueueRow {
+    QueueRow {
+        id: d.id.as_str().into(),
+        tieu_de: d.tieu_de.as_str().into(),
+        gio: d.gio.as_str().into(),
+        trang_thai: d.trang_thai.as_str().into(),
+        mau: match d.mau {
+            MauDong::Cho => 0,
+            MauDong::TamGiu => 1,
+            MauDong::DangIn => 2,
+            MauDong::ChuaXacNhan => 3,
+        },
+        che_do: match d.che_do {
+            CheDo::BinhThuong => 0,
+            CheDo::XacNhanHuy => 1,
+            CheDo::XacNhanBo => 2,
+            CheDo::ViSao => 3,
+            CheDo::Dang => 4,
+            CheDo::DaHuy => 5,
+            CheDo::DaBo => 6,
+            CheDo::ThatBai => 7,
+            CheDo::ChuaRo => 8,
+        },
+        nut_huy: d.nut == NutDong::Huy,
+        bat_nut: d.bat_nut,
+        thong_diep: d.thong_diep.as_str().into(),
+        co_nut_bo: d.co_nut_bo,
+    }
+}
+
+/// Cập nhật danh sách hàng đợi TẠI CHỖ theo `id` — KHÔNG thay model mỗi nhịp.
+/// Thay model (như "In gần đây") là dựng lại mọi dòng mỗi 300 ms: cú bấm chuột
+/// vắt qua lần dựng bị nuốt, và dòng biến mất giữa chừng làm các dòng dưới
+/// trượt lên đúng chỗ con trỏ. Giữ phần tử theo id: dòng còn thì giữ nguyên
+/// (chỉ đổi dữ liệu khi khác), dòng mất thì gỡ đúng nó, dòng mới thì chèn đúng chỗ.
+fn cap_nhat_theo_id(model: &VecModel<QueueRow>, moi: Vec<QueueRow>) {
+    let mut i = 0;
+    while i < moi.len() {
+        if i < model.row_count() {
+            let cu = model.row_data(i).unwrap_or_default();
+            if cu.id == moi[i].id {
+                if cu != moi[i] {
+                    model.set_row_data(i, moi[i].clone());
+                }
+                i += 1;
+                continue;
+            }
+            // Id này còn ở phía dưới → các dòng xen giữa đã mất: gỡ chúng.
+            if let Some(j) = (i + 1..model.row_count()).find(|&j| model.row_data(j).is_some_and(|r| r.id == moi[i].id)) {
+                for k in (i..j).rev() {
+                    model.remove(k);
+                }
+                continue;
+            }
+        }
+        model.insert(i, moi[i].clone());
+        i += 1;
+    }
+    while model.row_count() > moi.len() {
+        model.remove(model.row_count() - 1);
+    }
+}
+
 /// Bơm ViewModel (build_view_model) vào properties MainWindow — điểm DUY NHẤT
 /// map trạng thái → hiển thị, gọi từ Timer mỗi tick và ngay sau khi Lưu.
 /// Trả cảnh báo đang hiện để tray/nháy cửa sổ dùng chung đúng một nguồn.
-fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung) -> Option<CanhBao> {
+fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung, hd: &VecModel<QueueRow>) -> Option<CanhBao> {
+    let lech = crate::thoi_gian::lech_gio_may_phut();
+    let bay_gio_he = SystemTime::now();
+    let k = t.hang_doi.khoi(t.da_noi, t.may_in.as_ref().map(|(m, _)| *m), Instant::now(), &|iso| {
+        crate::thoi_gian::gio_may_tu_iso(iso, lech, bay_gio_he)
+    });
+    w.set_hd_hien(k.hien);
+    w.set_hd_tieu_de(k.tieu_de.into());
+    w.set_hd_ghi_chu(k.ghi_chu.into());
+    w.set_hd_dai(k.dai_tam_giu.into());
+    w.set_hd_so_huy_ca(k.so_huy_ca as i32);
+    w.set_hd_loat_che_do(i32::from(k.loat_che_do));
+    w.set_hd_loat_chu(k.loat_chu.into());
+    w.set_hd_loat_nut(k.loat_nut.into());
+    cap_nhat_theo_id(hd, k.dong.iter().map(dong_hang_doi_sang_slint).collect());
+
     let vm = build_view_model(cfg, t);
     w.set_da_noi(vm.da_noi);
     w.set_trang_thai_text(vm.trang_thai_text.into());
@@ -451,7 +533,12 @@ pub fn chay_ui(
     window.set_f_tu_khoi_dong(crate::tu_khoi_dong::dang_bat());
     // Mutex hỏng (một luồng panic lúc giữ khoá) vẫn đọc tiếp được dữ liệu —
     // giao diện KHÔNG được chết theo (R11e).
-    bom_view_model(&window, &cfg, &trang_thai.lock().unwrap_or_else(|p| p.into_inner()));
+    // Danh sách hàng đợi: MỘT model sống suốt đời cửa sổ (xem `cap_nhat_theo_id`).
+    let hd_model: Rc<VecModel<QueueRow>> = Rc::new(VecModel::default());
+    window.set_hd_dong(ModelRc::from(hd_model.clone()));
+    // Cấu hình thu gọn khi đã đủ — mở sẵn khi còn thiếu (máy mới cài).
+    window.set_cau_hinh_mo(cfg.server_url.is_empty() || cfg.token.is_empty() || cfg.printer_name.is_empty());
+    bom_view_model(&window, &cfg, &trang_thai.lock().unwrap_or_else(|p| p.into_inner()), &hd_model);
 
     // Tray phải dựng trên CÙNG thread + TRƯỚC khi event loop chạy (bài học #1).
     let tray = Rc::new(RefCell::new(Tray::moi(&cfg)));
@@ -512,6 +599,7 @@ pub fn chay_ui(
         let duong_gui = duong_gui.clone();
         let ds_may_in = ds_may_in.clone();
         let ds_khay = ds_khay.clone();
+        let hd_model = hd_model.clone();
         window.on_luu(move || {
             let Some(w) = w_weak.upgrade() else { return };
 
@@ -546,7 +634,7 @@ pub fn chay_ui(
                     t.doi_cau_hinh();
                     tray.borrow_mut().cap_nhat_cfg(&cfg_moi);
                     *cfg_dang_dung.borrow_mut() = cfg_moi.clone();
-                    bom_view_model(&w, &cfg_moi, &t);
+                    bom_view_model(&w, &cfg_moi, &t, &hd_model);
                 }
                 Err(e) => {
                     w.set_trang_thai_text(format!("Ghi config.ini lỗi: {}", e).into());
@@ -616,13 +704,80 @@ pub fn chay_ui(
         let w_weak = window.as_weak();
         let cfg_dang_dung = cfg_dang_dung.clone();
         let trang_thai = trang_thai.clone();
+        let hd_model = hd_model.clone();
         window.on_da_hieu(move || {
             let Some(w) = w_weak.upgrade() else { return };
             let mut t = trang_thai.lock().unwrap_or_else(|p| p.into_inner());
             // Tắt DẢI ĐANG HIỆN (T6) — dải kế tiếp (nếu có) hiện lên.
             t.da_hieu();
-            bom_view_model(&w, &cfg_dang_dung.borrow(), &t);
+            bom_view_model(&w, &cfg_dang_dung.borrow(), &t, &hd_model);
         });
+    }
+
+    // Khối HÀNG ĐỢI (0.2.6, hợp đồng v5.1 §8): mọi nút đổi trạng thái THUẦN
+    // (hang_doi.rs) rồi vẽ lại ngay; chỉ hai nút XÁC NHẬN mới gửi yêu cầu, trên
+    // luồng riêng (`net::khoi_chay_yeu_cau_hang_doi`) — giao diện không chờ mạng.
+    {
+        type ViecCanGui = Option<(LoaiViec, Vec<MucHangDoi>)>;
+        type ThaoTacHd = Box<dyn Fn(&mut TrangThaiChung, &str) -> ViecCanGui>;
+        let gan = |f: ThaoTacHd| {
+            let (w_weak, cfg, tt, hd, dg) =
+                (window.as_weak(), cfg_dang_dung.clone(), trang_thai.clone(), hd_model.clone(), duong_gui.clone());
+            move |id: slint::SharedString| {
+                let Some(w) = w_weak.upgrade() else { return };
+                let viec = {
+                    let mut t = tt.lock().unwrap_or_else(|p| p.into_inner());
+                    let viec = f(&mut t, &id);
+                    bom_view_model(&w, &cfg.borrow(), &t, &hd);
+                    viec
+                };
+                if let Some((loai, muc)) = viec {
+                    net::khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), loai, muc);
+                }
+            }
+        };
+        window.on_hd_huy(gan(Box::new(|t, id| {
+            let dn = t.da_noi;
+            t.hang_doi.bam_huy(id, dn);
+            None
+        })));
+        window.on_hd_vi_sao(gan(Box::new(|t, id| {
+            t.hang_doi.bam_vi_sao(id);
+            None
+        })));
+        window.on_hd_bo(gan(Box::new(|t, id| {
+            let dn = t.da_noi;
+            t.hang_doi.bam_bo(id, dn);
+            None
+        })));
+        window.on_hd_dong_lai(gan(Box::new(|t, id| {
+            t.hang_doi.dong(id);
+            None
+        })));
+        window.on_hd_xac_nhan_huy(gan(Box::new(|t, id| {
+            let dn = t.da_noi;
+            t.hang_doi.bat_dau(id, LoaiViec::Huy, dn).map(|m| (LoaiViec::Huy, vec![m]))
+        })));
+        window.on_hd_xac_nhan_bo(gan(Box::new(|t, id| {
+            let dn = t.da_noi;
+            t.hang_doi.bat_dau(id, LoaiViec::BoTheoDoi, dn).map(|m| (LoaiViec::BoTheoDoi, vec![m]))
+        })));
+        let huy_ca = gan(Box::new(|t, _| {
+            let dn = t.da_noi;
+            t.hang_doi.bam_huy_ca(dn);
+            None
+        }));
+        window.on_hd_huy_ca(move || huy_ca("".into()));
+        let xn_huy_ca = gan(Box::new(|t, _| {
+            let dn = t.da_noi;
+            Some((LoaiViec::Huy, t.hang_doi.bat_dau_loat(dn)))
+        }));
+        window.on_hd_xac_nhan_huy_ca(move || xn_huy_ca("".into()));
+        let dong_loat = gan(Box::new(|t, _| {
+            t.hang_doi.dong_loat();
+            None
+        }));
+        window.on_hd_dong_loat(move || dong_loat("".into()));
     }
 
     // Bài học #6 (tiếp): single_shot RIÊNG, TÁCH khỏi timer polling 300ms bên
@@ -660,6 +815,7 @@ pub fn chay_ui(
         // Cảnh báo ở tick trước (tiêu đề) + lần gần nhất TỰ mở cửa sổ (view_model::nen_bat_cua_so).
         let canh_bao_truoc: RefCell<Option<String>> = RefCell::new(None);
         let lan_bat_cuoi: Cell<Option<Instant>> = Cell::new(None);
+        let hd_model = hd_model.clone();
         timer.start(TimerMode::Repeated, std::time::Duration::from_millis(300), move || {
             // Rút cạn TrayIconEvent (bài học #4: không đọc nội dung, chỉ để
             // channel không phình — with_menu_on_left_click(true) tự lo phần
@@ -684,8 +840,10 @@ pub fn chay_ui(
             if let Some(w) = w_weak.upgrade() {
                 let cfg = cfg_dang_dung.borrow().clone();
                 let (da_noi, canh_bao) = {
-                    let t = trang_thai.lock().unwrap_or_else(|p| p.into_inner());
-                    let canh_bao = bom_view_model(&w, &cfg, &t);
+                    let mut t = trang_thai.lock().unwrap_or_else(|p| p.into_inner());
+                    // "Đã huỷ ✓" quá 5 s thì rời danh sách.
+                    t.hang_doi.don_dep(Instant::now());
+                    let canh_bao = bom_view_model(&w, &cfg, &t, &hd_model);
                     (t.da_noi, canh_bao)
                 };
                 so_tick.set(so_tick.get().wrapping_add(1));
@@ -737,6 +895,31 @@ pub fn chay_ui(
 mod tests_chon {
     use super::*;
 
+    fn r(id: &str, chu: &str) -> QueueRow {
+        QueueRow { id: id.into(), tieu_de: chu.into(), ..Default::default() }
+    }
+
+    fn ids(m: &VecModel<QueueRow>) -> Vec<String> {
+        m.iter().map(|x| format!("{}:{}", x.id, x.tieu_de)).collect()
+    }
+
+    /// Model hàng đợi cập nhật theo id: gỡ đúng dòng mất, chèn đúng chỗ dòng
+    /// mới, đổi dữ liệu tại chỗ — không dựng lại cả danh sách.
+    #[test]
+    fn cap_nhat_theo_id_giu_dong_theo_id() {
+        let m = VecModel::default();
+        cap_nhat_theo_id(&m, vec![r("a", "1"), r("b", "1"), r("c", "1")]);
+        assert_eq!(ids(&m), ["a:1", "b:1", "c:1"]);
+        cap_nhat_theo_id(&m, vec![r("a", "1"), r("c", "2")]);
+        assert_eq!(ids(&m), ["a:1", "c:2"]);
+        cap_nhat_theo_id(&m, vec![r("x", "1"), r("a", "1"), r("c", "2"), r("d", "1")]);
+        assert_eq!(ids(&m), ["x:1", "a:1", "c:2", "d:1"]);
+        cap_nhat_theo_id(&m, vec![r("d", "1")]);
+        assert_eq!(ids(&m), ["d:1"]);
+        cap_nhat_theo_id(&m, vec![]);
+        assert_eq!(m.row_count(), 0);
+    }
+
     /// HCM 25/09: ô Máy in tự nhảy về mục đầu ("Microsoft XPS Document Writer"),
     /// bấm Lưu là đổi máy in. Vị trí phải trỏ đúng máy đang cấu hình.
     #[test]
@@ -751,5 +934,212 @@ mod tests_chon {
         // Vị trí hỏng → chữ đang hiện.
         assert_eq!(gia_tri_chon(&ds, 9, " Fax "), "Fax");
         assert_eq!(gia_tri_chon(&ds, -1, "Fax"), "Fax");
+    }
+
+    /// Chụp màn hình THẬT (software renderer, đúng đường `bom_view_model`) các
+    /// kịch bản hàng đợi — để soi giao diện mà không cần máy Windows:
+    ///   CHUP_DIR=/tmp/chup cargo test chup_man_hinh_hang_doi -- --ignored
+    /// Ra file .bmp (không kéo thêm crate mã hoá ảnh).
+    #[test]
+    #[ignore]
+    fn chup_man_hinh_hang_doi() {
+        use crate::bao_cao::{HangDoiServer, MucHangDoi};
+        use crate::hang_doi::KetCuc;
+        use crate::state::JobLog;
+        use crate::su_co::MaSuCo;
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType};
+        use slint::platform::{Platform, WindowAdapter};
+
+        struct NenTest(Rc<MinimalSoftwareWindow>);
+        impl Platform for NenTest {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                Ok(self.0.clone())
+            }
+        }
+        let thu_muc = std::env::var("CHUP_DIR").expect("đặt CHUP_DIR");
+        let cua_so = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        slint::platform::set_platform(Box::new(NenTest(cua_so.clone()))).unwrap();
+
+        let ghi_bmp = |ten: &str, rong: usize, cao: usize, px: &[PremultipliedRgbaColor]| {
+            let dong = (rong * 3).div_ceil(4) * 4;
+            let mut b: Vec<u8> = Vec::with_capacity(54 + dong * cao);
+            let kich = (54 + dong * cao) as u32;
+            b.extend_from_slice(b"BM");
+            b.extend_from_slice(&kich.to_le_bytes());
+            b.extend_from_slice(&[0; 4]);
+            b.extend_from_slice(&54u32.to_le_bytes());
+            b.extend_from_slice(&40u32.to_le_bytes());
+            b.extend_from_slice(&(rong as i32).to_le_bytes());
+            b.extend_from_slice(&(cao as i32).to_le_bytes());
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&24u16.to_le_bytes());
+            b.extend_from_slice(&[0; 24]);
+            for y in (0..cao).rev() {
+                for x in 0..rong {
+                    let p = px[y * rong + x];
+                    b.extend_from_slice(&[p.blue, p.green, p.red]);
+                }
+                b.extend(std::iter::repeat_n(0u8, dong - rong * 3));
+            }
+            std::fs::write(format!("{}/{}.bmp", thu_muc, ten), b).unwrap();
+        };
+
+        let cfg = Config {
+            server_url: "https://zalocrm.incokit.com".into(),
+            token: "x".into(),
+            printer_name: "HP Laser 103 107 108".into(),
+            tray: "Tự động".into(),
+            paper_size: "A5".into(),
+        };
+        let muc = |id: &str, so: &str, khach: &str, tt: &str, tam_giu: bool, ly_do: &str, tao: &str| MucHangDoi {
+            id: id.into(),
+            so_hoa_don: so.into(),
+            ten_khach: (!khach.is_empty()).then(|| khach.to_string()),
+            trang_thai: tt.into(),
+            nhom: if tt == "khong_ro" { "chua_xac_nhan" } else { "cho_in" }.into(),
+            ly_do: ly_do.into(),
+            tam_giu,
+            tao: tao.into(),
+            huy: if tt == "cho_in" { "chac_chan" } else { "khong" }.into(),
+        };
+        let khach = ["Anh Lộc", "Chị Hằng Cầu Giấy", "Anh Dev", "Cửa hàng Minh Phát", "Chị Ánh", "Anh Tuấn Điện Máy"];
+        let muoi: Vec<MucHangDoi> = (0..10)
+            .map(|i| {
+                muc(
+                    &format!("j{i}"),
+                    &format!("INV/2026/0301{:02}", 10 + i),
+                    khach[i % khach.len()],
+                    "cho_in",
+                    true,
+                    "Tạm giữ — máy in Hết giấy (từ 18:45)",
+                    &format!("2026-09-25T11:{:02}:00.000Z", 45 + i),
+                )
+            })
+            .collect();
+
+        let chup = |ten: &str, t: &TrangThaiChung, sua: &dyn Fn(&MainWindow)| {
+            let ui = MainWindow::new().unwrap();
+            let hd: Rc<VecModel<QueueRow>> = Rc::new(VecModel::default());
+            ui.set_hd_dong(ModelRc::from(hd.clone()));
+            bom_view_model(&ui, &cfg, t, &hd);
+            sua(&ui);
+            ui.show().unwrap();
+            cua_so.set_size(slint::PhysicalSize::new(400, 2000));
+            slint::platform::update_timers_and_animations();
+            let cao = ui.get_cao_noi_dung().ceil() as u32;
+            cua_so.set_size(slint::PhysicalSize::new(400, cao));
+            slint::platform::update_timers_and_animations();
+            cua_so.request_redraw();
+            cua_so.draw_if_needed(|r| {
+                let mut px = vec![PremultipliedRgbaColor::default(); 400 * cao as usize];
+                r.render(&mut px, 400);
+                ghi_bmp(ten, 400, cao as usize, &px);
+            });
+            ui.hide().unwrap();
+        };
+
+        let t0 = Instant::now();
+        let co_so = |anh: HangDoiServer| {
+            let mut t = TrangThaiChung { da_noi: true, ..Default::default() };
+            t.may_in = Some((MaSuCo::HetGiay, None));
+            t.dai_jobs.clear();
+            t.hang_doi.nhan_cau_hinh(true);
+            t.hang_doi.nhan_anh(anh, t0);
+            t.them_job(JobLog {
+                job_id: "j0-1790000000000".into(),
+                so_hoa_don: "INV/2026/030110".into(),
+                khach: Some("Anh Lộc".into()),
+                trang_thai: job::LOI.into(),
+                loai: Some(MaSuCo::HetGiay),
+                luc: "18:45:12".into(),
+                ..Default::default()
+            });
+            t.them_job(JobLog {
+                job_id: "z-1790000000001".into(),
+                so_hoa_don: "INV/2026/030099".into(),
+                khach: Some("Chị Ánh".into()),
+                trang_thai: job::DA_IN.into(),
+                luc: "18:30:02".into(),
+                ..Default::default()
+            });
+            t
+        };
+
+        // 1. Hết giấy, 10 hoá đơn tạm giữ.
+        let mut t = co_so(HangDoiServer { cho_in: muoi.clone(), chua_xac_nhan: vec![], cap_nhat: String::new() });
+        t.ghi_may_in(MaSuCo::HetGiay, None, true);
+        chup("1-het-giay-10-hoa-don", &t, &|_| {});
+
+        // 2. Các trạng thái dòng.
+        let mut ds = muoi[..6].to_vec();
+        ds[5] = muc("d1", "INV/2026/030120", "Anh Tuấn", "dang_gui", false, "Đang gửi xuống máy in", "2026-09-25T11:58:00.000Z");
+        let cxn = vec![muc(
+            "k1",
+            "INV/2026/030071",
+            "Chị Hằng",
+            "khong_ro",
+            false,
+            "Chưa xác nhận đã in — có thể đang nằm trong máy in",
+            "2026-09-24T09:10:00.000Z",
+        )];
+        let mut t = co_so(HangDoiServer { cho_in: ds, chua_xac_nhan: cxn, cap_nhat: String::new() });
+        for (id, kc) in [
+            ("j1", Some(KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: "Đã huỷ — hoá đơn chắc chắn không in".into() })),
+            ("j2", Some(KetCuc::KhongDuoc { loi: "DANG_IN".into(), noi_dung: hang_doi::VI_SAO_DANG_IN.into() })),
+            ("j3", Some(KetCuc::ChuaRo { ly_do: "het gio".into() })),
+            ("j4", None),
+        ] {
+            t.hang_doi.bam_huy(id, true);
+            t.hang_doi.bat_dau(id, LoaiViec::Huy, true);
+            if let Some(kc) = kc {
+                t.hang_doi.ket_thuc(id, LoaiViec::Huy, &kc, t0);
+            }
+        }
+        t.hang_doi.bam_huy("j0", true);
+        chup("2-trang-thai-dong", &t, &|_| {});
+
+        // 3. Vì sao + bỏ theo dõi (chưa xác nhận).
+        let mut t = co_so(HangDoiServer {
+            cho_in: vec![muc("d1", "INV/2026/030120", "Anh Tuấn", "dang_gui", false, "Đang gửi xuống máy in", "2026-09-25T11:58:00.000Z")],
+            chua_xac_nhan: vec![muc("k1", "INV/2026/030071", "Chị Hằng", "khong_ro", false, "", "2026-09-24T09:10:00.000Z")],
+            cap_nhat: String::new(),
+        });
+        t.hang_doi.bam_vi_sao("k1");
+        chup("3-vi-sao-chua-xac-nhan", &t, &|_| {});
+        t.hang_doi.bam_bo("k1", true);
+        chup("4-xac-nhan-bo", &t, &|_| {});
+
+        // 5. Huỷ cả N — hỏi xác nhận; 6. tổng kết có lỗi.
+        let mut t = co_so(HangDoiServer { cho_in: muoi[..4].to_vec(), chua_xac_nhan: vec![], cap_nhat: String::new() });
+        t.ghi_may_in(MaSuCo::HetGiay, None, true);
+        t.hang_doi.bam_huy_ca(true);
+        chup("5-huy-ca-xac-nhan", &t, &|_| {});
+        let ds = t.hang_doi.bat_dau_loat(true);
+        for (i, m) in ds.iter().enumerate() {
+            let kc = if i == 2 {
+                KetCuc::KhongDuoc { loi: "DANG_IN".into(), noi_dung: hang_doi::VI_SAO_DANG_IN.into() }
+            } else {
+                KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: String::new() }
+            };
+            t.hang_doi.ket_thuc(&m.id, LoaiViec::Huy, &kc, t0);
+            if matches!(kc, KetCuc::Duoc { .. }) {
+                t.ghi_da_huy(&m.id, &m.so_hoa_don, m.ten_khach.clone(), "18:52:10".into());
+            }
+        }
+        t.hang_doi.nhan_anh(HangDoiServer { cho_in: vec![muoi[2].clone()], chua_xac_nhan: vec![], cap_nhat: String::new() }, t0);
+        chup("6-huy-ca-ket-qua", &t, &|_| {});
+
+        // 7. Mất kết nối.
+        let mut t = co_so(HangDoiServer { cho_in: muoi[..3].to_vec(), chua_xac_nhan: vec![], cap_nhat: String::new() });
+        t.da_noi = false;
+        chup("7-mat-ket-noi", &t, &|_| {});
+
+        // 8. Cấu hình mở.
+        let t = co_so(HangDoiServer::default());
+        chup("8-cau-hinh-mo", &t, &|w| {
+            w.set_cau_hinh_mo(true);
+            w.set_f_server("https://zalocrm.incokit.com".into());
+            w.set_f_token("••••••••".into());
+        });
     }
 }

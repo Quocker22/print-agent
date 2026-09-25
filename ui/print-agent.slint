@@ -11,11 +11,198 @@ import { Button, LineEdit, ComboBox, ScrollView, CheckBox } from "std-widgets.sl
 import "../assets/font-regular.ttf";
 import "../assets/font-semibold.ttf";
 
-export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool, khong_ro: bool, dang_xu_ly: bool, luc: string }
+// HAI LUẬT BỐ CỤC (đo bằng ảnh chụp software renderer, 0.2.6 — `cargo test
+// chup_man_hinh_hang_doi -- --ignored`):
+// 1. Chữ `wrap: word-wrap` PHẢI là con trực tiếp của VerticalLayout. Đặt trong
+//    HorizontalLayout (cạnh icon/nút) thì Slint tính chiều cao như thể chữ nằm
+//    trên MỘT dòng — dòng 2–3 tràn ra ngoài khung (dải đỏ 0.2.5 bị đúng lỗi này).
+//    Icon/nút cạnh chữ wrap: đặt TUYỆT ĐỐI (x/y) + chừa padding cho chữ.
+// 2. Cửa sổ cao ĐÚNG bằng nội dung (min = max = lop_chinh.min-height): để
+//    preferred-height thì ô nhập/nút bị kéo giãn, và hàng đợi biến mất thì
+//    mọi thứ giãn theo.
+
+export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool, khong_ro: bool, dang_xu_ly: bool, da_huy: bool, luc: string }
+
+// Một dòng khối HÀNG ĐỢI (hợp đồng v5.1 §8) — Rust dựng ở hang_doi::HangDoiApp::khoi.
+// mau: 0 chờ gửi · 1 tạm giữ · 2 đang gửi/in · 3 chưa xác nhận.
+// che_do: 0 thường · 1 hỏi xác nhận huỷ · 2 hỏi xác nhận bỏ · 3 vì sao · 4 đang làm
+//         · 5 đã huỷ · 6 đã bỏ · 7 không được · 8 chưa rõ.
+export struct QueueRow {
+    id: string, tieu_de: string, gio: string, trang_thai: string,
+    mau: int, che_do: int, nut_huy: bool, bat_nut: bool, thong_diep: string, co_nut_bo: bool,
+}
+
+// Nút nhỏ tự vẽ: std Button cao 32px + không có kiểu "nguy hiểm". kieu: 0 viền
+// thường · 1 viền đỏ (Huỷ) · 2 nền đỏ (xác nhận huỷ) · 3 nền xanh đậm (xác nhận khác).
+component NutNho inherits Rectangle {
+    in property <string> chu;
+    in property <bool> bat: true;
+    in property <int> kieu: 0;
+    in property <length> co_chu: 12px;
+    callback bam();
+    height: 26px;
+    width: nhan.preferred-width + 20px;
+    border-radius: 6px;
+    border-width: kieu >= 2 ? 0px : 1px;
+    border-color: !bat ? #E2E6EC : (kieu == 1 ? #E8A0A0 : #CDD3DB);
+    background: !bat ? #F1F3F6
+        : kieu == 2 ? (vung.pressed ? #9E2B1F : (vung.has-hover ? #AE3326 : #C0392B))
+        : kieu == 3 ? (vung.pressed ? #15375C : (vung.has-hover ? #1C4570 : #22527F))
+        : (vung.pressed ? #E9ECF0 : (vung.has-hover ? #F4F6F9 : #FFFFFF));
+    nhan := Text {
+        text: root.chu;
+        color: !root.bat ? #A0A7B1 : (root.kieu >= 2 ? #FFFFFF : (root.kieu == 1 ? #B03A2E : #1B2432));
+        font-size: root.co_chu; font-weight: 600;
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    vung := TouchArea {
+        enabled: root.bat;
+        mouse-cursor: root.bat ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.bam(); }
+    }
+}
+
+// Biểu tượng tự vẽ — font nhúng KHÔNG có ⏸ ✓ ● ⚠ (đo bằng fonttools 25/09),
+// máy shop thiếu font dự phòng sẽ hiện ô vuông.
+component IconTamDung inherits Rectangle {
+    in property <color> mau: #C2410C;
+    width: 10px; height: 10px;
+    Rectangle { x: 1px; y: 0px; width: 3px; height: 10px; border-radius: 1px; background: root.mau; }
+    Rectangle { x: 6px; y: 0px; width: 3px; height: 10px; border-radius: 1px; background: root.mau; }
+}
+
+component IconCham inherits Rectangle {
+    in property <color> mau: #16A34A;
+    width: 8px; height: 8px; border-radius: 4px; background: mau;
+}
+
+component IconDung inherits Path {
+    in property <color> mau: #16A34A;
+    width: 12px; height: 12px;
+    viewbox-width: 12; viewbox-height: 12;
+    commands: "M 2 6.5 L 5 9.5 L 10.5 3";
+    stroke: mau; stroke-width: 2px; fill: transparent;
+}
+
+// Chữ nhiều dòng có icon bên trái (luật bố cục 1: icon tuyệt đối, chữ trong
+// VerticalLayout). icon: 0 không · 1 tạm dừng · 2 chấm · 3 dấu đúng.
+component ChuIcon inherits Rectangle {
+    in property <string> chu;
+    in property <color> mau;
+    in property <int> icon: 0;
+    in property <length> co_chu: 12px;
+    in property <int> dam: 600;
+    // CHỈ padding-left: Slint tính chiều cao chữ wrap mà BỎ QUA padding-right
+    // (đo 25/09) — cần chừa phải thì đặt nút xuống dòng riêng.
+    VerticalLayout {
+        padding-left: root.icon == 0 ? 0px : 18px;
+        Text { text: root.chu; color: root.mau; font-size: root.co_chu; font-weight: root.dam; wrap: word-wrap; }
+    }
+    if root.icon == 1: IconTamDung { x: 1px; y: (root.co_chu * 1.4 - 10px) / 2; mau: root.mau; }
+    if root.icon == 2: IconCham { x: 2px; y: (root.co_chu * 1.4 - 8px) / 2; mau: root.mau; }
+    if root.icon == 3: IconDung { x: 0px; y: (root.co_chu * 1.4 - 12px) / 2; mau: root.mau; }
+}
+
+// Một dòng hàng đợi.
+component DongHangDoi inherits Rectangle {
+    in property <QueueRow> d;
+    in property <bool> dau: false;
+    callback huy(string);
+    callback vi_sao(string);
+    callback bo(string);
+    callback xac_nhan_huy(string);
+    callback xac_nhan_bo(string);
+    callback dong(string);
+    // Dòng vừa mở rộng (hỏi xác nhận / giải thích / báo lỗi): khung cuộn kéo nó vào tầm nhìn.
+    callback can_hien(length, length);
+
+    property <color> mau_tt: d.mau == 1 ? #C2410C : (d.mau == 2 ? #1786BE : (d.mau == 3 ? #B7791F : #69727F));
+    property <bool> mo_rong: (d.che_do >= 1 && d.che_do <= 3) || d.che_do >= 7;
+    changed height => {
+        if (root.mo_rong) { root.can_hien(self.y, self.height); }
+    }
+    background: d.che_do == 5 ? #EEF8F1 : (d.che_do == 7 ? #FDF1F0 : (d.che_do == 8 ? #FFF8E6 : (d.che_do == 1 || d.che_do == 2 ? #FBF7F2 : transparent)));
+
+    VerticalLayout {
+        if !root.dau: Rectangle { height: 1px; background: #EEF0F3; }
+        VerticalLayout {
+            padding-left: 11px; padding-right: 11px; padding-top: 7px; padding-bottom: 7px; spacing: 5px;
+            // Dòng 1: hoá đơn · khách — giờ — nút chính / × (không wrap: HorizontalLayout được).
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.d.tieu_de; color: root.d.che_do == 5 || root.d.che_do == 6 ? #69727F : #1B2432;
+                    font-size: 13px; font-weight: 500; overflow: elide; horizontal-stretch: 1; vertical-alignment: center;
+                }
+                Text { text: root.d.gio; color: #69727F; font-size: 11px; horizontal-stretch: 0; vertical-alignment: center; }
+                if root.d.che_do == 0 && root.d.nut_huy: NutNho {
+                    chu: "Huỷ"; kieu: 1; bat: root.d.bat_nut;
+                    bam => { root.huy(root.d.id); }
+                }
+                if root.d.che_do == 0 && !root.d.nut_huy: NutNho {
+                    chu: "Vì sao?"; kieu: 0;
+                    bam => { root.vi_sao(root.d.id); }
+                }
+                if root.d.che_do == 7 || root.d.che_do == 8: NutNho {
+                    chu: "×"; kieu: 0; co_chu: 16px;
+                    bam => { root.dong(root.d.id); }
+                }
+            }
+            // Dòng 2 (thường / đang hỏi / vì sao): trạng thái server, một dòng.
+            if root.d.che_do <= 3: HorizontalLayout {
+                spacing: 6px;
+                VerticalLayout {
+                    alignment: center;
+                    if root.d.mau == 1: IconTamDung { mau: root.mau_tt; }
+                    if root.d.mau != 1: IconCham { mau: root.mau_tt; }
+                }
+                Text {
+                    text: root.d.trang_thai; color: root.mau_tt;
+                    font-size: 11px; font-weight: 600; overflow: elide; horizontal-stretch: 1;
+                }
+            }
+            // Hỏi xác nhận tại chỗ (huỷ / bỏ).
+            if root.d.che_do == 1 || root.d.che_do == 2: Text {
+                text: root.d.thong_diep; color: #8E1B12; font-size: 12px; font-weight: 600; wrap: word-wrap;
+            }
+            if root.d.che_do == 1 || root.d.che_do == 2: HorizontalLayout {
+                alignment: end; spacing: 8px;
+                NutNho { chu: "Giữ lại"; kieu: 0; bam => { root.dong(root.d.id); } }
+                if root.d.che_do == 1: NutNho {
+                    chu: "Huỷ lệnh in"; kieu: 2; bat: root.d.bat_nut;
+                    bam => { root.xac_nhan_huy(root.d.id); }
+                }
+                if root.d.che_do == 2: NutNho {
+                    chu: "Bỏ khỏi hàng đợi"; kieu: 3; bat: root.d.bat_nut;
+                    bam => { root.xac_nhan_bo(root.d.id); }
+                }
+            }
+            // Vì sao không huỷ được.
+            if root.d.che_do == 3: Text { text: root.d.thong_diep; color: #3A4452; font-size: 12px; wrap: word-wrap; }
+            if root.d.che_do == 3: HorizontalLayout {
+                alignment: end; spacing: 8px;
+                NutNho { chu: "Đóng"; kieu: 0; bam => { root.dong(root.d.id); } }
+                if root.d.co_nut_bo: NutNho {
+                    chu: "Bỏ khỏi hàng đợi"; kieu: 0; bat: root.d.bat_nut;
+                    bam => { root.bo(root.d.id); }
+                }
+            }
+            // Đang gửi yêu cầu / đã huỷ (CHỈ khi server ack ok) / đã bỏ / không được / chưa rõ.
+            if root.d.che_do == 4: ChuIcon { chu: root.d.thong_diep; mau: #1786BE; icon: 2; }
+            if root.d.che_do == 5: ChuIcon { chu: root.d.thong_diep; mau: #15803D; icon: 3; }
+            if root.d.che_do == 6: ChuIcon { chu: root.d.thong_diep; mau: #4B5563; dam: 400; }
+            if root.d.che_do == 7: ChuIcon { chu: root.d.thong_diep; mau: #A12A1E; }
+            if root.d.che_do == 8: ChuIcon { chu: root.d.thong_diep; mau: #8A5A00; }
+        }
+    }
+}
 
 export component MainWindow inherits Window {
     title: "Incokit Print Agent";
     width: 400px;
+    // Luật bố cục 2: cao đúng bằng nội dung, đổi theo nội dung.
+    min-height: lop_chinh.min-height;
+    max-height: lop_chinh.min-height;
     default-font-family: "Be Vietnam Pro";
     background: #F4F6F9;
 
@@ -51,15 +238,40 @@ export component MainWindow inherits Window {
     // chiều, và ghi lại khi người dùng bấm (xem src/tu_khoi_dong.rs).
     in-out property <bool> f_tu_khoi_dong: false;
     in property <string> loi_tu_khoi_dong: "";
+    // Khối HÀNG ĐỢI (0.2.6) — Rust bơm từ hang_doi::KhoiHangDoi mỗi nhịp.
+    in property <bool> hd_hien: false;
+    in property <string> hd_tieu_de: "";
+    in property <string> hd_ghi_chu: "";
+    in property <string> hd_dai: "";
+    in property <int> hd_so_huy_ca: 0;
+    in property <int> hd_loat_che_do: 0;
+    in property <string> hd_loat_chu: "";
+    in property <string> hd_loat_nut: "";
+    in property <[QueueRow]> hd_dong: [];
+    // Trang Cấu hình thay chỗ Hàng đợi + In gần đây (cửa sổ vừa màn hình laptop
+    // 768px cả khi hết giấy: dải đỏ + dải cam + hàng đợi). Rust mở sẵn khi thiếu cấu hình.
+    in-out property <bool> cau_hinh_mo: false;
+    callback hd_huy(string);
+    callback hd_vi_sao(string);
+    callback hd_bo(string);
+    callback hd_xac_nhan_huy(string);
+    callback hd_xac_nhan_bo(string);
+    callback hd_dong_lai(string);
+    callback hd_huy_ca();
+    callback hd_xac_nhan_huy_ca();
+    callback hd_dong_loat();
+    // Chiều cao nội dung — test chụp màn hình dựng đúng cỡ cửa sổ.
+    out property <length> cao_noi_dung: lop_chinh.min-height;
     callback luu();
     callback in_thu();
     callback mo_nhat_ky();
     callback da_hieu();
     callback doi_tu_khoi_dong(bool);
 
-    VerticalLayout {
-        padding: 16px;
-        spacing: 14px;
+    lop_chinh := VerticalLayout {
+        padding: 14px;
+        spacing: 10px;
+        alignment: start;
 
         // Titlebar
         HorizontalLayout {
@@ -70,9 +282,11 @@ export component MainWindow inherits Window {
                 border-radius: 16px;
                 horizontal-stretch: 0;
                 HorizontalLayout {
-                    padding-left: 10px; padding-right: 10px; spacing: 6px;
+                    padding-left: 10px; padding-right: 10px; padding-top: 3px; padding-bottom: 3px; spacing: 6px;
+                    // Chấm vẽ bằng hình — font nhúng không có "●".
+                    VerticalLayout { alignment: center; IconCham { mau: root.da_noi ? #16A34A : #C0392B; } }
                     Text {
-                        text: "● " + root.trang_thai_text;
+                        text: root.trang_thai_text;
                         color: root.da_noi ? #16A34A : #C0392B;
                         font-size: 12px; font-weight: 600; vertical-alignment: center;
                     }
@@ -81,55 +295,51 @@ export component MainWindow inherits Window {
         }
 
         // Dải cảnh báo — hiện tới khi máy in về bình thường. Dấu "!" vẽ bằng
-        // hình tròn + chữ thay cho ký tự ⚠: font nhúng Be Vietnam Pro không có
-        // glyph đó, máy shop thiếu font dự phòng sẽ hiện ô vuông.
+        // hình tròn + chữ thay cho ký tự ⚠. Chữ wrap trong VerticalLayout, dấu "!"
+        // và nút "Đã hiểu" đặt tuyệt đối (luật bố cục 1 — bản 0.2.5 tràn dòng 3).
         if root.canh_bao_hien: Rectangle {
             background: root.canh_bao_loi ? #FCE8E8 : #FFF6E0;
             border-radius: 10px; border-width: 1px;
             border-color: root.canh_bao_loi ? #E8A0A0 : #F2CC80;
-            HorizontalLayout {
-                padding: 12px; spacing: 10px;
-                VerticalLayout {
-                    alignment: center;
-                    Rectangle {
-                        width: 22px; height: 22px; border-radius: 11px;
-                        background: root.canh_bao_loi ? #C0392B : #D68910;
-                        Text { text: "!"; color: white; font-size: 14px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                    }
+            // Chữ đặt x/width TƯỜNG MINH + cao = cao khối chữ: padding-right bị Slint
+            // bỏ qua khi tính cao chữ wrap (đo 25/09 — bản padding hụt đúng một dòng).
+            height: chu_dai.preferred-height;
+            chu_dai := VerticalLayout {
+                x: 46px; width: parent.width - 46px - 100px;
+                padding-top: 12px; padding-bottom: 12px; spacing: 4px;
+                Text {
+                    text: root.canh_bao_tieu_de;
+                    color: root.canh_bao_loi ? #8E1B12 : #7A5200;
+                    font-size: 13px; font-weight: 600; wrap: word-wrap;
                 }
-                VerticalLayout {
-                    spacing: 4px; horizontal-stretch: 1;
-                    Text {
-                        text: root.canh_bao_tieu_de;
-                        color: root.canh_bao_loi ? #8E1B12 : #7A5200;
-                        font-size: 13px; font-weight: 600; wrap: word-wrap;
-                    }
-                    Text {
-                        text: root.canh_bao_chi_tiet;
-                        color: root.canh_bao_loi ? #8E1B12 : #7A5200;
-                        font-size: 12px; wrap: word-wrap;
-                    }
+                Text {
+                    text: root.canh_bao_chi_tiet;
+                    color: root.canh_bao_loi ? #8E1B12 : #7A5200;
+                    font-size: 12px; wrap: word-wrap;
                 }
-                // NV đã đọc → tắt dải (dải cũng tự tắt khi hoá đơn in xong).
-                VerticalLayout {
-                    alignment: center;
-                    Button { text: "Đã hiểu"; clicked => { root.da_hieu(); } }
-                }
+            }
+            Rectangle {
+                x: 12px; y: (parent.height - self.height) / 2;
+                width: 22px; height: 22px; border-radius: 11px;
+                background: root.canh_bao_loi ? #C0392B : #D68910;
+                Text { text: "!"; color: white; font-size: 14px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            // NV đã đọc → tắt dải (dải cũng tự tắt khi hoá đơn in xong).
+            Button {
+                x: parent.width - self.width - 12px; y: (parent.height - self.height) / 2;
+                text: "Đã hiểu"; clicked => { root.da_hieu(); }
             }
         }
 
-        // Status card
+        // Status card — máy in đang dùng (server nằm ở trang Cấu hình).
         Rectangle {
             background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
             VerticalLayout {
-                padding: 14px; spacing: 10px;
-                HorizontalLayout { alignment: space-between;
-                    Text { text: "Server"; color: #69727F; font-size: 13px; }
-                    Text { text: root.server; color: #1B2432; font-size: 13px; font-weight: 500; }
-                }
-                HorizontalLayout { alignment: space-between;
-                    Text { text: "Máy in"; color: #69727F; font-size: 13px; }
-                    Text { text: root.may_in; color: #1B2432; font-size: 13px; font-weight: 500; }
+                padding: 10px; padding-left: 14px; padding-right: 14px; spacing: 8px;
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text { text: "Máy in"; color: #69727F; font-size: 13px; horizontal-stretch: 0; }
+                    Text { text: root.may_in; color: #1B2432; font-size: 13px; font-weight: 500; horizontal-alignment: right; overflow: elide; horizontal-stretch: 1; }
                 }
                 if root.thong_bao_phu != "": Text {
                     text: root.thong_bao_phu;
@@ -138,11 +348,76 @@ export component MainWindow inherits Window {
             }
         }
 
-        // In gần đây
-        Text { text: "IN GẦN ĐÂY"; color: #69727F; font-size: 12px; font-weight: 600; }
-        Rectangle {
+        // Hàng đợi server giữ (v5.1 §8.7) — chỉ hiện khi có hoá đơn đang chờ.
+        if root.hd_hien && !root.cau_hinh_mo: HorizontalLayout {
+            spacing: 8px;
+            Text { text: root.hd_tieu_de; color: #69727F; font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 0; }
+            Text {
+                text: root.hd_ghi_chu == "" ? "" : "(" + root.hd_ghi_chu + ")";
+                color: #B7791F; font-size: 11px; font-italic: true; overflow: elide; horizontal-stretch: 1; vertical-alignment: center;
+            }
+        }
+        if root.hd_hien && !root.cau_hinh_mo: Rectangle {
             background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
-            height: 160px;
+            clip: true;
+            VerticalLayout {
+                // Dải cam: lệnh tạm giữ + "Huỷ cả N" (và tiến độ / tổng kết loạt).
+                if root.hd_dai != "" || root.hd_loat_che_do != 0: Rectangle {
+                    background: root.hd_loat_che_do == 3 ? #EEF8F1 : (root.hd_loat_che_do == 4 ? #FDF1F0 : #FFF4E5);
+                    VerticalLayout {
+                        padding: 10px; spacing: 8px;
+                        if root.hd_dai != "": ChuIcon { chu: root.hd_dai; mau: #7A3E00; icon: 1; }
+                        if root.hd_loat_che_do == 0 && root.hd_so_huy_ca >= 2: HorizontalLayout {
+                            alignment: end;
+                            NutNho { chu: "Huỷ cả " + root.hd_so_huy_ca + " lệnh…"; kieu: 1; bam => { root.hd_huy_ca(); } }
+                        }
+                        if root.hd_loat_che_do == 1: ChuIcon { chu: root.hd_loat_chu; mau: #8E1B12; dam: 700; }
+                        if root.hd_loat_che_do == 1: HorizontalLayout {
+                            alignment: end; spacing: 8px;
+                            NutNho { chu: "Giữ lại"; kieu: 0; bam => { root.hd_dong_loat(); } }
+                            NutNho { chu: root.hd_loat_nut; kieu: 2; bam => { root.hd_xac_nhan_huy_ca(); } }
+                        }
+                        if root.hd_loat_che_do == 2: ChuIcon { chu: root.hd_loat_chu; mau: #1786BE; icon: 2; }
+                        if root.hd_loat_che_do == 3: ChuIcon { chu: root.hd_loat_chu; mau: #15803D; icon: 3; }
+                        if root.hd_loat_che_do == 4: ChuIcon { chu: root.hd_loat_chu; mau: #A12A1E; }
+                        if root.hd_loat_che_do == 4: HorizontalLayout {
+                            alignment: end;
+                            NutNho { chu: "Đóng"; kieu: 0; bam => { root.hd_dong_loat(); } }
+                        }
+                    }
+                }
+                // Danh sách: cao theo nội dung, tối đa 180px rồi cuộn; dòng vừa
+                // mở rộng được kéo vào tầm nhìn (nút "Huỷ lệnh in" không nằm khuất).
+                khung_hd := ScrollView {
+                    height: min(ds_hd.preferred-height, 180px);
+                    ds_hd := VerticalLayout {
+                        for d[i] in root.hd_dong: DongHangDoi {
+                            d: d; dau: i == 0;
+                            huy(id) => { root.hd_huy(id); }
+                            vi_sao(id) => { root.hd_vi_sao(id); }
+                            bo(id) => { root.hd_bo(id); }
+                            xac_nhan_huy(id) => { root.hd_xac_nhan_huy(id); }
+                            xac_nhan_bo(id) => { root.hd_xac_nhan_bo(id); }
+                            dong(id) => { root.hd_dong_lai(id); }
+                            can_hien(y, h) => {
+                                if (y + h > -khung_hd.viewport-y + khung_hd.visible-height) {
+                                    khung_hd.viewport-y = -(y + h - khung_hd.visible-height);
+                                }
+                                if (y < -khung_hd.viewport-y) {
+                                    khung_hd.viewport-y = -y;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // In gần đây — thấp lại khi hàng đợi đang hiện (hàng đợi mới là việc cần làm).
+        if !root.cau_hinh_mo: Text { text: "IN GẦN ĐÂY"; color: #69727F; font-size: 12px; font-weight: 600; }
+        if !root.cau_hinh_mo: Rectangle {
+            background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
+            height: root.hd_hien ? 98px : 160px;
             ScrollView {
                 VerticalLayout {
                     // Dòng 1: số hoá đơn · khách (hoặc id job đã cắt token) + giờ.
@@ -159,7 +434,7 @@ export component MainWindow inherits Window {
                             }
                             Text {
                                 text: j.badge;
-                                color: j.da_in ? #16A34A : (j.dang_xu_ly ? #1786BE : (j.khong_ro ? #B7791F : #C0392B));
+                                color: j.da_in ? #16A34A : (j.da_huy ? #69727F : (j.dang_xu_ly ? #1786BE : (j.khong_ro ? #B7791F : #C0392B)));
                                 font-size: 11px; font-weight: 600; overflow: elide;
                             }
                         }
@@ -168,12 +443,12 @@ export component MainWindow inherits Window {
             }
         }
 
-        // Cấu hình
-        Text { text: "CẤU HÌNH"; color: #69727F; font-size: 12px; font-weight: 600; }
-        Rectangle {
+        // Trang Cấu hình.
+        if root.cau_hinh_mo: Text { text: "CẤU HÌNH"; color: #69727F; font-size: 12px; font-weight: 600; }
+        if root.cau_hinh_mo: Rectangle {
             background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
             VerticalLayout {
-                padding: 14px; spacing: 10px;
+                padding: 14px; spacing: 8px;
                 Text { text: "Server URL"; color: #69727F; font-size: 11px; }
                 LineEdit { text <=> root.f_server; }
                 Text { text: "Token"; color: #69727F; font-size: 11px; }
@@ -202,6 +477,10 @@ export component MainWindow inherits Window {
                     text: root.loi_tu_khoi_dong;
                     color: #C0392B; font-size: 11px; wrap: word-wrap;
                 }
+                HorizontalLayout {
+                    alignment: end;
+                    Button { text: "Lưu"; primary: true; clicked => { root.luu(); } }
+                }
             }
         }
 
@@ -210,7 +489,10 @@ export component MainWindow inherits Window {
             spacing: 10px;
             Button { text: "In thử"; clicked => { root.in_thu(); } }
             Button { text: "Nhật ký"; clicked => { root.mo_nhat_ky(); } }
-            Button { text: "Lưu"; primary: true; clicked => { root.luu(); } }
+            Button {
+                text: root.cau_hinh_mo ? "Xong" : "Cấu hình";
+                clicked => { root.cau_hinh_mo = !root.cau_hinh_mo; }
+            }
         }
     }
 }

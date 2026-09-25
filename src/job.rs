@@ -36,6 +36,9 @@ pub const KHONG_RO: &str = "khong_ro";
 pub const DANG_GUI: &str = "dang_gui";
 /// Job đã rời hàng đợi Windows, app đang chờ máy in xác nhận (trung gian, chỉ app).
 pub const CHO_MAY_IN: &str = "cho_may_in";
+/// Trạng thái dòng "In gần đây" — hoá đơn đã huỷ CHẮC CHẮN từ app (hợp đồng
+/// v5.1 §8.2). CHỈ hiển thị cục bộ, KHÔNG bao giờ gửi trong `ket-qua` (v5.1 bỏ §4.5).
+pub const DA_HUY: &str = "da_huy";
 
 /// Kết quả emit về server qua event "ket-qua" (hợp đồng v2 §2):
 /// `{jobId, trangThai: "da_in"|"loi"|"khong_ro", loiCuoi?, loai?}`.
@@ -322,7 +325,7 @@ mod tests {
         let kq = xu_ly_job(&payload, &cfg(), &in_fn);
         assert_eq!(kq.trang_thai, "khong_ro");
         assert!(!can_gui(&kq, &HoTro::default()), "KhongRo + backend cũ phải IM LẶNG (không emit)");
-        let chi_su_co = HoTro { su_co: true, trang_thai_may_in: true, khong_ro: false, nhat_ky_app: false };
+        let chi_su_co = HoTro { su_co: true, trang_thai_may_in: true, khong_ro: false, nhat_ky_app: false, hang_doi: false };
         assert!(!can_gui(&kq, &chi_su_co), "thiếu đúng 'khong_ro' trong hoTro vẫn phải im lặng");
     }
 

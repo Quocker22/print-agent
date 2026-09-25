@@ -22,6 +22,8 @@ pub struct HoTro {
     pub trang_thai_may_in: bool,
     /// Backend nhận toàn bộ nhật ký cục bộ của app (`nhat-ky-app`, 0.2.4).
     pub nhat_ky_app: bool,
+    /// Backend gửi hàng đợi + nhận huỷ/bỏ theo dõi (`hang-doi`, hợp đồng v5.1 §8.7).
+    pub hang_doi: bool,
 }
 
 /// Payload `cau-hinh` `{hoTro: [...]}` → `HoTro`. Payload lạ/thiếu/sai kiểu →
@@ -38,10 +40,85 @@ pub fn doc_cau_hinh(payload: &Value) -> HoTro {
             "su_co" => ho_tro.su_co = true,
             "trang_thai_may_in" => ho_tro.trang_thai_may_in = true,
             "nhat_ky_app" => ho_tro.nhat_ky_app = true,
+            "hang_doi" => ho_tro.hang_doi = true,
             _ => {} // tính năng backend mới hơn app — bỏ qua, không lỗi
         }
     }
     ho_tro
+}
+
+/// Một mục hàng đợi server gửi (`MucHangDoi`, hợp đồng v5.1 §3.1/§8.6). App
+/// dùng THẲNG `id` (print_jobs.id) để huỷ — không tự bóc từ jobId.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MucHangDoi {
+    pub id: String,
+    pub so_hoa_don: String,
+    pub ten_khach: Option<String>,
+    pub trang_thai: String,
+    /// `cho_in` (đang/sẽ in) | `chua_xac_nhan`.
+    pub nhom: String,
+    pub ly_do: String,
+    pub tam_giu: bool,
+    /// ISO UTC lúc tạo.
+    pub tao: String,
+    /// `chac_chan` (huỷ được chắc chắn) | `khong`.
+    pub huy: String,
+}
+
+/// Payload `hang-doi` `{choIn, chuaXacNhan, capNhat}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HangDoiServer {
+    pub cho_in: Vec<MucHangDoi>,
+    pub chua_xac_nhan: Vec<MucHangDoi>,
+    pub cap_nhat: String,
+}
+
+fn chu(v: &Value, khoa: &str) -> String {
+    v.get(khoa).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+fn doc_muc(v: &Value, nhom_mac_dinh: &str) -> Option<MucHangDoi> {
+    let id = chu(v, "id");
+    if id.is_empty() {
+        return None;
+    }
+    let nhom = chu(v, "nhom");
+    Some(MucHangDoi {
+        id,
+        so_hoa_don: chu(v, "soHoaDon"),
+        ten_khach: v.get("tenKhach").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+        trang_thai: chu(v, "trangThai"),
+        nhom: if nhom.is_empty() { nhom_mac_dinh.to_string() } else { nhom },
+        ly_do: chu(v, "lyDo"),
+        tam_giu: v.get("tamGiu").and_then(Value::as_bool).unwrap_or(false),
+        tao: chu(v, "tao"),
+        huy: chu(v, "huy"),
+    })
+}
+
+/// Payload `hang-doi` → `HangDoiServer`. Mục thiếu `id` bị bỏ; payload lạ ⇒ rỗng.
+pub fn doc_hang_doi(v: &Value) -> HangDoiServer {
+    let ds = |khoa: &str, nhom: &str| -> Vec<MucHangDoi> {
+        v.get(khoa).and_then(Value::as_array).map(|a| a.iter().filter_map(|m| doc_muc(m, nhom)).collect()).unwrap_or_default()
+    };
+    HangDoiServer { cho_in: ds("choIn", "cho_in"), chua_xac_nhan: ds("chuaXacNhan", "chua_xac_nhan"), cap_nhat: chu(v, "capNhat") }
+}
+
+/// Kết quả huỷ / bỏ theo dõi (ack của `yeu-cau-huy` / `yeu-cau-bo-theo-doi`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KetQuaHuy {
+    pub ok: bool,
+    /// `chua_gui` | `da_huy_truoc` (huỷ) — rỗng với bỏ theo dõi.
+    pub cach: String,
+    /// `DANG_IN` | `CHUA_XAC_NHAN` | `DA_IN` | `DA_KET_THUC` | `KHONG_TIM_THAY` | …
+    pub loi: String,
+    pub noi_dung: String,
+}
+
+/// Ack → `KetQuaHuy`. Ack lạ (không có `ok`) ⇒ `None` (người gọi coi là "chưa rõ").
+pub fn doc_ket_qua_huy(v: &Value) -> Option<KetQuaHuy> {
+    let ok = v.get("ok").and_then(Value::as_bool)?;
+    Some(KetQuaHuy { ok, cach: chu(v, "cach"), loi: chu(v, "loi"), noi_dung: chu(v, "noiDung") })
 }
 
 /// `su-co`: `{jobId, loai, chiTiet?, mayIn, luc}`.
@@ -106,13 +183,13 @@ mod tests {
         assert!(doc_cau_hinh(&json!({"hoTro": ["nhat_ky_app"]})).nhat_ky_app);
         assert!(!doc_cau_hinh(&json!({"hoTro": ["su_co"]})).nhat_ky_app);
         let h = doc_cau_hinh(&json!({"hoTro": ["khong_ro", "su_co", "trang_thai_may_in"]}));
-        assert_eq!(h, HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false });
+        assert_eq!(h, HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false, hang_doi: false });
     }
 
     #[test]
     fn cau_hinh_mot_phan_va_muc_la_bo_qua() {
         let h = doc_cau_hinh(&json!({"hoTro": ["su_co", "tinh_nang_tuong_lai", 42]}));
-        assert_eq!(h, HoTro { khong_ro: false, su_co: true, trang_thai_may_in: false, nhat_ky_app: false });
+        assert_eq!(h, HoTro { khong_ro: false, su_co: true, trang_thai_may_in: false, nhat_ky_app: false, hang_doi: false });
     }
 
     #[test]
@@ -163,5 +240,30 @@ mod tests {
         assert!(!b.lan_dau(MaSuCo::HetGiay));
         assert!(b.lan_dau(MaSuCo::Offline), "loai khác vẫn gửi");
         assert!(!b.lan_dau(MaSuCo::HetGiay));
+    }
+
+    /// v5.1 §8.6/§8.7: đọc ảnh chụp hàng đợi + ack huỷ.
+    #[test]
+    fn doc_hang_doi_va_ket_qua_huy() {
+        let v = json!({
+            "choIn": [
+                {"id": "a1", "soHoaDon": "INV/2026/030110", "tenKhach": "Anh Dev", "trangThai": "cho_in", "nhom": "cho_in",
+                 "lyDo": "Tạm giữ — máy in Hết giấy", "tamGiu": true, "tao": "2026-09-25T11:45:00.000Z", "huy": "chac_chan", "lanThu": 0},
+                {"soHoaDon": "thiếu id — bỏ"}
+            ],
+            "chuaXacNhan": [{"id": "b2", "soHoaDon": "INV/2", "trangThai": "khong_ro", "huy": "khong", "tenKhach": ""}],
+            "capNhat": "2026-09-25T11:46:00.000Z"
+        });
+        let h = doc_hang_doi(&v);
+        assert_eq!(h.cho_in.len(), 1);
+        assert_eq!(h.cho_in[0].ten_khach.as_deref(), Some("Anh Dev"));
+        assert!(h.cho_in[0].tam_giu);
+        assert_eq!(h.chua_xac_nhan[0].nhom, "chua_xac_nhan", "nhóm mặc định theo khối");
+        assert_eq!(h.chua_xac_nhan[0].ten_khach, None, "tên rỗng = không có");
+        assert_eq!(doc_hang_doi(&json!(null)), HangDoiServer::default());
+        let k = doc_ket_qua_huy(&json!({"id": "a1", "ok": false, "loi": "DANG_IN", "noiDung": "đang in"})).unwrap();
+        assert!(!k.ok && k.loi == "DANG_IN" && k.noi_dung == "đang in");
+        assert_eq!(doc_ket_qua_huy(&json!({"loi": "x"})), None, "không có ok = chưa rõ");
+        assert!(doc_cau_hinh(&json!({"hoTro": ["hang_doi"]})).hang_doi);
     }
 }

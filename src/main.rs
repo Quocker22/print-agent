@@ -12,6 +12,7 @@
 
 mod bao_cao;
 mod config;
+mod hang_doi;
 mod hop_thu_di;
 mod job;
 mod mot_ban;
