@@ -40,6 +40,7 @@
 use crate::job::{self, KetQuaIn, LyDo};
 use crate::nhat_ky;
 use crate::su_co::{self, co, MaSuCo, TapMa};
+use crate::usb_may_in::{DocUsb, TinhTrangUsb};
 use std::time::Duration;
 
 /// Chu kỳ poll spooler.
@@ -62,6 +63,19 @@ pub const SO_LAN_VANG_LA_XONG: usize = 2;
 /// máy rồi mới hết giấy/kẹt giấy — job rời hàng đợi Windows sạch sẽ mà giấy
 /// chưa ra. Máy in báo sự cố chặn in trong khoảng này → `KhongRo(<mã>)`.
 pub const SO_LAN_DOC_MAY_IN_SAU_KHI_ROI: usize = 4;
+
+/// Máy in USB đọc được trạng thái (U2): sau khi job rời hàng đợi, đọc tối đa
+/// chừng này lần (60 × 500 ms = 30 s) để thấy máy IN XONG (BUSY → IDLE) hoặc
+/// báo lỗi. Hoá đơn 1–2 trang trên HP Laser 107 in ~10 s kể cả lúc máy vừa
+/// thức; quá 30 s mà vẫn BUSY → `khong_ro` + theo dõi tiếp qua USB. Tổng thời
+/// gian một job vẫn phải dưới 90 s backend chờ (hợp đồng §3.1).
+pub const SO_LAN_USB_TOI_DA: usize = 60;
+
+/// Máy USB đọc được mà CHƯA từng thấy BUSY (in xong trước lần đọc đầu, hoặc máy
+/// không có trường STATUS): chừng này lần đọc liên tiếp không lỗi (6 s) là xong.
+/// Dài hơn 4 lần của máy mạng vì máy USB báo lỗi lúc KÉO GIẤY, sau khi nhận
+/// xong dữ liệu vài giây.
+pub const SO_LAN_USB_KHONG_THAY_IN: usize = 12;
 
 /// Sau lệnh xoá: kiểm lại hàng đợi tối đa SO_LAN × CHU_KY (5 s) cho tới khi
 /// job biến mất. Job không vướng cổng máy in thì xoá gần như tức thì; kẹt quá
@@ -146,6 +160,10 @@ pub enum QuanSat {
     /// Vòng theo dõi kết luận `KhongRo` mà lần đọc cuối VẪN THẤY job trong
     /// hàng đợi Windows — net.rs đưa job vào luồng theo dõi tiếp (R3).
     ConTrongHangDoi(BangChungJob),
+    /// Job đã rời hàng đợi Windows sang BỘ NHỚ máy in USB mà chưa ra giấy (U2):
+    /// máy báo lỗi (`da_thay_loi`) hoặc vẫn bận quá hạn — net.rs đưa job vào theo
+    /// dõi tiếp QUA USB, báo backend `conTrongHangDoi:true` (tự in, KHÔNG in lại).
+    TrongMayInUsb { bang_chung: BangChungJob, da_thay_loi: bool },
 }
 
 /// Kết luận của `BoSuy`.
@@ -439,6 +457,11 @@ pub struct VongDoc {
     pub hang_doi: Option<Vec<JobHangDoi>>,
     /// OpenPrinter lỗi vì TÊN máy in không tồn tại trong Windows.
     pub khong_tim_thay_may_in: bool,
+    /// Trạng thái hỏi THẲNG thiết bị USB (usb_may_in.rs) — chỉ có khi máy in
+    /// nằm trên cổng `USBnnn` VÀ hàng đợi vừa đọc RỖNG (không chen vào lúc
+    /// spooler đang đẩy byte). `None` = không phải máy USB / không đọc được /
+    /// hàng đợi còn job: mọi luật giữ nguyên như trước khi có lớp này.
+    pub usb: Option<crate::usb_may_in::DocUsb>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,29 +747,49 @@ fn mo_ta_job(j: &JobHangDoi) -> String {
 }
 
 /// Trạng thái máy in (CẤP MÁY) của một vòng đọc (None = không đọc được).
+/// Máy USB báo lỗi qua thiết bị (U1) mà cờ spooler "bình thường" → mã USB
+/// thắng theo thứ tự ưu tiên §1, `chiTiet` ghép cả hai nguồn.
 fn doc_may_in(vong: &VongDoc) -> Option<(MaSuCo, Option<String>)> {
     if vong.khong_tim_thay_may_in {
-        Some((MaSuCo::KhongTimThayMayIn, Some("OpenPrinter: ERROR_INVALID_PRINTER_NAME".to_string())))
-    } else {
-        vong.co_may_in.map(|s| tinh_trang_tu_co(s, vong.thuoc_tinh_may_in))
+        return Some((MaSuCo::KhongTimThayMayIn, Some("OpenPrinter: ERROR_INVALID_PRINTER_NAME".to_string())));
     }
+    let (ma, ct) = vong.co_may_in.map(|s| tinh_trang_tu_co(s, vong.thuoc_tinh_may_in))?;
+    let Some((usb, ma_usb)) = vong.usb.as_ref().and_then(|u| u.ma_su_co().map(|m| (u, m))) else {
+        return Some((ma, ct));
+    };
+    let ct_usb = usb.mo_ta();
+    let ct = match ct {
+        Some(c) => format!("{}; {}", c, ct_usb),
+        None => ct_usb,
+    };
+    Some((su_co::uu_tien_hon(ma, ma_usb), Some(ct)))
 }
 
 /// MỌI mã cấp máy của một vòng đọc (None = không đọc được máy in) — R-B.
+/// Gồm mã lỗi đọc thẳng từ thiết bị USB (U1).
 pub fn tap_may_in(vong: &VongDoc) -> Option<TapMa> {
     if vong.khong_tim_thay_may_in {
-        Some([MaSuCo::KhongTimThayMayIn].into_iter().collect())
-    } else {
-        vong.co_may_in.map(|s| su_co::cac_ma_may_in(s, vong.thuoc_tinh_may_in))
+        return Some([MaSuCo::KhongTimThayMayIn].into_iter().collect());
     }
+    let mut tap = vong.co_may_in.map(|s| su_co::cac_ma_may_in(s, vong.thuoc_tinh_may_in))?;
+    if let Some(ma) = vong.usb.as_ref().and_then(crate::usb_may_in::DocUsb::ma_su_co) {
+        tap.them(ma);
+    }
+    Some(tap)
 }
 
 /// Chụp cờ nền (R-B) từ một vòng đọc. `khong_tim_thay_may_in` KHÔNG BAO GIỜ
 /// là nền: tên máy in không có trong Windows thì không gì in được — không thể
 /// là "cờ báo sai mà máy vẫn in". Không đọc được máy in → nền rỗng.
+///
+/// Mã lỗi đọc thẳng từ USB (U1) cũng KHÔNG BAO GIỜ là nền: cờ nền sinh ra cho
+/// cờ spooler báo sai dai dẳng (HP 4003 qua WSD bật ERROR suốt mà vẫn in); bit
+/// lỗi USB thì đã đo là đổi đúng theo giấy — máy lỗi từ trước job thì job gửi
+/// xuống cũng nằm chờ trong máy.
 pub fn chup_nen(vong: &VongDoc) -> TapMa {
     let khong_tim_thay: TapMa = [MaSuCo::KhongTimThayMayIn].into_iter().collect();
-    tap_may_in(vong).unwrap_or_default().tru(khong_tim_thay)
+    let chi_spooler = VongDoc { usb: None, ..vong.clone() };
+    tap_may_in(&chi_spooler).unwrap_or_default().tru(khong_tim_thay)
 }
 
 /// Cờ job cho thấy job KHÔNG chặn hàng đợi dù còn mang cờ lỗi (T2, giám sát
@@ -843,18 +886,88 @@ fn bao_may_in(vong: &VongDoc, nen: TapMa, bao: &dyn Fn(QuanSat)) -> MayInVong {
     MayInVong { chan, chan_moi }
 }
 
-/// Sau khi job rời hàng đợi sạch: đọc máy in thêm `SO_LAN_DOC_MAY_IN_SAU_KHI_ROI`
-/// lần (R5c). Trả mã sự cố chặn in MỚI (ngoài nền, R-B) nếu máy báo — lúc đó
-/// job có thể đang nằm trong bộ nhớ máy in mạng, chưa ra giấy.
-fn kiem_may_in_sau_khi_roi(sp: &mut dyn Spooler, nen: TapMa, bao: &dyn Fn(QuanSat)) -> Option<MaSuCo> {
-    for _ in 0..SO_LAN_DOC_MAY_IN_SAU_KHI_ROI {
+/// Kết luận của bước đọc máy in SAU KHI job rời hàng đợi sạch (R5c, U2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SauKhiRoi {
+    /// Không thấy gì bất thường — hoặc máy USB xác nhận IN XONG (BUSY → IDLE).
+    Sach,
+    /// Cờ spooler báo sự cố chặn in MỚI (R5c): có thể còn trong bộ nhớ máy in
+    /// mạng — không có cách nào theo dõi tiếp.
+    SuCo(MaSuCo),
+    /// Máy USB báo lỗi: hoá đơn nằm trong bộ nhớ máy, tự in khi xử lý xong (U2).
+    TrongMayInUsb(MaSuCo),
+    /// Máy USB vẫn BUSY quá `SO_LAN_USB_TOI_DA` lần đọc — chưa biết in xong chưa.
+    UsbChuaXong,
+}
+
+/// Bộ quyết THUẦN của bước sau khi rời hàng đợi (R5c + U2), mỗi lần đọc một bước.
+///
+/// Máy KHÔNG đọc được USB: luật cũ R5c — `SO_LAN_DOC_MAY_IN_SAU_KHI_ROI` lần
+/// sạch là xong. Máy USB (U2): phải thấy máy IN XONG — đã thấy BUSY rồi về
+/// không-BUSY, không lỗi — mới là `Sach`; lỗi USB bất cứ lúc nào → hoá đơn
+/// nằm trong bộ nhớ máy. Chưa từng thấy BUSY: `SO_LAN_USB_KHONG_THAY_IN` lần
+/// sạch liên tiếp (máy in rất nhanh / không có trường STATUS).
+#[derive(Debug, Default)]
+pub struct BoSauKhiRoi {
+    so_lan: usize,
+    da_thay_usb: bool,
+    da_thay_dang_in: bool,
+    sach_chua_thay_in: usize,
+}
+
+impl BoSauKhiRoi {
+    /// `chan_moi` = mã chặn in MỚI của vòng (cờ spooler ngoài nền + lỗi USB);
+    /// `usb` = tình trạng USB của vòng (`None` = không đọc được).
+    pub fn them(&mut self, chan_moi: Option<MaSuCo>, usb: Option<TinhTrangUsb>) -> Option<SauKhiRoi> {
+        self.so_lan += 1;
+        if usb.is_some() {
+            self.da_thay_usb = true;
+        }
+        if let Some(TinhTrangUsb::Loi(ma)) = usb {
+            return Some(SauKhiRoi::TrongMayInUsb(chan_moi.map_or(ma, |m| su_co::uu_tien_hon(m, ma))));
+        }
+        if let Some(ma) = chan_moi {
+            // Cờ spooler báo lỗi mà máy vẫn đọc được USB → theo dõi được qua USB.
+            return Some(if self.da_thay_usb { SauKhiRoi::TrongMayInUsb(ma) } else { SauKhiRoi::SuCo(ma) });
+        }
+        if !self.da_thay_usb {
+            return (self.so_lan >= SO_LAN_DOC_MAY_IN_SAU_KHI_ROI).then_some(SauKhiRoi::Sach);
+        }
+        match usb {
+            Some(TinhTrangUsb::DangIn) => {
+                self.da_thay_dang_in = true;
+                self.sach_chua_thay_in = 0;
+            }
+            // Đã thấy in, nay không bận, không lỗi → in xong.
+            Some(TinhTrangUsb::Ranh | TinhTrangUsb::KhongLoi) if self.da_thay_dang_in => return Some(SauKhiRoi::Sach),
+            Some(TinhTrangUsb::Ranh | TinhTrangUsb::KhongLoi) => {
+                self.sach_chua_thay_in += 1;
+                if self.sach_chua_thay_in >= SO_LAN_USB_KHONG_THAY_IN {
+                    return Some(SauKhiRoi::Sach);
+                }
+            }
+            // Lần này không đọc được USB (hàng đợi có job khác, thiết bị bận…) — chờ tiếp.
+            Some(TinhTrangUsb::Loi(_)) | None => {}
+        }
+        if self.so_lan >= SO_LAN_USB_TOI_DA {
+            return Some(if self.da_thay_dang_in { SauKhiRoi::UsbChuaXong } else { SauKhiRoi::Sach });
+        }
+        None
+    }
+}
+
+/// Sau khi job rời hàng đợi sạch: đọc máy in tiếp tới khi `BoSauKhiRoi` kết
+/// luận (R5c; máy USB: U2). Mọi lần đọc vẫn báo trạng thái/sự cố ra ngoài NGAY.
+fn kiem_may_in_sau_khi_roi(sp: &mut dyn Spooler, nen: TapMa, bao: &dyn Fn(QuanSat)) -> SauKhiRoi {
+    let mut bo = BoSauKhiRoi::default();
+    loop {
         sp.cho(POLL_INTERVAL);
         let vong = sp.doc_vong();
-        if let Some(ma) = bao_may_in(&vong, nen, bao).chan_moi {
-            return Some(ma);
+        let chan_moi = bao_may_in(&vong, nen, bao).chan_moi;
+        if let Some(kl) = bo.them(chan_moi, vong.usb.as_ref().map(DocUsb::tinh_trang)) {
+            return kl;
         }
     }
-    None
 }
 
 /// Vòng theo dõi một job — viết trên trait `Spooler` để test được.
@@ -973,14 +1086,31 @@ fn ket_thuc(
     match kl {
         KetLuan::DaIn { qua_vang: false } => KetQuaIn::DaIn,
         KetLuan::DaIn { qua_vang: true } => match kiem_may_in_sau_khi_roi(sp, bo_suy.nen, bao) {
-            None => KetQuaIn::DaIn,
-            Some(ma) => KetQuaIn::KhongRo(LyDo::co_loai(
+            SauKhiRoi::Sach => KetQuaIn::DaIn,
+            SauKhiRoi::SuCo(ma) => KetQuaIn::KhongRo(LyDo::co_loai(
                 format!(
                     "job da roi hang doi Windows nhung may in bao {} ngay sau do — co the con trong bo nho may in",
                     ma.nhan()
                 ),
                 ma,
             )),
+            SauKhiRoi::TrongMayInUsb(ma) => {
+                bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: true });
+                KetQuaIn::KhongRo(LyDo::co_loai(
+                    format!(
+                        "may in bao {} qua USB — hoa don dang nam trong bo nho may in, tu in khi xu ly xong (app theo doi va bao khi in xong)",
+                        ma.nhan()
+                    ),
+                    ma,
+                ))
+            }
+            SauKhiRoi::UsbChuaXong => {
+                bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: false });
+                KetQuaIn::KhongRo(LyDo::co_loai(
+                    "may in USB van dang ban sau 30 giay — app theo doi tiep va bao khi in xong",
+                    MaSuCo::KhongXacNhan,
+                ))
+            }
         },
         KetLuan::KhongRo(ly_do) => {
             if con_trong_hang_doi {
@@ -1299,9 +1429,9 @@ mod win {
         }
     }
 
-    /// (PRINTER_INFO_2W.Status, .Attributes) đọc trong CÙNG một lần GetPrinterW
-    /// (None nếu query lỗi).
-    fn doc_co_may_in(h: &PrinterHandle) -> Option<(u32, u32)> {
+    /// (PRINTER_INFO_2W.Status, .Attributes, .pPortName) đọc trong CÙNG một lần
+    /// GetPrinterW (None nếu query lỗi). Tên cổng (`USB001`, `WSD-…`) cho U1.
+    fn doc_co_may_in(h: &PrinterHandle) -> Option<(u32, u32, String)> {
         let can = std::mem::size_of::<PRINTER_INFO_2W>();
         let mut needed: u32 = 0;
         // Lần gọi 1: chỉ để lấy kích thước buffer cần (luôn lỗi INSUFFICIENT_BUFFER).
@@ -1321,7 +1451,9 @@ mod win {
         // read_unaligned: Vec<u8> chỉ bảo đảm căn 1 byte, PRINTER_INFO_2W cần căn
         // con trỏ — đọc lệch qua `&*` là UB dù x64 hiếm khi lộ ra.
         let info = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const PRINTER_INFO_2W) };
-        Some((info.Status, info.Attributes))
+        // pPortName trỏ vào `buf` — còn sống tới hết hàm.
+        let cong = unsafe { pwstr_to_string(info.pPortName) };
+        Some((info.Status, info.Attributes, cong))
     }
 
     /// EnumJobs cấp độ 2 (JOB_INFO_2W), đọc CHẶT (R5b): lần hỏi kích thước lỗi
@@ -1413,11 +1545,20 @@ mod win {
                 Err(LoiMo::Khac) => VongDoc::default(),
                 Ok(h) => {
                     let may_in = doc_co_may_in(&h);
+                    let hang_doi = doc_danh_sach_job(&h);
+                    // U1: hỏi thẳng thiết bị USB CHỈ khi hàng đợi RỖNG (đọc được và
+                    // không còn job nào) — không chen vào lúc spooler đang đẩy byte
+                    // xuống cổng. Máy mạng/WSD: `doc_theo_cong` trả None ngay.
+                    let usb = match (&may_in, &hang_doi) {
+                        (Some((_, _, cong)), Some(jobs)) if jobs.is_empty() => crate::usb_may_in::doc_theo_cong(cong),
+                        _ => None,
+                    };
                     VongDoc {
-                        co_may_in: may_in.map(|(s, _)| s),
-                        thuoc_tinh_may_in: may_in.map_or(0, |(_, a)| a),
-                        hang_doi: doc_danh_sach_job(&h),
+                        co_may_in: may_in.as_ref().map(|(s, _, _)| *s),
+                        thuoc_tinh_may_in: may_in.as_ref().map_or(0, |(_, a, _)| *a),
+                        hang_doi,
                         khong_tim_thay_may_in: false,
+                        usb,
                     }
                 }
             }
@@ -1547,6 +1688,20 @@ pub(crate) mod gia {
 
     pub fn vong(co_may_in: u32, jobs: Vec<JobHangDoi>) -> VongDoc {
         VongDoc { co_may_in: Some(co_may_in), hang_doi: Some(jobs), ..VongDoc::default() }
+    }
+
+    /// Ba trạng thái USB ĐO THẬT ở máy HCM (HP Laser 103 107 108, 25/09).
+    pub const USB_RANH: (u8, &str) = (0x18, "IDLE");
+    pub const USB_DANG_IN: (u8, &str) = (0x98, "BUSY");
+    pub const USB_HET_GIAY: (u8, &str) = (0x90, "BUSY");
+
+    /// Vòng đọc của máy USB lúc hàng đợi RỖNG (chỉ lúc đó mới đọc USB — U1),
+    /// cờ spooler "bình thường" như máy HCM thật.
+    pub fn vong_usb((byte, status): (u8, &str)) -> VongDoc {
+        VongDoc {
+            usb: Some(crate::usb_may_in::DocUsb { byte, status: Some(status.to_string()) }),
+            ..vong(0, vec![])
+        }
     }
 
     #[derive(Default)]
@@ -1786,7 +1941,7 @@ mod tests {
     // ================= Mã §1, cờ job, xoá job trước khi báo Loi =================
 
     use crate::su_co::co::*;
-    use gia::{job, job_khac, vong, SpoolerGia, ID};
+    use gia::{job, job_khac, vong, vong_usb, SpoolerGia, ID, USB_DANG_IN, USB_HET_GIAY, USB_RANH};
     use std::cell::RefCell;
 
     #[test]
@@ -2794,5 +2949,144 @@ mod tests {
         // không đọc được hàng đợi → không làm gì
         let mut sp = SpoolerGia::default();
         assert!(tiep_tuc_job_bi_dung_cua_app(&mut sp, MAY).is_empty());
+    }
+
+    // --- U1/U2: máy in USB — hỏi thẳng thiết bị (usb_may_in.rs), đo ở HCM 25/09 ---
+
+    fn trong_may_in_usb(ds: &[QuanSat]) -> Option<bool> {
+        ds.iter().find_map(|q| match q {
+            QuanSat::TrongMayInUsb { da_thay_loi, .. } => Some(*da_thay_loi),
+            _ => None,
+        })
+    }
+
+    /// Ca THẬT INV/2026/030110: HP Laser 107 cắm USB, hết giấy. Windows không
+    /// biết gì (cờ máy 0, hàng đợi rỗng sau vài giây) — bản 0.2.0 báo `da_in`,
+    /// NV gửi lại 3 lần, nạp giấy ra 3 tờ. Máy báo lỗi qua USB lúc KÉO GIẤY,
+    /// muộn hơn khung 4 lần đọc cũ → phải bắt được, ra `khong_ro` + theo dõi USB.
+    #[test]
+    fn u2_ca_that_hcm_het_giay_sau_khi_roi_hang_doi_la_khong_ro_trong_may_in() {
+        let mut vongs = vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)])];
+        vongs.extend(std::iter::repeat_n(vong_usb(USB_DANG_IN), 2 + 5));
+        vongs.push(vong_usb(USB_HET_GIAY));
+        let mut sp = SpoolerGia { vong: vongs, ..Default::default() };
+        let (kq, bao) = chay_su_co_moi(&mut sp, 30);
+        let KetQuaIn::KhongRo(l) = kq else { panic!("{:?}", kq) };
+        assert_eq!(l.loai, Some(MaSuCo::CanXuLy));
+        assert!(l.chu.contains("bo nho may in") && l.chu.contains("tu in"), "{}", l.chu);
+        assert_eq!(trong_may_in_usb(&bao), Some(true), "giao theo dõi tiếp QUA USB");
+        assert!(!co_theo_doi_tiep(&bao), "không còn trong hàng đợi Windows");
+        assert_eq!(so_su_co(&bao, MaSuCo::CanXuLy), 1, "su-co gửi NGAY lúc thấy lỗi");
+    }
+
+    /// Đối chứng cùng máy: in bình thường — BUSY vài giây rồi IDLE → `da_in`,
+    /// và PHẢI chờ tới IDLE (không kết luận sau 4 lần đọc như máy mạng).
+    #[test]
+    fn u2_usb_in_xong_busy_roi_idle_moi_la_da_in() {
+        let mut vongs = vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)])];
+        vongs.extend(std::iter::repeat_n(vong_usb(USB_DANG_IN), 2 + 10));
+        vongs.push(vong_usb(USB_RANH));
+        let mut sp = SpoolerGia { vong: vongs, ..Default::default() };
+        let (kq, bao) = chay_su_co_moi(&mut sp, 30);
+        assert_eq!(kq, KetQuaIn::DaIn);
+        assert_eq!(sp.so_vong_da_doc, 1 + 2 + 10 + 1, "đọc tới đúng lần IDLE");
+        assert_eq!(trong_may_in_usb(&bao), None);
+    }
+
+    /// Máy USB mà lần nào cũng IDLE (in xong trước lần đọc đầu): đủ
+    /// `SO_LAN_USB_KHONG_THAY_IN` lần sạch mới `da_in` — lỗi kéo giấy có thời gian hiện ra.
+    #[test]
+    fn u2_usb_khong_thay_busy_can_du_so_lan_sach() {
+        let mut sp = SpoolerGia {
+            vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)]), vong_usb(USB_RANH)],
+            ..Default::default()
+        };
+        let (kq, _) = chay_su_co_moi(&mut sp, 30);
+        assert_eq!(kq, KetQuaIn::DaIn);
+        assert_eq!(sp.so_vong_da_doc, 1 + SO_LAN_VANG_LA_XONG + SO_LAN_USB_KHONG_THAY_IN);
+    }
+
+    /// Máy USB BUSY mãi (không lỗi): hết `SO_LAN_USB_TOI_DA` lần → `khong_ro
+    /// (khong_xac_nhan)` + theo dõi tiếp qua USB (chưa từng thấy lỗi).
+    #[test]
+    fn u2_usb_ban_qua_han_la_khong_ro_va_theo_doi_usb() {
+        let mut sp = SpoolerGia {
+            vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)]), vong_usb(USB_DANG_IN)],
+            ..Default::default()
+        };
+        let (kq, bao) = chay_su_co_moi(&mut sp, 30);
+        let KetQuaIn::KhongRo(l) = kq else { panic!("{:?}", kq) };
+        assert_eq!(l.loai, Some(MaSuCo::KhongXacNhan));
+        assert_eq!(trong_may_in_usb(&bao), Some(false));
+        assert_eq!(sp.so_vong_da_doc, 1 + SO_LAN_VANG_LA_XONG + SO_LAN_USB_TOI_DA);
+        assert_eq!(so_su_co(&bao, MaSuCo::KhongXacNhan), 0, "bận không phải sự cố");
+    }
+
+    /// Máy KHÔNG đọc được USB (mạng/WSD, hoặc thiết bị không mở được): luật
+    /// cũ R5c giữ nguyên — đúng `SO_LAN_DOC_MAY_IN_SAU_KHI_ROI` lần là xong.
+    #[test]
+    fn u2_khong_co_usb_giu_luat_cu() {
+        let mut sp = SpoolerGia {
+            vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)]), vong(0, vec![])],
+            ..Default::default()
+        };
+        let (kq, bao) = chay_su_co_moi(&mut sp, 30);
+        assert_eq!(kq, KetQuaIn::DaIn);
+        assert_eq!(sp.so_vong_da_doc, 1 + SO_LAN_VANG_LA_XONG + SO_LAN_DOC_MAY_IN_SAU_KHI_ROI);
+        assert_eq!(trong_may_in_usb(&bao), None);
+    }
+
+    #[test]
+    fn u2_bo_sau_khi_roi_thuan() {
+        use crate::usb_may_in::TinhTrangUsb::*;
+        // Lỗi USB ngay lần đầu.
+        let mut bo = BoSauKhiRoi::default();
+        assert_eq!(bo.them(Some(MaSuCo::CanXuLy), Some(Loi(MaSuCo::CanXuLy))), Some(SauKhiRoi::TrongMayInUsb(MaSuCo::CanXuLy)));
+        // Cờ spooler báo lỗi, máy đọc được USB (chưa lỗi) → vẫn theo dõi được qua USB.
+        let mut bo = BoSauKhiRoi::default();
+        assert_eq!(bo.them(Some(MaSuCo::HetGiay), Some(DangIn)), Some(SauKhiRoi::TrongMayInUsb(MaSuCo::HetGiay)));
+        // Không USB → luật cũ.
+        let mut bo = BoSauKhiRoi::default();
+        assert_eq!(bo.them(Some(MaSuCo::HetGiay), None), Some(SauKhiRoi::SuCo(MaSuCo::HetGiay)));
+        // Đã thấy BUSY, giữa chừng không đọc được USB (hàng đợi có job khác) → chờ, rồi IDLE → Sach.
+        let mut bo = BoSauKhiRoi::default();
+        assert_eq!(bo.them(None, Some(DangIn)), None);
+        for _ in 0..10 {
+            assert_eq!(bo.them(None, None), None);
+        }
+        assert_eq!(bo.them(None, Some(Ranh)), Some(SauKhiRoi::Sach));
+        // Máy không có STATUS (KhongLoi): chưa thấy in → cần đủ SO_LAN_USB_KHONG_THAY_IN.
+        let mut bo = BoSauKhiRoi::default();
+        for _ in 0..SO_LAN_USB_KHONG_THAY_IN - 1 {
+            assert_eq!(bo.them(None, Some(KhongLoi)), None);
+        }
+        assert_eq!(bo.them(None, Some(KhongLoi)), Some(SauKhiRoi::Sach));
+        // BUSY rồi lại BUSY: đếm "sạch chưa thấy in" không cộng dồn qua lần BUSY.
+        let mut bo = BoSauKhiRoi::default();
+        assert_eq!(bo.them(None, Some(DangIn)), None);
+        assert_eq!(bo.them(None, Some(Ranh)), Some(SauKhiRoi::Sach));
+    }
+
+    /// U1: lỗi USB vào trạng thái gộp (luồng rảnh báo `can_xu_ly`, backend
+    /// ngắt cầu dao), `chiTiet` nói rõ nguồn USB.
+    #[test]
+    fn u1_tinh_trang_gop_co_loi_usb() {
+        let (ma, ct) = tinh_trang_gop(&vong_usb(USB_HET_GIAY)).unwrap();
+        assert_eq!(ma, MaSuCo::CanXuLy);
+        assert!(ct.as_deref().is_some_and(|c| c.contains("USB 0x90") && c.contains("hết giấy")), "{:?}", ct);
+        assert_eq!(tinh_trang_gop(&vong_usb(USB_RANH)).unwrap().0, MaSuCo::BinhThuong);
+        assert_eq!(tinh_trang_gop(&vong_usb(USB_DANG_IN)).unwrap().0, MaSuCo::BinhThuong);
+        // Cờ spooler hết giấy + lỗi USB chung → mã ưu tiên cao hơn (hết giấy), chiTiet ghép hai nguồn.
+        let v = VongDoc { co_may_in: Some(PRINTER_STATUS_PAPER_OUT), ..vong_usb(USB_HET_GIAY) };
+        let (ma, ct) = tinh_trang_gop(&v).unwrap();
+        assert_eq!(ma, MaSuCo::HetGiay);
+        assert!(ct.as_deref().is_some_and(|c| c.contains("PAPER_OUT") && c.contains("USB 0x90")), "{:?}", ct);
+    }
+
+    /// U1: lỗi USB KHÔNG BAO GIỜ là cờ nền (R-B chỉ cho cờ spooler báo sai dai dẳng).
+    #[test]
+    fn u1_loi_usb_khong_vao_nen() {
+        assert!(chup_nen(&vong_usb(USB_HET_GIAY)).is_empty());
+        assert!(tap_may_in(&vong_usb(USB_HET_GIAY)).is_some_and(|t| t.co(MaSuCo::CanXuLy)));
     }
 }

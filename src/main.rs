@@ -26,6 +26,7 @@ mod thoi_gian;
 mod ui;
 mod taskbar_win;
 mod tu_khoi_dong;
+mod usb_may_in;
 mod view_model;
 
 use anyhow::Result;

@@ -88,7 +88,9 @@ impl MaSuCo {
             MaSuCo::Offline => "Bật máy in, kiểm dây mạng/USB",
             MaSuCo::MoNap => "Đóng nắp máy in",
             MaSuCo::HetMuc => "Chuẩn bị thay mực",
-            MaSuCo::CanXuLy => "Xem màn hình máy in",
+            // Máy HP Laser 107 (HCM) không có màn hình — chỉ đèn; lỗi qua USB
+            // không nói rõ hết giấy hay kẹt (usb_may_in.rs) nên kể đủ ba việc.
+            MaSuCo::CanXuLy => "Xem đèn/màn hình máy in: nạp giấy, gỡ giấy kẹt, đóng nắp",
             MaSuCo::LoiMayIn => "Xem màn hình máy in, tắt/bật lại máy in",
             MaSuCo::KhongTimThayMayIn => "Chọn lại máy in trong app",
             MaSuCo::LoiSumatra => "Báo kỹ thuật: SumatraPDF lỗi",

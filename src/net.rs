@@ -266,7 +266,13 @@ fn chay_worker_in(
 fn dua_vao_theo_doi_tiep(kho: &KhoTheoDoiTiep, j: JobTheoDoiTiep) {
     nhat_ky::ghi(
         "theo_doi_tiep_them",
-        &format!("job={} hoa_don={} may_in={}", job::rut_gon_job_id(&j.job_id), j.so_hoa_don, j.may_in),
+        &format!(
+            "job={} hoa_don={} may_in={} theo={}",
+            job::rut_gon_job_id(&j.job_id),
+            j.so_hoa_don,
+            j.may_in,
+            if j.la_qua_usb() { "usb" } else { "hang_doi" }
+        ),
     );
     if let Some(bo) = kho.them(j) {
         nhat_ky::ghi(
@@ -313,6 +319,8 @@ struct BaoCaoTrongLuc<'a> {
     may_in_da_chuyen: Cell<Option<MaSuCo>>,
     da_thay_su_co: Cell<bool>,
     con_trong_hang_doi: Cell<Option<BangChungJob>>,
+    /// `Some(da_thay_loi)` = job nằm trong BỘ NHỚ máy in USB (U2) — theo dõi tiếp qua USB.
+    trong_may_in_usb: Cell<Option<bool>>,
 }
 
 impl BaoCaoTrongLuc<'_> {
@@ -339,6 +347,12 @@ impl BaoCaoTrongLuc<'_> {
                 }
             }
             QuanSat::ConTrongHangDoi(bc) => self.con_trong_hang_doi.set(Some(bc)),
+            // Không còn trong hàng đợi Windows nhưng CÒN chờ trong máy in — với
+            // backend nghĩa y hệt (`conTrongHangDoi:true`: tự in, KHÔNG in lại).
+            QuanSat::TrongMayInUsb { bang_chung, da_thay_loi } => {
+                self.con_trong_hang_doi.set(Some(bang_chung));
+                self.trong_may_in_usb.set(Some(da_thay_loi));
+            }
         }
     }
 }
@@ -348,7 +362,8 @@ impl BaoCaoTrongLuc<'_> {
 struct KetThucViec {
     /// Có sự cố trong lúc in → ép gửi trạng thái máy in lần rảnh tới (R6).
     da_thay_su_co: bool,
-    /// Job `khong_ro` còn nằm trong hàng đợi Windows → theo dõi tiếp (R3).
+    /// Job `khong_ro` còn nằm trong hàng đợi Windows (R3) hoặc trong bộ nhớ máy
+    /// in USB (U2) → theo dõi tiếp.
     theo_doi_tiep: Option<JobTheoDoiTiep>,
 }
 
@@ -382,6 +397,7 @@ fn xu_ly_viec_co_bao_cao(
         may_in_da_chuyen: Cell::new(None),
         da_thay_su_co: Cell::new(false),
         con_trong_hang_doi: Cell::new(None),
+        trong_may_in_usb: Cell::new(None),
     };
     let bao = |qs: QuanSat| bao_cao.nhan(qs);
     let in_fn = |pdf: &[u8], printer: &str, paper: &str, tray: &str, copies: u32, id: &str, ten: Option<&str>| {
@@ -401,9 +417,14 @@ fn xu_ly_viec_co_bao_cao(
     // Theo dõi tiếp ĐÚNG khi đã báo backend `conTrongHangDoi:true` (T9: in
     // thiếu bản thì không — bản còn lại đã gỡ khỏi hàng đợi).
     let theo_doi_tiep = match (kq.trang_thai.as_str(), kq.con_trong_hang_doi, bao_cao.con_trong_hang_doi.get()) {
-        (job::KHONG_RO, Some(true), Some(bc)) => Some(
-            JobTheoDoiTiep::moi(job_id.clone(), so_hoa_don.clone(), kq.loai, bc, Instant::now()).tren_may_in(&cfg.printer_name),
-        ),
+        (job::KHONG_RO, Some(true), Some(bc)) => {
+            let j = JobTheoDoiTiep::moi(job_id.clone(), so_hoa_don.clone(), kq.loai, bc, Instant::now())
+                .tren_may_in(&cfg.printer_name);
+            Some(match bao_cao.trong_may_in_usb.get() {
+                Some(da_thay_loi) => j.qua_usb(da_thay_loi),
+                None => j,
+            })
+        }
         _ => None,
     };
     KetThucViec { da_thay_su_co: bao_cao.da_thay_su_co.get(), theo_doi_tiep }
@@ -639,6 +660,14 @@ pub fn chu_het_han(so_hoa_don: &str) -> String {
     )
 }
 
+/// Như `chu_het_han` cho hoá đơn nằm trong BỘ NHỚ máy in USB (U3).
+pub fn chu_het_han_usb(so_hoa_don: &str) -> String {
+    format!(
+        "Hoá đơn {} theo dõi quá 12 giờ, máy in USB vẫn chưa in xong (hoá đơn nằm trong bộ nhớ máy in) — kiểm máy in và khay giấy, in lại nếu chưa có",
+        so_hoa_don
+    )
+}
+
 /// Kết luận của luồng theo dõi tiếp (R3) → gửi `da_in` muộn / cập nhật giao
 /// diện / ghi nhật ký. `da_in` chỉ gửi khi kết nối HIỆN TẠI có hoTro
 /// `khong_ro` (`DuongGui` lọc) — backend cũ thì chỉ ghi nhật ký.
@@ -688,7 +717,7 @@ fn xu_ly_ket_luan_tiep(
             );
         }
         KetLuanTiep::HetHan => {
-            let kq = bao_mat(chu_het_han(&j.so_hoa_don));
+            let kq = bao_mat(if j.la_qua_usb() { chu_het_han_usb(&j.so_hoa_don) } else { chu_het_han(&j.so_hoa_don) });
             nhat_ky::ghi(
                 "theo_doi_tiep_het_han",
                 &format!("job={} hoa_don={} loai_truoc={} gui_server={}", id_ngan, j.so_hoa_don, loai, kq.chu()),
@@ -2043,6 +2072,47 @@ mod tests {
         let in_fn = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>| KetQuaIn::DaIn;
         xu_ly_mot_viec(&payload("j1"), &cfg(), &in_fn, &tt, &gui, &|| true);
         assert!(e.lock().unwrap()[0].1.get("conTrongHangDoi").is_none());
+    }
+
+    /// U2: máy in USB giữ hoá đơn trong bộ nhớ (hết giấy, ca HCM 25/09) →
+    /// `ket-qua khong_ro` mang `conTrongHangDoi:true` (backend: tự in, KHÔNG in
+    /// lại; ngắt cầu dao), job vào theo dõi tiếp QUA USB, dải trên máy shop nói
+    /// "đang chờ trong máy in".
+    #[test]
+    fn u2_trong_may_in_usb_thi_con_trong_hang_doi_va_theo_doi_usb() {
+        let in_gia = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, bao: &dyn Fn(QuanSat)| {
+            bao(QuanSat::SuCo { loai: MaSuCo::CanXuLy, chi_tiet: "USB 0x90 STATUS:BUSY".into() });
+            bao(QuanSat::TrongMayInUsb { bang_chung: BangChungJob { da_thay_in: true, ..Default::default() }, da_thay_loi: true });
+            KetQuaIn::KhongRo(LyDo::co_loai("may in bao loi qua USB", MaSuCo::CanXuLy))
+        };
+        let tt = Mutex::new(TrangThaiChung::default());
+        let (e, gui) = gui_gia(du_ho_tro());
+        let xong = xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &tt, &gui, &|_, _| {});
+        let e = e.lock().unwrap();
+        let (ten, v) = e.iter().find(|(t, _)| t == "ket-qua").expect("phải gửi ket-qua");
+        assert_eq!(ten, "ket-qua");
+        assert_eq!(v["trangThai"], "khong_ro");
+        assert_eq!(v["loai"], "can_xu_ly");
+        assert_eq!(v["conTrongHangDoi"], true);
+        let j = xong.theo_doi_tiep.expect("phải theo dõi tiếp");
+        assert!(j.la_qua_usb(), "theo dõi QUA USB, không theo hàng đợi");
+        let cb = crate::view_model::canh_bao(&tt.lock().unwrap(), "HP").unwrap();
+        assert!(cb.tieu_de.contains("đang chờ trong máy in"), "{}", cb.tieu_de);
+        assert!(cb.chi_tiet.contains("TỰ in ra") && cb.chi_tiet.contains("KHÔNG in lại"), "{}", cb.chi_tiet);
+    }
+
+    /// U3: hết hạn 12 giờ của hoá đơn trong bộ nhớ máy in USB — câu KHÔNG nói
+    /// "hàng đợi Windows" (nó không nằm ở đó).
+    #[test]
+    fn u3_het_han_usb_noi_bo_nho_may_in() {
+        let tt = Mutex::new(TrangThaiChung::default());
+        let (e, gui) = gui_gia(du_ho_tro());
+        let j = JobTheoDoiTiep::moi("1790251200000-7".into(), "INV_1".into(), Some(MaSuCo::CanXuLy), BangChungJob::default(), Instant::now())
+            .qua_usb(true);
+        xu_ly_ket_luan_tiep(j, KetLuanTiep::HetHan, "HP", &tt, &gui);
+        let v = e.lock().unwrap()[0].1.clone();
+        let ct = v["chiTiet"].as_str().unwrap_or_default().to_string();
+        assert!(ct.contains("bộ nhớ máy in") && !ct.contains("hàng đợi Windows"), "{}", ct);
     }
 
     // --- R-H / R-I: kết nối ---

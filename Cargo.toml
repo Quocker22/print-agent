@@ -1,6 +1,6 @@
 [package]
 name = "print-agent"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Agent in hoá đơn: nhận job từ ZaloCRM qua socket.io, in qua driver Windows"
 license = "AGPL-3.0-or-later"
@@ -41,6 +41,9 @@ image = { version = "0.25", default-features = false }
 # Win32_System_SystemInformation: GetLocalTime — giờ máy shop cho cột giờ ở
 # "In gần đây" (net.rs::gio_hien_tai); không thêm crate ngày giờ chỉ vì 1 chỗ.
 # Win32_System_Threading: CreateMutexW — một máy một bản app (src/mot_ban.rs).
+# Win32_Storage_FileSystem + Win32_System_IO: CreateFileW/DeviceIoControl — hỏi
+# thẳng máy in USB "đang lỗi / đang in / rảnh" (src/usb_may_in.rs). Máy HP Laser
+# 107 ở HCM hết giấy mà Windows vẫn báo rảnh (25/09).
 winreg = "0.52"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
@@ -50,6 +53,8 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
 ] }
 
 [build-dependencies]
