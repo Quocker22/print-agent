@@ -148,6 +148,25 @@ impl CongGui for CongSocket {
     fn emit(&self, su_kien: &str, gia_tri: serde_json::Value) -> Result<(), String> {
         khoa(&self.0).emit(su_kien, gia_tri).map_err(|e| e.to_string())
     }
+
+    /// Ack về qua callback trên luồng poll — callback chỉ đẩy vào kênh (không
+    /// chặn luồng poll: chặn callback = mất ping, bài học 14–17/09); luồng gọi
+    /// chờ kênh SAU KHI đã nhả khoá client.
+    fn emit_ack(&self, su_kien: &str, gia_tri: serde_json::Value, cho: Duration) -> Result<serde_json::Value, String> {
+        let (gui, nhan) = mpsc::channel::<serde_json::Value>();
+        khoa(&self.0)
+            .emit_with_ack(su_kien, gia_tri, cho, move |p: Payload, _c: RawClient| {
+                let v = match p {
+                    Payload::Text(mut ds) if !ds.is_empty() => ds.swap_remove(0),
+                    #[allow(deprecated)]
+                    Payload::String(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::Value::Null,
+                };
+                let _ = gui.send(v);
+            })
+            .map_err(|e| e.to_string())?;
+        nhan.recv_timeout(cho).map_err(|_| "het gio cho ack".to_string())
+    }
 }
 
 /// Một việc in đưa từ callback socket.io sang worker thread. KHÔNG giữ socket
@@ -1071,6 +1090,77 @@ pub fn khoi_chay(
 /// Chạy vòng đời kết nối socket.io — GỌI TỪ THREAD RIÊNG (qua `khoi_chay`).
 /// Mỗi lần đổi trạng thái (nối/mất/job xong/lỗi) đều cập nhật `trang_thai`
 /// để UI (thread khác) đọc thấy ngay ở frame kế tiếp. Thoát khi `dung` bật.
+/// Số dòng tối đa một lô `nhat-ky-app` (hợp đồng: 1..500).
+const LO_NHAT_KY: usize = 500;
+/// Nhịp gửi nhật ký khi rảnh; còn nhiều dòng thì gửi lô kế ngay.
+const NHIP_NHAT_KY: Duration = Duration::from_secs(3);
+/// Chờ ack của backend (ghi DB xong mới ack).
+const CHO_ACK_NHAT_KY: Duration = Duration::from_secs(15);
+
+/// Payload `nhat-ky-app` của một lô.
+fn payload_nhat_ky(lo: &[nhat_ky::DongGui], bo_qua: u64) -> serde_json::Value {
+    let dong: Vec<serde_json::Value> = lo
+        .iter()
+        .map(|d| serde_json::json!({ "luc": crate::thoi_gian::iso_utc(d.luc), "suKien": d.su_kien, "noiDung": d.noi_dung }))
+        .collect();
+    serde_json::json!({ "dong": dong, "boQua": bo_qua, "phienBan": env!("CARGO_PKG_VERSION") })
+}
+
+/// Luồng gửi nhật ký: lấy một lô từ bộ đệm (nhat_ky.rs), gửi kèm ack; không
+/// có ack `ok:true` (chưa kết nối, backend cũ, quá tải, chưa migrate…) thì TRẢ
+/// LẠI lô vào đầu bộ đệm và nghỉ lâu dần (3 → 60 s). Chỉ ghi nhật ký khi tình
+/// trạng gửi ĐỔI — không một dòng mỗi lần thử (dòng đó cũng sẽ được gửi lên).
+fn chay_gui_nhat_ky(duong_gui: Arc<DuongGui>, dung: Arc<AtomicBool>) {
+    let mut nghi = NHIP_NHAT_KY;
+    let mut loi_truoc: Option<String> = None;
+    while !dung.load(Ordering::SeqCst) {
+        let (lo, bo_qua) = nhat_ky::lay_lo_gui(LO_NHAT_KY);
+        if lo.is_empty() && bo_qua == 0 {
+            ngu_tung_khuc(&dung, NHIP_NHAT_KY);
+            continue;
+        }
+        let ket_qua = duong_gui
+            .gui_ack("nhat-ky-app", payload_nhat_ky(&lo, bo_qua), CanHoTro::NhatKyApp, CHO_ACK_NHAT_KY)
+            .and_then(|v| {
+                if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                    Ok(())
+                } else {
+                    Err(v.get("loi").and_then(serde_json::Value::as_str).unwrap_or("ack khong ok").to_string())
+                }
+            });
+        match ket_qua {
+            Ok(()) => {
+                if loi_truoc.take().is_some() {
+                    nhat_ky::ghi("gui_nhat_ky", "gui nhat ky len server tro lai binh thuong");
+                }
+                nghi = NHIP_NHAT_KY;
+                if lo.len() < LO_NHAT_KY {
+                    ngu_tung_khuc(&dung, NHIP_NHAT_KY);
+                }
+            }
+            Err(loi) => {
+                nhat_ky::tra_lai_gui(lo, bo_qua);
+                if loi_truoc.as_deref() != Some(loi.as_str()) {
+                    nhat_ky::ghi("gui_nhat_ky_loi", &loi);
+                    loi_truoc = Some(loi);
+                }
+                ngu_tung_khuc(&dung, nghi);
+                nghi = (nghi * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+}
+
+/// Ngủ `tong` theo từng khúc 500 ms — cờ dừng (bấm Lưu) có hiệu lực nhanh.
+fn ngu_tung_khuc(dung: &AtomicBool, tong: Duration) {
+    let mut con = tong;
+    while !con.is_zero() && !dung.load(Ordering::SeqCst) {
+        let khuc = con.min(Duration::from_millis(500));
+        std::thread::sleep(khuc);
+        con = con.saturating_sub(khuc);
+    }
+}
+
 fn chay_net(
     cfg: Arc<Config>,
     trang_thai: Arc<Mutex<TrangThaiChung>>,
@@ -1123,6 +1213,14 @@ fn chay_net(
             .spawn(move || chay_theo_doi_tiep(k, may_in, tt, dg, d))
         {
             eprintln!("[print-agent] không spawn được luồng theo dõi tiếp: {}", e);
+        }
+    }
+
+    // Luồng gửi nhật ký cục bộ lên ZaloCRM (0.2.4, chủ yêu cầu 25/09).
+    {
+        let (dg, d) = (duong_gui.clone(), dung.clone());
+        if let Err(e) = std::thread::Builder::new().name("gui-nhat-ky".into()).spawn(move || chay_gui_nhat_ky(dg, d)) {
+            eprintln!("[print-agent] không spawn được luồng gửi nhật ký: {}", e);
         }
     }
 
@@ -1437,7 +1535,7 @@ mod tests {
     }
 
     fn du_ho_tro() -> HoTro {
-        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true }
+        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false }
     }
 
     /// In xong → ghi trạng thái cho UI + emit "ket-qua" đúng một lần.
@@ -2126,6 +2224,22 @@ mod tests {
         let v = e.lock().unwrap()[0].1.clone();
         let ct = v["chiTiet"].as_str().unwrap_or_default().to_string();
         assert!(ct.contains("bộ nhớ máy in") && !ct.contains("hàng đợi Windows"), "{}", ct);
+    }
+
+    /// 0.2.4: payload `nhat-ky-app` đúng hợp đồng (luc ISO ms, suKien, noiDung, boQua, phienBan).
+    #[test]
+    fn nhat_ky_app_payload_dung_hop_dong() {
+        let lo = vec![nhat_ky::DongGui {
+            luc: std::time::UNIX_EPOCH + Duration::from_millis(1_790_331_966_328),
+            su_kien: "vet_in".into(),
+            noi_dung: "job=x t=1ms".into(),
+        }];
+        let v = payload_nhat_ky(&lo, 3);
+        assert_eq!(v["dong"][0]["luc"], "2026-09-25T10:26:06.328Z");
+        assert_eq!(v["dong"][0]["suKien"], "vet_in");
+        assert_eq!(v["dong"][0]["noiDung"], "job=x t=1ms");
+        assert_eq!(v["boQua"], 3);
+        assert_eq!(v["phienBan"], env!("CARGO_PKG_VERSION"));
     }
 
     // --- R-H / R-I: kết nối ---

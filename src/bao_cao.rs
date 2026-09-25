@@ -20,6 +20,8 @@ pub struct HoTro {
     pub khong_ro: bool,
     pub su_co: bool,
     pub trang_thai_may_in: bool,
+    /// Backend nhận toàn bộ nhật ký cục bộ của app (`nhat-ky-app`, 0.2.4).
+    pub nhat_ky_app: bool,
 }
 
 /// Payload `cau-hinh` `{hoTro: [...]}` → `HoTro`. Payload lạ/thiếu/sai kiểu →
@@ -35,6 +37,7 @@ pub fn doc_cau_hinh(payload: &Value) -> HoTro {
             "khong_ro" => ho_tro.khong_ro = true,
             "su_co" => ho_tro.su_co = true,
             "trang_thai_may_in" => ho_tro.trang_thai_may_in = true,
+            "nhat_ky_app" => ho_tro.nhat_ky_app = true,
             _ => {} // tính năng backend mới hơn app — bỏ qua, không lỗi
         }
     }
@@ -100,14 +103,16 @@ mod tests {
 
     #[test]
     fn cau_hinh_du_ba_tinh_nang() {
+        assert!(doc_cau_hinh(&json!({"hoTro": ["nhat_ky_app"]})).nhat_ky_app);
+        assert!(!doc_cau_hinh(&json!({"hoTro": ["su_co"]})).nhat_ky_app);
         let h = doc_cau_hinh(&json!({"hoTro": ["khong_ro", "su_co", "trang_thai_may_in"]}));
-        assert_eq!(h, HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true });
+        assert_eq!(h, HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false });
     }
 
     #[test]
     fn cau_hinh_mot_phan_va_muc_la_bo_qua() {
         let h = doc_cau_hinh(&json!({"hoTro": ["su_co", "tinh_nang_tuong_lai", 42]}));
-        assert_eq!(h, HoTro { khong_ro: false, su_co: true, trang_thai_may_in: false });
+        assert_eq!(h, HoTro { khong_ro: false, su_co: true, trang_thai_may_in: false, nhat_ky_app: false });
     }
 
     #[test]

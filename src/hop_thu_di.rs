@@ -40,6 +40,9 @@ pub enum CanHoTro {
     KhongRo,
     SuCo,
     TrangThaiMayIn,
+    /// `nhat-ky-app` — KHÔNG BAO GIỜ vào hộp thư đi (trần 200 thư: nhật ký dồn
+    /// vào là đẩy mất `ket-qua`); bộ đệm riêng ở nhat_ky.rs, gửi qua `gui_ack`.
+    NhatKyApp,
 }
 
 impl CanHoTro {
@@ -49,6 +52,7 @@ impl CanHoTro {
             CanHoTro::KhongRo => h.khong_ro,
             CanHoTro::SuCo => h.su_co,
             CanHoTro::TrangThaiMayIn => h.trang_thai_may_in,
+            CanHoTro::NhatKyApp => h.nhat_ky_app,
         }
     }
 
@@ -163,6 +167,12 @@ impl HopThuDi {
 /// đường gửi mà không cần socket.
 pub trait CongGui: Send + Sync {
     fn emit(&self, su_kien: &str, gia_tri: Value) -> Result<(), String>;
+
+    /// Emit kèm ack, CHỜ tối đa `cho` lấy giá trị ack đầu tiên. Mặc định: không
+    /// hỗ trợ (cổng giả trong test cũ).
+    fn emit_ack(&self, _su_kien: &str, _gia_tri: Value, _cho: Duration) -> Result<Value, String> {
+        Err("cong khong ho tro ack".into())
+    }
 }
 
 #[derive(Default)]
@@ -218,6 +228,21 @@ impl DuongGui {
                 KetQuaGui::XepHang
             }
         }
+    }
+
+    /// Gửi NGAY kèm ack qua kết nối hiện tại, KHÔNG cất hộp thư đi: chưa kết nối /
+    /// kết nối chưa báo hỗ trợ `can` → `Err` để người gọi (bộ đệm nhật ký) tự giữ
+    /// lại. Không giữ khoá trong lúc chờ ack.
+    pub fn gui_ack(&self, su_kien: &str, gia_tri: Value, can: CanHoTro, cho: Duration) -> Result<Value, String> {
+        let cong = {
+            let k = self.khoa();
+            match (&k.cong, k.ho_tro) {
+                (Some(c), Some(h)) if can.duoc_gui(h) => c.clone(),
+                (None, _) => return Err("chua ket noi".into()),
+                _ => return Err("backend chua ho tro".into()),
+            }
+        };
+        cong.emit_ack(su_kien, gia_tri, cho)
     }
 
     /// Callback "open": kết nối mới — QUÊN hoTro của kết nối trước (§2). Trả thế hệ.
@@ -322,7 +347,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn du() -> HoTro {
-        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true }
+        HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false }
     }
 
     #[test]

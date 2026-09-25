@@ -82,8 +82,87 @@ pub fn che_bi_mat(bi_mat: &str) {
     }
 }
 
+// ── Bộ đệm gửi lên ZaloCRM (0.2.4, chủ yêu cầu 25/09) ─────────────────────
+// MỌI dòng ghi file cũng vào bộ đệm này; luồng `gui-nhat-ky` (net.rs) lấy
+// từng lô gửi `nhat-ky-app` kèm ack, không ack thì trả lại. Trần cố định:
+// mất mạng cả ngày vẫn không phình bộ nhớ — tràn thì bỏ dòng CŨ NHẤT và đếm
+// (`boQua`), backend ghi một dòng "app bỏ N dòng".
+
+/// Trần bộ đệm gửi (dòng).
+pub const TRAN_CHO_GUI: usize = 20_000;
+
+/// Một dòng chờ gửi lên backend (đã che token khi LẤY ra).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DongGui {
+    pub luc: SystemTime,
+    pub su_kien: String,
+    pub noi_dung: String,
+}
+
+#[derive(Default)]
+struct ChoGui {
+    ds: std::collections::VecDeque<DongGui>,
+    bo_qua: u64,
+}
+
+impl ChoGui {
+    fn them(&mut self, dong: DongGui, tran: usize) {
+        if self.ds.len() >= tran {
+            self.ds.pop_front();
+            self.bo_qua += 1;
+        }
+        self.ds.push_back(dong);
+    }
+
+    fn lay(&mut self, toi_da: usize) -> (Vec<DongGui>, u64) {
+        let n = toi_da.min(self.ds.len());
+        (self.ds.drain(..n).collect(), std::mem::take(&mut self.bo_qua))
+    }
+
+    fn tra_lai(&mut self, lo: Vec<DongGui>, bo_qua: u64, tran: usize) {
+        self.bo_qua += bo_qua;
+        for d in lo.into_iter().rev() {
+            self.ds.push_front(d);
+        }
+        while self.ds.len() > tran {
+            self.ds.pop_front();
+            self.bo_qua += 1;
+        }
+    }
+}
+
+static CHO_GUI: Mutex<Option<ChoGui>> = Mutex::new(None);
+
+fn voi_cho_gui<R>(f: impl FnOnce(&mut ChoGui) -> R) -> R {
+    let mut k = CHO_GUI.lock().unwrap_or_else(|p| p.into_inner());
+    f(k.get_or_insert_with(ChoGui::default))
+}
+
+/// Che token + phẳng tab/xuống dòng một lô trước khi gửi.
+fn lam_sach_lo(lo: Vec<DongGui>, bi_mat: &[String]) -> Vec<DongGui> {
+    let phang = |s: &str| s.replace(['\r', '\n', '\t'], " ");
+    lo.into_iter()
+        .map(|d| DongGui { luc: d.luc, su_kien: phang(&che(&d.su_kien, bi_mat)), noi_dung: phang(&che(d.noi_dung.trim(), bi_mat)) })
+        .collect()
+}
+
+/// Lấy tối đa `toi_da` dòng CŨ NHẤT (đã che token, phẳng tab/xuống dòng) + số
+/// dòng đã bỏ vì tràn (đặt lại 0 — lô này mang nó đi).
+pub fn lay_lo_gui(toi_da: usize) -> (Vec<DongGui>, u64) {
+    let (lo, bo_qua) = voi_cho_gui(|c| c.lay(toi_da));
+    let bi_mat = BI_MAT.lock().map(|ds| ds.clone()).unwrap_or_default();
+    (lam_sach_lo(lo, &bi_mat), bo_qua)
+}
+
+/// Gửi hỏng: trả lô về ĐẦU bộ đệm (giữ thứ tự). Tràn thì bỏ dòng cũ nhất.
+pub fn tra_lai_gui(lo: Vec<DongGui>, bo_qua: u64) {
+    voi_cho_gui(|c| c.tra_lai(lo, bo_qua, TRAN_CHO_GUI));
+}
+
 /// Ghi một sự kiện. KHÔNG chặn, KHÔNG panic, KHÔNG trả lỗi (xem đầu file).
 pub fn ghi(su_kien: &str, noi_dung: &str) {
+    let dong = DongGui { luc: SystemTime::now(), su_kien: su_kien.to_string(), noi_dung: noi_dung.to_string() };
+    voi_cho_gui(|c| c.them(dong, TRAN_CHO_GUI));
     let kenh = KENH.get_or_init(|| {
         let dir = thu_muc()?;
         let (gui, nhan) = mpsc::channel::<Dong>();
@@ -250,5 +329,36 @@ mod tests {
         let _ = std::fs::remove_file(&f);
         // Trên Mac không có thư mục nhật ký: ghi() là no-op, không panic.
         ghi("thu", "noi dung");
+    }
+
+    fn d(i: u64) -> DongGui {
+        DongGui { luc: UNIX_EPOCH + Duration::from_secs(i), su_kien: "e".into(), noi_dung: format!("n{}", i) }
+    }
+
+    /// Bộ đệm gửi (0.2.4): lấy cũ nhất trước; gửi hỏng trả lại ĐẦU, giữ thứ tự;
+    /// tràn bỏ dòng CŨ NHẤT và đếm.
+    #[test]
+    fn cho_gui_thu_tu_tra_lai_va_tran() {
+        let mut c = ChoGui::default();
+        for i in 0..5 {
+            c.them(d(i), 4);
+        }
+        assert_eq!(c.bo_qua, 1, "tràn một dòng");
+        let (lo, bo) = c.lay(2);
+        assert_eq!((lo.iter().map(|x| x.noi_dung.as_str()).collect::<Vec<_>>(), bo), (vec!["n1", "n2"], 1));
+        assert_eq!(c.bo_qua, 0, "bo_qua đi theo lô");
+        c.them(d(9), 4);
+        c.tra_lai(lo, bo, 4);
+        let (tat_ca, bo) = c.lay(10);
+        assert_eq!(tat_ca.iter().map(|x| x.noi_dung.as_str()).collect::<Vec<_>>(), vec!["n2", "n3", "n4", "n9"], "tràn khi trả lại bỏ dòng cũ nhất");
+        assert_eq!(bo, 2);
+    }
+
+    #[test]
+    fn lam_sach_lo_che_token_va_phang() {
+        let lo = vec![DongGui { luc: UNIX_EPOCH, su_kien: "ket\tqua".into(), noi_dung: " a TOKEN123456 b\nc ".into() }];
+        let ra = lam_sach_lo(lo, &["TOKEN123456".to_string()]);
+        assert_eq!(ra[0].su_kien, "ket qua");
+        assert_eq!(ra[0].noi_dung, "a *** b c");
     }
 }

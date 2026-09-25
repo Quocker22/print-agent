@@ -1,6 +1,6 @@
 [package]
 name = "print-agent"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Agent in hoá đơn: nhận job từ ZaloCRM qua socket.io, in qua driver Windows"
 license = "AGPL-3.0-or-later"

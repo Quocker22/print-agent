@@ -317,7 +317,7 @@ mod tests {
         let kq = xu_ly_job(&payload, &cfg(), &in_fn);
         assert_eq!(kq.trang_thai, "khong_ro");
         assert!(!can_gui(&kq, &HoTro::default()), "KhongRo + backend cũ phải IM LẶNG (không emit)");
-        let chi_su_co = HoTro { su_co: true, trang_thai_may_in: true, khong_ro: false };
+        let chi_su_co = HoTro { su_co: true, trang_thai_may_in: true, khong_ro: false, nhat_ky_app: false };
         assert!(!can_gui(&kq, &chi_su_co), "thiếu đúng 'khong_ro' trong hoTro vẫn phải im lặng");
     }
 
