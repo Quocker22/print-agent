@@ -93,6 +93,9 @@ pub struct JobTheoDoiTiep {
     /// Số vòng CHỜ đọc được USB để chuyển sang theo dõi qua USB (máy USB mà
     /// job đã PRINTED / rời hàng đợi nhưng thiết bị chưa đọc được) — 0.2.7.
     lan_cho_usb: usize,
+    /// Gửi đi lúc máy vừa hồi phục có hoá đơn kẹt (0.2.7) — kết luận "đã in"
+    /// của nó cũng không được báo server (không biết tờ ra là hoá đơn nào).
+    nghi_ngo: bool,
 }
 
 /// Theo dõi một hoá đơn nằm trong bộ nhớ máy in USB (U3). Máy HP Laser 107 ở
@@ -155,7 +158,21 @@ impl JobTheoDoiTiep {
             ket_khi_con_thay: None,
             usb: None,
             lan_cho_usb: 0,
+            nghi_ngo: false,
         }
+    }
+
+    pub fn nghi_ngo_sau_hoi_phuc(mut self, nghi: bool) -> Self {
+        self.nghi_ngo = nghi;
+        self
+    }
+
+    /// Kết luận "đã in" của job này KHÔNG được gửi server là `da_in` — chỉ
+    /// `su-co khong_xac_nhan` "đối chiếu số hoá đơn trên tờ" (0.2.7, review):
+    /// hoá đơn kẹt do lỗi (máy từng in lặp/bỏ sót sau khi hết giấy) hoặc gửi
+    /// ngay lúc máy vừa hồi phục. `da_in` còn đóng cầu dao backend tức thì.
+    pub fn khong_bao_da_in(&self) -> bool {
+        self.ket_do_loi() || self.nghi_ngo
     }
 
     /// Job nằm trong bộ nhớ máy in USB (U3) — `da_thay_loi`: máy đang báo lỗi

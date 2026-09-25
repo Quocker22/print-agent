@@ -117,14 +117,23 @@ pub struct TrangThaiChung {
     /// `print_jobs.id` của các hoá đơn đang NẰM TRONG BỘ NHỚ máy in (theo dõi
     /// tiếp qua USB) — giao diện tách riêng "sẽ in khi nạp giấy" (0.2.7).
     pub trong_may_in: Vec<String>,
-    /// `print_jobs.id` người dùng đã "Thôi theo dõi": kết luận sau đó của theo
-    /// dõi tiếp chỉ ghi nhật ký quan sát, không gửi "đã in" (0.2.7).
-    pub thoi_theo_doi: Vec<String>,
-    /// Lúc một hoá đơn nằm trong bộ nhớ máy in vừa có kết luận (máy vừa hồi
-    /// phục sau lỗi). Hoá đơn gửi NGAY SAU đó không được báo "đã in" — sự cố
-    /// 030134/030136 (25/09): máy in 134 hai lần, 136 không ra mà vẫn "đã in".
-    pub hoi_phuc_co_hoa_don_ket: Option<std::time::Instant>,
+    /// `(print_jobs.id, lúc bấm)` người dùng đã "Thôi theo dõi": kết luận sau
+    /// đó của theo dõi tiếp cho lần gửi BẮT ĐẦU TRƯỚC lúc bấm chỉ ghi nhật ký
+    /// quan sát, không gửi "đã in" (0.2.7). Không xoá khi có kết luận (nhiều lần
+    /// gửi cùng hoá đơn), trần `SO_THOI_THEO_DOI_TOI_DA` (= trần kho theo dõi).
+    pub thoi_theo_doi: Vec<(String, std::time::Instant)>,
+    /// `(máy in, lúc)` một hoá đơn KẸT DO LỖI trong bộ nhớ máy in vừa có kết
+    /// luận (máy vừa hồi phục). Hoá đơn kế tiếp GỬI ĐI trên máy đó không được
+    /// báo "đã in" — sự cố 030134/030136 (25/09): máy in 134 hai lần, 136 không ra.
+    pub hoi_phuc_co_hoa_don_ket: Option<(String, std::time::Instant)>,
+    /// Máy đã hết lỗi nhưng app CHƯA báo "bình thường" (còn hoá đơn kẹt đang
+    /// in ra) — giao diện nói vì sao chưa in tiếp (0.2.7).
+    pub dang_giu_binh_thuong: bool,
 }
+
+/// Trần danh sách "Thôi theo dõi" — bằng trần kho theo dõi tiếp (review Codex:
+/// 50 < 200 thì bỏ theo dõi hàng loạt làm mất dấu mục đầu).
+pub const SO_THOI_THEO_DOI_TOI_DA: usize = crate::theo_doi_tiep::SO_JOB_TOI_DA;
 
 /// `print_jobs.id` của một job id backend gửi (`<id>-<13 chữ số ms>`, 25/09).
 /// Id kiểu khác (backend cũ nhét token) → `None`.
@@ -333,6 +342,20 @@ impl TrangThaiChung {
             ngoai_hang_doi: ngoai_hang_doi && khong_ro,
             ban_da_in: ban_da_in.filter(|_| khong_ro),
         });
+    }
+
+    /// Ghi "Thôi theo dõi" hoá đơn `pid` lúc `luc` — một mục mỗi hoá đơn (bấm
+    /// lại thì dời mốc), giữ `SO_THOI_THEO_DOI_TOI_DA` mục mới nhất.
+    pub fn ghi_thoi_theo_doi(&mut self, pid: &str, luc: std::time::Instant) {
+        self.thoi_theo_doi.retain(|(p, _)| p != pid);
+        self.thoi_theo_doi.push((pid.to_string(), luc));
+        let du = self.thoi_theo_doi.len().saturating_sub(SO_THOI_THEO_DOI_TOI_DA);
+        self.thoi_theo_doi.drain(..du);
+    }
+
+    /// Lần gửi hoá đơn `pid` bắt đầu lúc `bat_dau` đã bị "Thôi theo dõi" chưa.
+    pub fn da_thoi_theo_doi(&self, pid: &str, bat_dau: std::time::Instant) -> bool {
+        self.thoi_theo_doi.iter().any(|(p, luc)| p == pid && bat_dau <= *luc)
     }
 
     /// Luồng theo dõi tiếp xác nhận job `khong_ro` đã in (R3): dòng "In gần
@@ -677,6 +700,26 @@ mod tests {
     }
 
     /// Huỷ từ app: dòng "Chờ giấy" cũ của cùng hoá đơn nhường chỗ cho "Đã huỷ".
+    #[test]
+    fn thoi_theo_doi_theo_lan_gui_va_co_tran() {
+        let mut t = TrangThaiChung::default();
+        let t0 = std::time::Instant::now();
+        let sau = t0 + std::time::Duration::from_secs(5);
+        t.ghi_thoi_theo_doi("p1", sau);
+        assert!(t.da_thoi_theo_doi("p1", t0), "lần gửi TRƯỚC lúc bấm");
+        assert!(t.da_thoi_theo_doi("p1", t0), "không xoá sau kết luận đầu (nhiều lần gửi cùng hoá đơn)");
+        assert!(!t.da_thoi_theo_doi("p1", sau + std::time::Duration::from_secs(1)), "lần gửi MỚI sau lúc bấm vẫn báo");
+        assert!(!t.da_thoi_theo_doi("p2", t0));
+        t.ghi_thoi_theo_doi("p1", sau);
+        assert_eq!(t.thoi_theo_doi.len(), 1, "không trùng");
+        for i in 0..SO_THOI_THEO_DOI_TOI_DA + 10 {
+            t.ghi_thoi_theo_doi(&format!("q{}", i), sau);
+        }
+        assert_eq!(t.thoi_theo_doi.len(), SO_THOI_THEO_DOI_TOI_DA);
+        assert!(!t.da_thoi_theo_doi("p1", t0), "cũ nhất bị bỏ");
+        assert!(t.da_thoi_theo_doi(&format!("q{}", SO_THOI_THEO_DOI_TOI_DA + 9), t0));
+    }
+
     #[test]
     fn ghi_da_huy_thay_dong_cu_cung_hoa_don() {
         let mut t = TrangThaiChung::default();

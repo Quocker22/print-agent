@@ -96,6 +96,9 @@ const NGHI_NGO_SAU_HOI_PHUC: Duration = Duration::from_secs(30 * 60);
 /// Máy vừa xong hoá đơn kẹt: chờ ổn định chừng này rồi mới báo "bình thường"
 /// (server nhả hoá đơn đang giữ).
 const CHO_ON_DINH_SAU_HOI_PHUC: Duration = Duration::from_secs(5);
+/// Giữ "chưa báo bình thường" lâu nhất chừng này — hoá đơn kẹt thường tự kết
+/// luận (in ra / máy rảnh 60 s không in → mất) trong vòng 1–2 phút.
+const GIU_BINH_THUONG_TOI_DA: Duration = Duration::from_secs(3 * 60);
 
 /// `loiCuoi` của hoá đơn gửi ngay sau khi máy hồi phục có hoá đơn kẹt (0.2.7).
 const CHU_NGHI_NGO_SAU_HOI_PHUC: &str = "may in vua hoi phuc sau loi (co hoa don ket trong bo nho may) — HP 108a tung in \
@@ -297,12 +300,13 @@ fn chay_worker_in(
         };
         let kiem_truoc = || kiem_truoc_khi_in_that(&cfg.printer_name, &kho_theo_doi, &duong_gui);
         let nghi_ngo = || nghi_ngo_sau_hoi_phuc(&trang_thai, &kho_theo_doi, &cfg.printer_name, Instant::now());
+        let da_gui_byte = || tieu_moc_hoi_phuc(&trang_thai, &cfg.printer_name);
         let xong = xu_ly_viec_co_bao_cao(
             &viec.val,
             &cfg,
             &printing::in_pdf,
             &kiem_truoc,
-            &nghi_ngo,
+            &NghiNgo { hoi: &nghi_ngo, da_gui_byte: &da_gui_byte },
             &trang_thai,
             &gui,
             &chuyen_may_in,
@@ -318,41 +322,62 @@ fn chay_worker_in(
     eprintln!("[print-agent] worker in dừng");
 }
 
-/// Hoá đơn sắp gửi có rơi vào khoảng "máy vừa hồi phục có hoá đơn kẹt" không
-/// (0.2.7 — sự cố 030134/030136): còn hoá đơn kẹt trong máy chưa kết luận, hoặc
-/// một hoá đơn kẹt vừa kết luận chưa quá `NGHI_NGO_SAU_HOI_PHUC`. Mốc vừa kết
-/// luận chỉ áp cho MỘT hoá đơn kế tiếp (lấy đi khi trả `true`).
+/// Hoá đơn sắp gửi xuống `may_in` có rơi vào khoảng "máy vừa hồi phục có hoá
+/// đơn kẹt" không (0.2.7 — sự cố 030134/030136): còn hoá đơn kẹt do lỗi trong
+/// máy chưa kết luận, hoặc một hoá đơn như vậy vừa kết luận trên CHÍNH máy
+/// này chưa quá `NGHI_NGO_SAU_HOI_PHUC`. CHỈ XEM — mốc chỉ bị lấy đi khi hoá
+/// đơn thật sự đã gửi byte (`tieu_moc_hoi_phuc`): lần gửi bị từ chối / lỗi
+/// trước khi gửi (backend gửi lại) vẫn được bảo vệ (review Codex).
 fn nghi_ngo_sau_hoi_phuc(trang_thai: &Mutex<TrangThaiChung>, kho: &KhoTheoDoiTiep, may_in: &str, bay_gio: Instant) -> bool {
     if kho.co_hoa_don_trong_may(may_in) {
         return true;
     }
+    khoa(trang_thai)
+        .hoi_phuc_co_hoa_don_ket
+        .as_ref()
+        .is_some_and(|(m, luc)| m == may_in && bay_gio.saturating_duration_since(*luc) < NGHI_NGO_SAU_HOI_PHUC)
+}
+
+/// Hoá đơn nghi ngờ đã gửi byte xuống `may_in` → mốc "vừa hồi phục" đã dùng
+/// cho MỘT hoá đơn kế tiếp, lấy đi.
+fn tieu_moc_hoi_phuc(trang_thai: &Mutex<TrangThaiChung>, may_in: &str) {
     let mut t = khoa(trang_thai);
-    let vua_hoi_phuc = t.hoi_phuc_co_hoa_don_ket.is_some_and(|m| bay_gio.saturating_duration_since(m) < NGHI_NGO_SAU_HOI_PHUC);
-    if vua_hoi_phuc {
+    if t.hoi_phuc_co_hoa_don_ket.as_ref().is_some_and(|(m, _)| m == may_in) {
         t.hoi_phuc_co_hoa_don_ket = None;
     }
-    vua_hoi_phuc
+}
+
+/// Hai câu hỏi của worker về "máy vừa hồi phục" (xem `nghi_ngo_sau_hoi_phuc`).
+struct NghiNgo<'a> {
+    /// Hoá đơn sắp gửi có bị nghi không (chỉ xem).
+    hoi: &'a dyn Fn() -> bool,
+    /// Hoá đơn nghi ngờ đã gửi byte (kết quả không phải `Loi`) — lấy mốc đi.
+    da_gui_byte: &'a dyn Fn(),
 }
 
 /// Lần đọc lúc rảnh ra `ma` — có GIỮ LẠI chưa báo "bình thường" không (0.2.7):
 /// chỉ khi đang ghi lỗi chặn in VÀ (còn hoá đơn kẹt trong máy chưa kết luận,
-/// hoặc hoá đơn kẹt vừa kết luận chưa quá `CHO_ON_DINH_SAU_HOI_PHUC`).
+/// hoặc hoá đơn kẹt vừa kết luận chưa quá `CHO_ON_DINH_SAU_HOI_PHUC`), và đã
+/// giữ (từ `giu_tu`) chưa quá `GIU_BINH_THUONG_TOI_DA` — hoá đơn kẹt không kết
+/// luận được thì hàng đợi server cũng không bị treo mãi (review Codex).
 fn nen_giu_binh_thuong(
     ma: MaSuCo,
     dang_ghi: Option<MaSuCo>,
     co_hoa_don_trong_may: bool,
     hoi_phuc: Option<Instant>,
+    giu_tu: Option<Instant>,
     bay_gio: Instant,
 ) -> bool {
     ma == MaSuCo::BinhThuong
         && dang_ghi.is_some_and(MaSuCo::chan_in)
         && (co_hoa_don_trong_may || hoi_phuc.is_some_and(|m| bay_gio.saturating_duration_since(m) < CHO_ON_DINH_SAU_HOI_PHUC))
+        && giu_tu.is_none_or(|m| bay_gio.saturating_duration_since(m) < GIU_BINH_THUONG_TOI_DA)
 }
 
 /// Đưa một job vào danh sách theo dõi tiếp (dùng chung qua lần bấm Lưu) + ghi
 /// nhật ký; job CŨ NHẤT bị bỏ vì vượt trần cũng được ghi (không mất lặng).
 fn dua_vao_theo_doi_tiep(kho: &KhoTheoDoiTiep, trang_thai: &Mutex<TrangThaiChung>, j: JobTheoDoiTiep) {
-    if j.la_qua_usb() {
+    if j.ket_do_loi() {
         if let Some(pid) = crate::state::print_job_id(&j.job_id) {
             let mut t = khoa(trang_thai);
             if !t.trong_may_in.iter().any(|x| x == pid) {
@@ -477,7 +502,7 @@ fn xu_ly_viec_co_bao_cao(
     cfg: &Config,
     in_that: &HamInCoBao<'_>,
     kiem_truoc: &HamKiemTruoc<'_>,
-    nghi_ngo: &dyn Fn() -> bool,
+    nghi_ngo: &NghiNgo<'_>,
     trang_thai: &Mutex<TrangThaiChung>,
     gui: &HamGui<'_>,
     chuyen_may_in: &dyn Fn(MaSuCo, Option<String>),
@@ -499,6 +524,7 @@ fn xu_ly_viec_co_bao_cao(
         trong_may_in_usb: Cell::new(None),
     };
     let bao = |qs: QuanSat| bao_cao.nhan(qs);
+    let da_nghi = Cell::new(false);
     let in_fn = |pdf: &[u8], printer: &str, paper: &str, tray: &str, copies: u32, id: &str, ten: Option<&str>| {
         match kiem_truoc() {
             KiemTruoc::TuChoi { ly_do, su_kien } => {
@@ -510,8 +536,14 @@ fn xu_ly_viec_co_bao_cao(
             }
             KiemTruoc::In { nen } => {
                 // Chụp lúc GỬI: máy vừa hồi phục có hoá đơn kẹt → không tin "đã in".
-                let nghi = nghi_ngo();
-                match in_that(pdf, printer, paper, tray, copies, id, ten, nen, &bao) {
+                let nghi = (nghi_ngo.hoi)();
+                let kq = in_that(pdf, printer, paper, tray, copies, id, ten, nen, &bao);
+                // `Loi` = chưa byte nào rời máy (backend gửi lại) → lần gửi lại vẫn bị nghi.
+                if nghi && !matches!(kq, job::KetQuaIn::Loi(_)) {
+                    (nghi_ngo.da_gui_byte)();
+                    da_nghi.set(true);
+                }
+                match kq {
                     job::KetQuaIn::DaIn if nghi => {
                         nhat_ky::ghi("nghi_ngo_sau_hoi_phuc", &format!("job={} — khong bao da_in, bao khong_ro kiem to", job::rut_gon_job_id(id)));
                         job::KetQuaIn::KhongRo(job::LyDo::co_loai(CHU_NGHI_NGO_SAU_HOI_PHUC, MaSuCo::KhongXacNhan))
@@ -528,7 +560,8 @@ fn xu_ly_viec_co_bao_cao(
     let theo_doi_tiep = match (kq.trang_thai.as_str(), kq.con_trong_hang_doi, bao_cao.con_trong_hang_doi.get()) {
         (job::KHONG_RO, Some(true), Some(bc)) => {
             let j = JobTheoDoiTiep::moi(job_id.clone(), so_hoa_don.clone(), kq.loai, bc, Instant::now())
-                .tren_may_in(&cfg.printer_name);
+                .tren_may_in(&cfg.printer_name)
+                .nghi_ngo_sau_hoi_phuc(da_nghi.get());
             Some(match bao_cao.trong_may_in_usb.get() {
                 Some((da_thay_loi, da_thay_in)) => j.qua_usb(da_thay_loi, da_thay_in),
                 None => j,
@@ -701,17 +734,30 @@ fn chay_theo_doi_may_in(
     // quá `CHO_ON_DINH_SAU_HOI_PHUC`) → CHƯA báo "bình thường": server nhả hoá
     // đơn đang giữ ngay khi nhận nó (sự cố 030134/030136: báo lúc máy còn khởi
     // động). Chỉ giữ khi trạng thái đang ghi là lỗi chặn in.
+    let giu_tu: Cell<Option<Instant>> = Cell::new(None);
     let giu_binh_thuong = |ma: MaSuCo| -> bool {
-        let t = khoa(&trang_thai);
-        nen_giu_binh_thuong(
-            ma,
-            t.may_in.as_ref().map(|(m, _)| *m),
-            kho_theo_doi.co_hoa_don_trong_may(&may_in),
-            t.hoi_phuc_co_hoa_don_ket,
-            Instant::now(),
-        )
+        let bay_gio = Instant::now();
+        let co_ket = kho_theo_doi.co_hoa_don_trong_may(&may_in);
+        let mut t = khoa(&trang_thai);
+        let hoi_phuc = t.hoi_phuc_co_hoa_don_ket.as_ref().filter(|(m, _)| *m == may_in).map(|(_, luc)| *luc);
+        let giu = nen_giu_binh_thuong(ma, t.may_in.as_ref().map(|(m, _)| *m), co_ket, hoi_phuc, giu_tu.get(), bay_gio);
+        match (giu, giu_tu.get()) {
+            (true, None) => {
+                giu_tu.set(Some(bay_gio));
+                nhat_ky::ghi("giu_binh_thuong", "may het loi nhung con hoa don ket dang in ra — chua bao binh_thuong");
+            }
+            (false, Some(tu)) => {
+                giu_tu.set(None);
+                nhat_ky::ghi(
+                    "giu_binh_thuong_het",
+                    &format!("sau {} giay{}", bay_gio.saturating_duration_since(tu).as_secs(), if ma == MaSuCo::BinhThuong && co_ket { " — qua han giu, bao binh_thuong du con hoa don ket" } else { "" }),
+                );
+            }
+            _ => {}
+        }
+        t.dang_giu_binh_thuong = giu;
+        giu
     };
-    let mut da_ghi_giu = false;
     let gui = |v: Option<serde_json::Value>| {
         if let Some(v) = v {
             let ma = v.get("trangThai").and_then(|m| m.as_str()).unwrap_or("-").to_string();
@@ -736,17 +782,10 @@ fn chay_theo_doi_may_in(
             BuocMayIn::GhiTuWorker(ma, ct) => gui(ghi_trang_thai_may_in(&trang_thai, &may_in, ma, ct, false, false)),
             BuocMayIn::DocRanh { ep_gui } => match spooler::doc_tinh_trang_may_in(&may_in) {
                 Some((ma, _)) if giu_binh_thuong(ma) => {
-                    if !da_ghi_giu {
-                        nhat_ky::ghi("giu_binh_thuong", "may het loi nhung con hoa don ket dang in ra — chua bao binh_thuong");
-                        da_ghi_giu = true;
-                    }
                     bo.ep_gui_lan_ranh_toi |= ep_gui;
                     cho = Duration::from_secs(1);
                 }
-                Some((ma, ct)) => {
-                    da_ghi_giu = false;
-                    gui(ghi_trang_thai_may_in(&trang_thai, &may_in, ma, ct, ep_gui, true))
-                }
+                Some((ma, ct)) => gui(ghi_trang_thai_may_in(&trang_thai, &may_in, ma, ct, ep_gui, true)),
                 // Không đọc được: giữ lời hứa ép gửi cho lần sau.
                 None => bo.ep_gui_lan_ranh_toi |= ep_gui,
             },
@@ -805,6 +844,15 @@ pub fn chu_co_the_trong_may_in(so_hoa_don: &str, ma: MaSuCo) -> String {
     )
 }
 
+/// `chiTiet` của `su-co khong_xac_nhan` khi máy in ra tờ SAU lỗi cho một hoá
+/// đơn kẹt (0.2.7) — không bảo in lại: tờ có thể đã ra, chỉ không biết là số nào.
+pub fn chu_doi_chieu_so(so_hoa_don: &str) -> String {
+    format!(
+        "Máy in đã chạy lại sau lỗi và ra tờ cho hoá đơn {} — máy từng in lặp / bỏ sót hoá đơn sau khi hết giấy: ĐỐI CHIẾU SỐ hoá đơn trên tờ, thiếu số nào mới in lại số đó",
+        so_hoa_don
+    )
+}
+
 /// `chiTiet` của `su-co khong_xac_nhan` khi theo dõi tiếp quá 12 giờ (R-C).
 pub fn chu_het_han(so_hoa_don: &str) -> String {
     format!(
@@ -846,18 +894,13 @@ fn xu_ly_ket_luan_tiep(
         if let Some(p) = &pid {
             t.trong_may_in.retain(|x| x != p);
         }
-        // Hoá đơn KẸT trong máy vừa có kết luận = máy vừa hồi phục: hoá đơn gửi
-        // ngay sau không được báo "đã in" (0.2.7), và chưa báo "bình thường" vội.
-        if j.la_qua_usb() {
-            t.hoi_phuc_co_hoa_don_ket = Some(Instant::now());
+        // Hoá đơn KẸT DO LỖI trong máy vừa có kết luận = máy vừa hồi phục: hoá
+        // đơn gửi ngay sau (trên CHÍNH máy này) không được báo "đã in" (0.2.7),
+        // và chưa báo "bình thường" vội. Job USB chỉ in chậm thì không.
+        if j.ket_do_loi() {
+            t.hoi_phuc_co_hoa_don_ket = Some((may_in.to_string(), Instant::now()));
         }
-        match &pid {
-            Some(p) if t.thoi_theo_doi.iter().any(|x| x == p) => {
-                t.thoi_theo_doi.retain(|x| x != p);
-                true
-            }
-            _ => false,
-        }
+        pid.as_deref().is_some_and(|p| t.da_thoi_theo_doi(p, j.bat_dau))
     };
     // Người dùng đã "Thôi theo dõi": server không còn chờ — chỉ ghi quan sát,
     // không gửi "đã in"/sự cố (DB `bo_qua` không bị nhật ký nói ngược).
@@ -878,6 +921,32 @@ fn xu_ly_ket_luan_tiep(
         gui("su-co", v, CanHoTro::SuCo)
     };
     match kl {
+        // Máy ra tờ SAU lỗi (hoặc ngay lúc vừa hồi phục): không biết tờ ra là
+        // hoá đơn nào (030134 ra hai lần, 030136 không ra) → KHÔNG `da_in` (nó
+        // còn đóng cầu dao backend khi hoá đơn kẹt khác chưa ra) — báo "không
+        // xác nhận" kèm việc cần làm: đối chiếu SỐ hoá đơn trên tờ (0.2.7).
+        KetLuanTiep::DaIn if j.khong_bao_da_in() => {
+            let v = bao_cao::su_co(
+                &j.job_id,
+                MaSuCo::KhongXacNhan,
+                Some(&chu_doi_chieu_so(&j.so_hoa_don)),
+                may_in,
+                SystemTime::now(),
+            );
+            let kq = gui("su-co", v, CanHoTro::SuCo);
+            khoa(trang_thai).xac_nhan_in_sau(&j.job_id);
+            nhat_ky::ghi(
+                "theo_doi_tiep_ra_to_khong_bao_da_in",
+                &format!(
+                    "job={} hoa_don={} loai_truoc={} {} gui_server={}",
+                    id_ngan,
+                    j.so_hoa_don,
+                    loai,
+                    if j.ket_do_loi() { "ket_do_loi" } else { "nghi_ngo_sau_hoi_phuc" },
+                    kq.chu()
+                ),
+            );
+        }
         KetLuanTiep::DaIn => {
             let mut ket_qua = job::KetQua::da_in(j.job_id.clone());
             ket_qua.loi_cuoi = j.ghi_chu_da_in();
@@ -1414,9 +1483,7 @@ pub fn khoi_chay_yeu_cau_hang_doi(
             // "Thôi theo dõi" xong: theo dõi tiếp (nếu còn) chỉ ghi quan sát, không
             // gửi "đã in" ngược với `bo_qua` của server (0.2.7).
             if loai == hang_doi::LoaiViec::BoTheoDoi && matches!(kc, hang_doi::KetCuc::Duoc { .. }) {
-                t.thoi_theo_doi.push(m.id.clone());
-                let du = t.thoi_theo_doi.len().saturating_sub(50);
-                t.thoi_theo_doi.drain(..du);
+                t.ghi_thoi_theo_doi(&m.id, Instant::now());
             }
         }
         let _ = dg.gui_ngay("lay-hang-doi", serde_json::json!({}), CanHoTro::HangDoi);
@@ -1850,6 +1917,10 @@ mod tests {
         KiemTruoc::In { nen: None }
     }
 
+    fn khong_nghi() -> NghiNgo<'static> {
+        NghiNgo { hoi: &|| false, da_gui_byte: &|| {} }
+    }
+
     fn du_ho_tro() -> HoTro {
         HoTro { khong_ro: true, su_co: true, trang_thai_may_in: true, nhat_ky_app: false, hang_doi: false }
     }
@@ -1967,7 +2038,7 @@ mod tests {
         let (da_emit, gui) = gui_gia(du_ho_tro());
         let da_chuyen = RefCell::new(Vec::<MaSuCo>::new());
         let chuyen = |ma: MaSuCo, _ct: Option<String>| da_chuyen.borrow_mut().push(ma);
-        let xong = xu_ly_viec_co_bao_cao(&payload("1790251200000-9"), &cfg(), &in_gia_co_su_co, &kiem_in, &|| false, &tt, &gui, &chuyen);
+        let xong = xu_ly_viec_co_bao_cao(&payload("1790251200000-9"), &cfg(), &in_gia_co_su_co, &kiem_in, &khong_nghi(), &tt, &gui, &chuyen);
 
         let e = da_emit.lock().unwrap();
         let ten: Vec<&str> = e.iter().map(|(t, _)| t.as_str()).collect();
@@ -1991,7 +2062,7 @@ mod tests {
         let tt = Mutex::new(TrangThaiChung::default());
         let (da_emit, gui) = gui_gia(HoTro::default());
         let chuyen = |_ma: MaSuCo, _ct: Option<String>| {};
-        xu_ly_viec_co_bao_cao(&payload("j9"), &cfg(), &in_gia_co_su_co, &kiem_in, &|| false, &tt, &gui, &chuyen);
+        xu_ly_viec_co_bao_cao(&payload("j9"), &cfg(), &in_gia_co_su_co, &kiem_in, &khong_nghi(), &tt, &gui, &chuyen);
         let e = da_emit.lock().unwrap();
         let ten: Vec<&str> = e.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(ten, vec!["ket-qua"], "backend cũ: không su-co, chỉ ket-qua như trước");
@@ -2014,7 +2085,7 @@ mod tests {
         let tt = Mutex::new(TrangThaiChung::default());
         let (_e, gui) = gui_gia(du_ho_tro());
         let id = "1790251200000-7";
-        let xong = xu_ly_viec_co_bao_cao(&payload_co_name(id), &cfg(), &in_gia_khong_ro_con_trong_hang_doi, &kiem_in, &|| false, &tt, &gui, &|_, _| {});
+        let xong = xu_ly_viec_co_bao_cao(&payload_co_name(id), &cfg(), &in_gia_khong_ro_con_trong_hang_doi, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
         let j = xong.theo_doi_tiep.expect("phải theo dõi tiếp");
         assert_eq!(j.job_id, id);
         assert_eq!(j.so_hoa_don, "INV_2026_030045");
@@ -2024,7 +2095,7 @@ mod tests {
         let in_khong_bao = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, _b: &dyn Fn(QuanSat)| {
             KetQuaIn::KhongRo(LyDo::co_loai("x", MaSuCo::HetGiay))
         };
-        assert!(xu_ly_viec_co_bao_cao(&payload(id), &cfg(), &in_khong_bao, &kiem_in, &|| false, &tt, &gui, &|_, _| {}).theo_doi_tiep.is_none());
+        assert!(xu_ly_viec_co_bao_cao(&payload(id), &cfg(), &in_khong_bao, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {}).theo_doi_tiep.is_none());
     }
 
     /// R3: da_in muộn chỉ gửi khi kết nối HIỆN TẠI hỗ trợ khong_ro; giao diện
@@ -2317,7 +2388,7 @@ mod tests {
         let id2 = "clx0abc12345678-1790000000000";
         let mut p = payload(id2);
         p["job"]["name"] = serde_json::json!(format!("AI-INV_2-Khach-{}.pdf", id2));
-        let xong = xu_ly_viec_co_bao_cao(&p, &cfg(), &in_that, &kiem, &|| false, &tt, &gui, &|_, _| {});
+        let xong = xu_ly_viec_co_bao_cao(&p, &cfg(), &in_that, &kiem, &khong_nghi(), &tt, &gui, &|_, _| {});
         assert!(!da_goi_in.get(), "KHÔNG được gửi hoá đơn xuống máy in (không Sumatra, không spool)");
         assert!(sp.borrow().lenh.is_empty());
         assert!(xong.theo_doi_tiep.is_none());
@@ -2352,7 +2423,7 @@ mod tests {
         };
         let tt = Mutex::new(TrangThaiChung::default());
         let (e, gui) = gui_gia(du_ho_tro());
-        xu_ly_viec_co_bao_cao(&payload_co_name("clx0abc12345678-1790000000000"), &cfg(), &in_that, &kiem, &|| false, &tt, &gui, &|_, _| {});
+        xu_ly_viec_co_bao_cao(&payload_co_name("clx0abc12345678-1790000000000"), &cfg(), &in_that, &kiem, &khong_nghi(), &tt, &gui, &|_, _| {});
         let emit = e.lock().unwrap().clone();
         let t = tt.into_inner().unwrap();
         (emit, da_goi.get(), nen_nhan.get(), t)
@@ -2421,7 +2492,7 @@ mod tests {
         };
         let tt = Mutex::new(TrangThaiChung::default());
         let (e, gui) = gui_gia(du_ho_tro());
-        let xong = xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &|| false, &tt, &gui, &|_, _| {});
+        let xong = xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
         let v = e.lock().unwrap()[0].1.clone();
         assert_eq!((v["trangThai"].as_str(), v["conTrongHangDoi"].as_bool()), (Some("khong_ro"), Some(false)));
         assert!(v["loiCuoi"].as_str().unwrap().starts_with("Đã in 1/2 bản — bản còn lại CHƯA in"));
@@ -2476,7 +2547,7 @@ mod tests {
             };
             let tt = Mutex::new(TrangThaiChung::default());
             let (e, gui) = gui_gia(du_ho_tro());
-            let xong = xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &|| false, &tt, &gui, &|_, _| {});
+            let xong = xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
             let v = e.lock().unwrap()[0].1.clone();
             let cb = crate::view_model::canh_bao(&tt.lock().unwrap(), "HP").unwrap();
             (v, cb, xong.theo_doi_tiep.is_some())
@@ -2515,7 +2586,7 @@ mod tests {
         };
         let tt = Mutex::new(TrangThaiChung::default());
         let (e, gui) = gui_gia(du_ho_tro());
-        let xong = xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &|| false, &tt, &gui, &|_, _| {});
+        let xong = xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
         let e = e.lock().unwrap();
         let (ten, v) = e.iter().find(|(t, _)| t == "ket-qua").expect("phải gửi ket-qua");
         assert_eq!(ten, "ket-qua");
@@ -2527,6 +2598,68 @@ mod tests {
         let cb = crate::view_model::canh_bao(&tt.lock().unwrap(), "HP").unwrap();
         assert!(cb.tieu_de.contains("đang chờ trong máy in"), "{}", cb.tieu_de);
         assert!(cb.chi_tiet.contains("TỰ in ra") && cb.chi_tiet.contains("KHÔNG in lại"), "{}", cb.chi_tiet);
+    }
+
+    /// 0.2.7 (review Codex): hoá đơn KẸT DO LỖI trong máy in USB ra tờ sau khi
+    /// khắc phục → KHÔNG gửi `da_in` (không biết tờ ra là số nào; `da_in` còn
+    /// đóng cầu dao backend) — gửi `su-co khong_xac_nhan` "đối chiếu số";
+    /// giao diện vẫn "đã in sau khắc phục — kiểm tờ"; mốc hồi phục gắn TÊN máy.
+    /// Job USB chỉ in CHẬM (chưa từng lỗi) thì `da_in` như cũ, không đặt mốc.
+    #[test]
+    fn hoa_don_ket_do_loi_ra_to_khong_bao_da_in() {
+        let id = "p134-1790251200000";
+        let tt = Mutex::new(TrangThaiChung::default());
+        {
+            let mut t = tt.lock().unwrap();
+            t.them_job(JobLog { job_id: id.into(), trang_thai: "khong_ro".into(), loai: Some(MaSuCo::HetGiay), ..Default::default() });
+            t.trong_may_in = vec!["p134".into()];
+        }
+        let (e, gui) = gui_gia(du_ho_tro());
+        let j = JobTheoDoiTiep::moi(id.into(), "INV_134".into(), Some(MaSuCo::HetGiay), BangChungJob::default(), Instant::now())
+            .tren_may_in("HP 108a")
+            .qua_usb(true, false);
+        xu_ly_ket_luan_tiep(j, KetLuanTiep::DaIn, "HP", &tt, &gui);
+        let da = e.lock().unwrap().clone();
+        assert_eq!(da.len(), 1);
+        assert_eq!(da[0].0, "su-co", "KHÔNG ket-qua da_in");
+        assert_eq!(da[0].1["loai"], "khong_xac_nhan");
+        assert!(da[0].1["chiTiet"].as_str().unwrap().contains("ĐỐI CHIẾU SỐ"), "{}", da[0].1);
+        let t = tt.lock().unwrap();
+        assert!(t.jobs[0].sau_khac_phuc, "giao diện: đã in sau khắc phục — kiểm tờ");
+        assert!(t.trong_may_in.is_empty());
+        assert_eq!(t.hoi_phuc_co_hoa_don_ket.as_ref().map(|(m, _)| m.as_str()), Some("HP 108a"), "mốc theo TÊN máy của job");
+        drop(t);
+        // In chậm, chưa từng lỗi → da_in như cũ, không đặt mốc.
+        let tt = Mutex::new(TrangThaiChung::default());
+        let (e, gui) = gui_gia(du_ho_tro());
+        let j = JobTheoDoiTiep::moi(id.into(), "INV_134".into(), None, BangChungJob::default(), Instant::now()).qua_usb(false, true);
+        xu_ly_ket_luan_tiep(j, KetLuanTiep::DaIn, "HP", &tt, &gui);
+        assert_eq!(e.lock().unwrap()[0].1["trangThai"], "da_in");
+        assert!(tt.lock().unwrap().hoi_phuc_co_hoa_don_ket.is_none());
+        // Job gửi lúc vừa hồi phục (mang cờ nghi) → cũng không da_in.
+        let (e, gui) = gui_gia(du_ho_tro());
+        let j = JobTheoDoiTiep::moi(id.into(), "INV_136".into(), None, BangChungJob::default(), Instant::now()).nghi_ngo_sau_hoi_phuc(true);
+        xu_ly_ket_luan_tiep(j, KetLuanTiep::DaIn, "HP", &tt, &gui);
+        assert_eq!(e.lock().unwrap()[0].0, "su-co");
+    }
+
+    /// "Thôi theo dõi" theo LẦN GỬI: kết luận của lần gửi trước lúc bấm chỉ ghi
+    /// quan sát (không gửi), kể cả kết luận thứ hai cùng hoá đơn; lần gửi MỚI
+    /// sau lúc bấm thì gửi như thường (review Codex).
+    #[test]
+    fn thoi_theo_doi_chi_im_lan_gui_truoc_luc_bam() {
+        let tt = Mutex::new(TrangThaiChung::default());
+        let t0 = Instant::now();
+        khoa(&tt).ghi_thoi_theo_doi("p7", t0 + Duration::from_secs(1));
+        let (e, gui) = gui_gia(du_ho_tro());
+        for id in ["p7-1790251200000", "p7-1790251200001"] {
+            let j = JobTheoDoiTiep::moi(id.into(), "INV_7".into(), None, BangChungJob::default(), t0);
+            xu_ly_ket_luan_tiep(j, KetLuanTiep::DaIn, "HP", &tt, &gui);
+        }
+        assert!(e.lock().unwrap().is_empty(), "{:?}", e.lock().unwrap());
+        let j = JobTheoDoiTiep::moi("p7-1790251200002".into(), "INV_7".into(), None, BangChungJob::default(), t0 + Duration::from_secs(2));
+        xu_ly_ket_luan_tiep(j, KetLuanTiep::DaIn, "HP", &tt, &gui);
+        assert_eq!(e.lock().unwrap().len(), 1, "lần gửi mới sau lúc bấm");
     }
 
     /// U3: hết hạn 12 giờ của hoá đơn trong bộ nhớ máy in USB — câu KHÔNG nói
@@ -2733,7 +2866,7 @@ mod tests {
             da_thay.borrow_mut().push(tt_ref.lock().unwrap().jobs[0].trang_thai.clone());
             KetQuaIn::DaIn
         };
-        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &|| false, &tt, &gui, &|_, _| {});
+        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
         assert_eq!(*da_thay.borrow(), vec![job::DANG_GUI.to_string(), job::CHO_MAY_IN.to_string()]);
         let t = tt.lock().unwrap();
         assert_eq!(t.jobs.len(), 1, "một dòng cho một job");
@@ -2828,14 +2961,39 @@ mod tests {
         let in_duoc = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, _b: &dyn Fn(QuanSat)| {
             KetQuaIn::DaIn
         };
-        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_duoc, &kiem_in, &|| true, &tt, &gui, &|_, _| {});
+        let so_lan_tieu = Cell::new(0);
+        let tieu = || so_lan_tieu.set(so_lan_tieu.get() + 1);
+        let nghi = NghiNgo { hoi: &|| true, da_gui_byte: &tieu };
+        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_duoc, &kiem_in, &nghi, &tt, &gui, &|_, _| {});
         let v = e.lock().unwrap()[0].1.clone();
         assert_eq!(v["trangThai"], "khong_ro", "{v}");
         assert!(v["loiCuoi"].as_str().unwrap_or_default().contains("KIEM TO"), "{v}");
         assert_eq!(v["loai"], "khong_xac_nhan");
+        assert_eq!(so_lan_tieu.get(), 1, "đã gửi byte → mốc lấy đi");
+        // Bị từ chối trước khi gửi (`Loi` — backend gửi lại) → mốc CÒN (review Codex).
+        let (_, gui) = gui_gia(du_ho_tro());
+        let in_loi = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, _b: &dyn Fn(QuanSat)| {
+            KetQuaIn::Loi(LyDo::co_loai("sumatra khong chay", MaSuCo::LoiSumatra))
+        };
+        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-9"), &cfg(), &in_loi, &kiem_in, &nghi, &tt, &gui, &|_, _| {});
+        assert_eq!(so_lan_tieu.get(), 1, "Loi không tiêu mốc");
+        // Máy chưa xong → `khong_ro` theo dõi tiếp: job MANG cờ nghi (kết luận sau không da_in).
+        let (_, gui) = gui_gia(du_ho_tro());
+        let xong = xu_ly_viec_co_bao_cao(
+            &payload_co_name("1790251200000-10"),
+            &cfg(),
+            &in_gia_khong_ro_con_trong_hang_doi,
+            &kiem_in,
+            &nghi,
+            &tt,
+            &gui,
+            &|_, _| {},
+        );
+        let j = xong.theo_doi_tiep.expect("theo dõi tiếp");
+        assert!(j.khong_bao_da_in(), "cờ nghi đi theo job");
         // Không nghi ngờ → đã in như cũ.
         let (e, gui) = gui_gia(du_ho_tro());
-        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-8"), &cfg(), &in_duoc, &kiem_in, &|| false, &tt, &gui, &|_, _| {});
+        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-8"), &cfg(), &in_duoc, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
         assert_eq!(e.lock().unwrap()[0].1["trangThai"], "da_in");
     }
 
@@ -2847,10 +3005,15 @@ mod tests {
         let kho = KhoTheoDoiTiep::default();
         let t0 = Instant::now();
         assert!(!nghi_ngo_sau_hoi_phuc(&tt, &kho, "HP", t0));
-        khoa(&tt).hoi_phuc_co_hoa_don_ket = Some(t0);
+        khoa(&tt).hoi_phuc_co_hoa_don_ket = Some(("HP".into(), t0));
+        assert!(!nghi_ngo_sau_hoi_phuc(&tt, &kho, "Canon", t0), "mốc của máy KHÁC");
         assert!(nghi_ngo_sau_hoi_phuc(&tt, &kho, "HP", t0 + Duration::from_secs(20)));
-        assert!(!nghi_ngo_sau_hoi_phuc(&tt, &kho, "HP", t0 + Duration::from_secs(21)), "đã lấy đi");
-        khoa(&tt).hoi_phuc_co_hoa_don_ket = Some(t0);
+        assert!(nghi_ngo_sau_hoi_phuc(&tt, &kho, "HP", t0 + Duration::from_secs(21)), "chỉ xem, chưa lấy đi");
+        tieu_moc_hoi_phuc(&tt, "Canon");
+        assert!(nghi_ngo_sau_hoi_phuc(&tt, &kho, "HP", t0), "máy khác không tiêu mốc của HP");
+        tieu_moc_hoi_phuc(&tt, "HP");
+        assert!(!nghi_ngo_sau_hoi_phuc(&tt, &kho, "HP", t0), "đã gửi byte → lấy đi");
+        khoa(&tt).hoi_phuc_co_hoa_don_ket = Some(("HP".into(), t0));
         assert!(!nghi_ngo_sau_hoi_phuc(&tt, &kho, "HP", t0 + NGHI_NGO_SAU_HOI_PHUC), "quá hạn");
         let j = JobTheoDoiTiep::moi("p1-1790000000001".into(), "INV_1".into(), Some(MaSuCo::HetGiay), BangChungJob::default(), t0)
             .tren_may_in("HP")
@@ -2866,12 +3029,16 @@ mod tests {
     fn giu_binh_thuong_khi_con_hoa_don_ket() {
         use MaSuCo::*;
         let t0 = Instant::now();
-        assert!(nen_giu_binh_thuong(BinhThuong, Some(HetGiay), true, None, t0));
-        assert!(nen_giu_binh_thuong(BinhThuong, Some(HetGiay), false, Some(t0), t0 + Duration::from_secs(4)));
-        assert!(!nen_giu_binh_thuong(BinhThuong, Some(HetGiay), false, Some(t0), t0 + CHO_ON_DINH_SAU_HOI_PHUC));
-        assert!(!nen_giu_binh_thuong(BinhThuong, Some(HetGiay), false, None, t0), "không có hoá đơn kẹt: báo ngay như 0.2.5");
-        assert!(!nen_giu_binh_thuong(BinhThuong, Some(BinhThuong), true, None, t0), "không đang lỗi");
-        assert!(!nen_giu_binh_thuong(BinhThuong, Some(HetMuc), true, None, t0), "cảnh báo mực không chặn in");
-        assert!(!nen_giu_binh_thuong(HetGiay, Some(HetGiay), true, None, t0));
+        assert!(nen_giu_binh_thuong(BinhThuong, Some(HetGiay), true, None, None, t0));
+        assert!(nen_giu_binh_thuong(BinhThuong, Some(HetGiay), false, Some(t0), None, t0 + Duration::from_secs(4)));
+        assert!(!nen_giu_binh_thuong(BinhThuong, Some(HetGiay), false, Some(t0), None, t0 + CHO_ON_DINH_SAU_HOI_PHUC));
+        assert!(!nen_giu_binh_thuong(BinhThuong, Some(HetGiay), false, None, None, t0), "không có hoá đơn kẹt: báo ngay như 0.2.5");
+        assert!(!nen_giu_binh_thuong(BinhThuong, Some(BinhThuong), true, None, None, t0), "không đang lỗi");
+        assert!(!nen_giu_binh_thuong(BinhThuong, Some(HetMuc), true, None, None, t0), "cảnh báo mực không chặn in");
+        assert!(!nen_giu_binh_thuong(HetGiay, Some(HetGiay), true, None, None, t0));
+        // Trần giữ (review Codex): hoá đơn kẹt không kết luận được không treo hàng đợi server.
+        let sau = t0 + GIU_BINH_THUONG_TOI_DA;
+        assert!(nen_giu_binh_thuong(BinhThuong, Some(HetGiay), true, None, Some(t0), sau - Duration::from_secs(1)));
+        assert!(!nen_giu_binh_thuong(BinhThuong, Some(HetGiay), true, None, Some(t0), sau), "quá 3 phút → báo bình thường");
     }
 }

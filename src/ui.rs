@@ -432,7 +432,9 @@ fn cap_nhat_theo_id(model: &VecModel<QueueRow>, moi: Vec<QueueRow>) {
 fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung, hd: &VecModel<QueueRow>) -> Option<CanhBao> {
     let lech = crate::thoi_gian::lech_gio_may_phut();
     let bay_gio_he = SystemTime::now();
-    let k = t.hang_doi.khoi(t.da_noi, t.may_in.as_ref().map(|(m, _)| *m), &t.trong_may_in, Instant::now(), &|iso| {
+    // Máy đã hết lỗi mà app còn giữ chưa báo server (in nốt tờ kẹt): dải nói đúng thế.
+    let ma_may_in = if t.dang_giu_binh_thuong { Some(crate::su_co::MaSuCo::BinhThuong) } else { t.may_in.as_ref().map(|(m, _)| *m) };
+    let k = t.hang_doi.khoi(t.da_noi, ma_may_in, &t.trong_may_in, Instant::now(), &|iso| {
         crate::thoi_gian::gio_may_tu_iso(iso, lech, bay_gio_he)
     });
     w.set_hd_hien(k.hien);
