@@ -23,6 +23,8 @@ pub struct JobRow {
     pub da_in: bool,
     /// Không rõ / đang chờ trong máy in — tô màu riêng (vàng), khác "Lỗi" (đỏ).
     pub khong_ro: bool,
+    /// Đang xử lý (gửi xuống / chờ in ra) — tô xanh dương.
+    pub dang_xu_ly: bool,
     pub luc: String,
 }
 
@@ -82,6 +84,11 @@ pub fn nhan_job(trang_thai: &str, loai: Option<MaSuCo>, sau_khac_phuc: bool) -> 
     let dau = match trang_thai {
         job::DA_IN if sau_khac_phuc => return "Đã in (sau khi khắc phục)".into(),
         job::DA_IN => return "Đã in".into(),
+        job::DANG_GUI => return "Đang gửi xuống máy in…".into(),
+        job::CHO_MAY_IN => return "Đã gửi xuống máy in — đang chờ in ra…".into(),
+        // Từ chối gửi vì khay trống (0.2.5): chưa gửi gì, có giấy là tự in — nói
+        // thẳng việc cần làm, không "Lỗi"/"Không rõ".
+        job::LOI if loai == Some(MaSuCo::HetGiay) => return "Chờ giấy — nạp giấy vào khay là tự in".into(),
         job::KHONG_RO if loai.is_some_and(MaSuCo::la_su_co_may_in) => "Đang chờ trong máy in",
         job::KHONG_RO => "Không rõ",
         _ if loai.is_some_and(MaSuCo::khong_tieu_luot) => "Lỗi — sẽ tự in lại",
@@ -107,7 +114,8 @@ fn dong_job(j: &JobLog) -> JobRow {
             _ => nhan_job(&j.trang_thai, j.loai, j.sau_khac_phuc),
         },
         da_in: j.trang_thai == job::DA_IN,
-        khong_ro: j.trang_thai == job::KHONG_RO,
+        khong_ro: j.trang_thai == job::KHONG_RO || (j.trang_thai == job::LOI && j.loai == Some(MaSuCo::HetGiay)),
+        dang_xu_ly: j.trang_thai == job::DANG_GUI || j.trang_thai == job::CHO_MAY_IN,
         luc: j.luc.clone(),
     }
 }
@@ -342,7 +350,10 @@ mod tests {
         assert_eq!(nhan_job("da_in", None, false), "Đã in");
         assert_eq!(nhan_job("da_in", Some(MaSuCo::HetGiay), false), "Đã in");
         assert_eq!(nhan_job("da_in", None, true), "Đã in (sau khi khắc phục)");
-        assert_eq!(nhan_job("loi", Some(MaSuCo::HetGiay), false), "Lỗi — sẽ tự in lại: Hết giấy");
+        // 0.2.5: từ chối gửi vì khay trống — nói việc cần làm, không "Lỗi".
+        assert_eq!(nhan_job("loi", Some(MaSuCo::HetGiay), false), "Chờ giấy — nạp giấy vào khay là tự in");
+        assert_eq!(nhan_job("dang_gui", None, false), "Đang gửi xuống máy in…");
+        assert_eq!(nhan_job("cho_may_in", None, false), "Đã gửi xuống máy in — đang chờ in ra…");
         assert_eq!(nhan_job("loi", Some(MaSuCo::CanXuLy), false), "Lỗi — sẽ tự in lại: Máy in cần người xử lý");
         // T4: mã tiêu lượt thử — không hứa tự in lại
         assert_eq!(nhan_job("loi", Some(MaSuCo::LoiMayIn), false), "Lỗi — hệ thống thử lại: Máy in báo lỗi");

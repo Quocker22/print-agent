@@ -459,8 +459,14 @@ mod tests {
         assert_eq!(a[6], "c:\\a.pdf");
     }
 
+    /// Hai test dry-run cùng đặt biến môi trường CHUNG của tiến trình
+    /// (`AGENT_DRY_RUN_DIR`) — chạy song song là giẫm nhau (test này ghi vào thư
+    /// mục của test kia). Khoá để chạy lần lượt.
+    static KHOA_ENV_DRY_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn dry_run_ghi_file_dung_noi_dung() {
+        let _khoa = KHOA_ENV_DRY_RUN.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pa-test-{}", now_id()));
         std::env::set_var("AGENT_DRY_RUN", "1");
         std::env::set_var("AGENT_DRY_RUN_DIR", dir.to_str().unwrap());
@@ -507,6 +513,7 @@ mod tests {
 
     #[test]
     fn dry_run_dung_name_server_gui() {
+        let _khoa = KHOA_ENV_DRY_RUN.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("pa-test-name-{}", now_id()));
         std::env::set_var("AGENT_DRY_RUN", "1");
         std::env::set_var("AGENT_DRY_RUN_DIR", dir.to_str().unwrap());

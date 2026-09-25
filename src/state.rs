@@ -118,9 +118,35 @@ pub const MAX_JOB_LOG: usize = 20;
 
 impl TrangThaiChung {
     /// Thêm một job log mới vào đầu danh sách, cắt bớt nếu vượt MAX_JOB_LOG.
+    /// Cùng `job_id` đã có (dòng trung gian "Đang gửi…") thì THAY dòng đó.
     pub fn them_job(&mut self, log: JobLog) {
+        if !log.job_id.is_empty() {
+            self.jobs.retain(|j| j.job_id != log.job_id);
+        }
         self.jobs.insert(0, log);
         self.jobs.truncate(MAX_JOB_LOG);
+    }
+
+    /// Job vừa nhận: hiện NGAY dòng "Đang gửi xuống máy in…" (0.2.5).
+    pub fn bat_dau_job(&mut self, job_id: &str, so_hoa_don: &str, khach: Option<String>, luc: String) {
+        self.them_job(JobLog {
+            job_id: job_id.to_string(),
+            so_hoa_don: so_hoa_don.to_string(),
+            khach,
+            trang_thai: job::DANG_GUI.into(),
+            luc,
+            ..Default::default()
+        });
+    }
+
+    /// Đổi trạng thái TRUNG GIAN của job đang xử lý (vd rời hàng đợi Windows →
+    /// "đang chờ in ra"). Dòng đã có kết quả cuối thì không đụng.
+    pub fn doi_trang_thai_job(&mut self, job_id: &str, trang_thai: &str) {
+        for j in self.jobs.iter_mut().filter(|j| j.job_id == job_id) {
+            if j.trang_thai == job::DANG_GUI || j.trang_thai == job::CHO_MAY_IN {
+                j.trang_thai = trang_thai.to_string();
+            }
+        }
     }
 
     /// Ghi một lần đọc trạng thái máy in. Trả `true` khi MÃ đổi so với lần

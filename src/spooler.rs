@@ -170,6 +170,9 @@ pub enum QuanSat {
     /// `da_thay_in`: máy USB đã BUSY trong bước sau khi rời hàng đợi (giao vì
     /// bận quá hạn) — theo dõi tiếp chỉ cần thấy về IDLE.
     TrongMayInUsb { bang_chung: BangChungJob, da_thay_loi: bool, da_thay_in: bool },
+    /// Job vừa RỜI hàng đợi Windows (byte đã xuống máy in) — app hiện "Đã gửi
+    /// xuống máy in — đang chờ in ra…" trong lúc đọc máy in (0.2.5).
+    DaRoiHangDoi,
 }
 
 /// Kết luận của `BoSuy`.
@@ -1234,27 +1237,31 @@ fn ket_thuc(
         // PRINTED trên máy USB chỉ nghĩa là byte cuối đã vào BỘ NHỚ máy in —
         // máy hết giấy vẫn giữ đó (giám sát 25/09): máy USB cũng phải qua U2.
         KetLuan::DaIn { qua_vang: false } if !usb.la_may_usb => KetQuaIn::DaIn,
-        KetLuan::DaIn { .. } => match kiem_may_in_sau_khi_roi(sp, bo_suy.nen, job_id, vet, bao) {
-            (SauKhiRoi::Sach, _) => KetQuaIn::DaIn,
-            (SauKhiRoi::SuCo(ma), _) => KetQuaIn::KhongRo(LyDo::co_loai(
-                format!(
-                    "job da roi hang doi Windows nhung may in bao {} ngay sau do — co the con trong bo nho may in",
-                    ma.nhan()
-                ),
-                ma,
-            )),
-            (SauKhiRoi::TrongMayInUsb(ma), _) => {
-                bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: true, da_thay_in: false });
-                KetQuaIn::KhongRo(LyDo::co_loai(chu_trong_may_in_usb(ma), ma))
+        KetLuan::DaIn { .. } => {
+            bao(QuanSat::DaRoiHangDoi);
+            let sau_khi_roi = kiem_may_in_sau_khi_roi(sp, bo_suy.nen, job_id, vet, bao);
+            match sau_khi_roi {
+                (SauKhiRoi::Sach, _) => KetQuaIn::DaIn,
+                (SauKhiRoi::SuCo(ma), _) => KetQuaIn::KhongRo(LyDo::co_loai(
+                    format!(
+                        "job da roi hang doi Windows nhung may in bao {} ngay sau do — co the con trong bo nho may in",
+                        ma.nhan()
+                    ),
+                    ma,
+                )),
+                (SauKhiRoi::TrongMayInUsb(ma), _) => {
+                    bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: true, da_thay_in: false });
+                    KetQuaIn::KhongRo(LyDo::co_loai(chu_trong_may_in_usb(ma), ma))
+                }
+                (SauKhiRoi::UsbChuaXong, da_thay_in) => {
+                    bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: false, da_thay_in });
+                    KetQuaIn::KhongRo(LyDo::co_loai(
+                        "may in USB chua in xong sau 30 giay — app theo doi tiep va bao khi in xong",
+                        MaSuCo::KhongXacNhan,
+                    ))
+                }
             }
-            (SauKhiRoi::UsbChuaXong, da_thay_in) => {
-                bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: false, da_thay_in });
-                KetQuaIn::KhongRo(LyDo::co_loai(
-                    "may in USB chua in xong sau 30 giay — app theo doi tiep va bao khi in xong",
-                    MaSuCo::KhongXacNhan,
-                ))
-            }
-        },
+        }
         KetLuan::KhongRo(ly_do) => {
             if con_trong_hang_doi {
                 bao(QuanSat::ConTrongHangDoi(bo_suy.bang_chung()));
@@ -1507,8 +1514,27 @@ pub fn kiem_truoc_khi_in(
         if let Some(ly_do) = kiem_hang_doi_truoc_khi_in(vong.hang_doi.as_deref(), ket_theo_doi) {
             return KiemTruoc::TuChoi { ly_do, su_kien: "khong_in_hang_doi_ket" };
         }
+        // Máy USB báo KHAY TRỐNG (mức giấy 0 — HP dòng SPL, đo HCM 25/09): KHÔNG gửi
+        // hoá đơn xuống. Gửi xuống là máy nhận vào bộ nhớ, giữ tới khi nạp giấy —
+        // app không biết lúc nào nó ra giấy, NV thấy "chưa in" rồi in lại = hai tờ.
+        // `loi(het_giay)`: backend giữ hoá đơn, KHÔNG tiêu lượt, ngắt cầu dao; máy
+        // báo `binh_thuong` (có giấy) là tự gửi lại. Chưa byte nào rời máy tính.
+        if let Some(d) = vong.usb.as_ref().filter(|d| d.khay_1.is_some_and(|(_, muc)| muc == 0)) {
+            return KiemTruoc::TuChoi {
+                ly_do: LyDo::co_loai(chu_het_giay_truoc_khi_in(d), MaSuCo::HetGiay),
+                su_kien: "khong_in_het_giay",
+            };
+        }
     }
     KiemTruoc::In { nen: Some(chup_nen(vong)) }
+}
+
+/// Câu `loiCuoi` khi từ chối in vì khay trống (không gửi gì xuống máy in).
+pub fn chu_het_giay_truoc_khi_in(d: &DocUsb) -> String {
+    format!(
+        "Máy in hết giấy (khay trống — {}) — chưa gửi hoá đơn xuống máy in; nạp giấy là hệ thống tự in",
+        d.mo_ta_ngan()
+    )
 }
 
 /// Chụp cờ nền của máy in `printer` NGAY BÂY GIỜ (một vòng đọc) — cho đường in
@@ -3370,5 +3396,35 @@ mod tests {
         assert_eq!(bo.them(None, Some(TinhTrangUsb::Ranh)), None);
         assert_eq!(bo.het_gio(), SauKhiRoi::UsbChuaXong);
         assert_eq!(BoSauKhiRoi::default().het_gio(), SauKhiRoi::Sach, "máy không USB: như cũ");
+    }
+
+    /// HCM 25/09: khay trống (mức giấy 0) → KHÔNG gửi hoá đơn xuống máy in, trả
+    /// `loi(het_giay)` (backend giữ, không tiêu lượt, tự gửi lại khi có giấy).
+    #[test]
+    fn g_khay_trong_thi_khong_gui_hoa_don_xuong_may_in() {
+        let mut v = vong_usb(USB_DANG_IN);
+        if let Some(d) = v.usb.as_mut() {
+            d.khay_1 = Some((150, 0));
+        }
+        match kiem_truoc_khi_in(&v, "HP Laser 103 107 108", None, true) {
+            KiemTruoc::TuChoi { ly_do, su_kien } => {
+                assert_eq!(su_kien, "khong_in_het_giay");
+                assert_eq!(ly_do.loai, Some(MaSuCo::HetGiay));
+                assert!(ly_do.chu.contains("chưa gửi hoá đơn"), "{}", ly_do.chu);
+            }
+            k => panic!("{:?}", k),
+        }
+        // Có giấy → in bình thường.
+        let mut v = vong_usb(USB_RANH);
+        if let Some(d) = v.usb.as_mut() {
+            d.khay_1 = Some((150, 150));
+        }
+        assert!(matches!(kiem_truoc_khi_in(&v, "HP", None, true), KiemTruoc::In { .. }));
+        // Backend CŨ (không có cầu dao / không tiêu lượt): không từ chối, như trước.
+        let mut v = vong_usb(USB_DANG_IN);
+        if let Some(d) = v.usb.as_mut() {
+            d.khay_1 = Some((150, 0));
+        }
+        assert!(matches!(kiem_truoc_khi_in(&v, "HP", None, false), KiemTruoc::In { .. }));
     }
 }

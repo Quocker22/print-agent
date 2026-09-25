@@ -350,6 +350,7 @@ fn jobs_sang_model(jobs: Vec<crate::view_model::JobRow>) -> ModelRc<JobRow> {
             badge: j.badge.into(),
             da_in: j.da_in,
             khong_ro: j.khong_ro,
+            dang_xu_ly: j.dang_xu_ly,
             luc: j.luc.into(),
         })
         .collect();

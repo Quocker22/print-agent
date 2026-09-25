@@ -366,6 +366,7 @@ impl BaoCaoTrongLuc<'_> {
                 self.con_trong_hang_doi.set(Some(bang_chung));
                 self.trong_may_in_usb.set(Some((da_thay_loi, da_thay_in)));
             }
+            QuanSat::DaRoiHangDoi => khoa(self.trang_thai).doi_trang_thai_job(self.job_id, job::CHO_MAY_IN),
         }
     }
 }
@@ -470,6 +471,9 @@ fn xu_ly_mot_viec(
         "nhan_job",
         &format!("job={} hoa_don={} khach={}", id_ngan, so_hoa_don, khach.as_deref().unwrap_or("-")),
     );
+    // Hiện NGAY trên app (0.2.5): trước bản này "In gần đây" im lặng tới khi có
+    // kết quả cuối (tới 30 s với máy USB) — NV tưởng app không nhận lệnh.
+    khoa(trang_thai).bat_dau_job(&job_id_tho, &so_hoa_don, khach.clone(), gio_hien_tai());
 
     let mut kq = job::xu_ly_job(val, cfg, in_fn);
     if kq.trang_thai == job::KHONG_RO {
@@ -2291,6 +2295,28 @@ mod tests {
         assert_eq!(v["dong"][0]["noiDung"], "job=x t=1ms");
         assert_eq!(v["boQua"], 3);
         assert_eq!(v["phienBan"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// 0.2.5 (chủ 25/09: "lúc gửi xuống máy in không hiển thị"): dòng "In gần đây"
+    /// hiện NGAY khi nhận lệnh ("Đang gửi…"), đổi "Đã gửi — đang chờ in ra…" khi
+    /// job rời hàng đợi, rồi THAY bằng kết quả cuối (một dòng, không nhân đôi).
+    #[test]
+    fn in_gan_day_hien_tung_buoc_mot_dong() {
+        let tt = Mutex::new(TrangThaiChung::default());
+        let (_e, gui) = gui_gia(du_ho_tro());
+        let da_thay: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let tt_ref = &tt;
+        let in_gia = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, bao: &dyn Fn(QuanSat)| {
+            da_thay.borrow_mut().push(tt_ref.lock().unwrap().jobs[0].trang_thai.clone());
+            bao(QuanSat::DaRoiHangDoi);
+            da_thay.borrow_mut().push(tt_ref.lock().unwrap().jobs[0].trang_thai.clone());
+            KetQuaIn::DaIn
+        };
+        xu_ly_viec_co_bao_cao(&payload_co_name("1790251200000-7"), &cfg(), &in_gia, &kiem_in, &tt, &gui, &|_, _| {});
+        assert_eq!(*da_thay.borrow(), vec![job::DANG_GUI.to_string(), job::CHO_MAY_IN.to_string()]);
+        let t = tt.lock().unwrap();
+        assert_eq!(t.jobs.len(), 1, "một dòng cho một job");
+        assert_eq!(t.jobs[0].trang_thai, job::DA_IN);
     }
 
     // --- R-H / R-I: kết nối ---

@@ -68,6 +68,25 @@ pub struct DocUsb {
     pub hang: Option<String>,
     /// Vendor GET 0x0A wValue 0x0005 (sức chứa / mức giấy khay), hex.
     pub khay: Option<String>,
+    /// Khay 1 giải mã từ `khay`: (sức chứa, mức giấy) — xem `khay_1_tu_byte`.
+    pub khay_1: Option<(u16, u16)>,
+}
+
+/// Khay 1 từ trả lời vendor GET 0x0A/0x0005 của HP dòng SPL: mỗi khay 4 byte =
+/// sức chứa (u16 big-endian) + mức giấy hiện tại (u16 BE); `FF FF` = không có.
+///
+/// ĐO THẬT HCM 25/09 (HP Laser 108a, khay TRỐNG suốt, phần mềm HP báo "Paper
+/// is empty in tray"): `00 96 00 00 00 00 FF FF …` → khay 1 = (150, 0): 150 tờ
+/// đúng sức chứa khay của HP Laser 107/108, mức 0 = trống. Đây là thứ "HP
+/// Printer Status" dùng để báo hết giấy (1284 STATUS và bit nFault KHÔNG dùng
+/// được — BUSY/IDLE nhảy mà không in tờ nào).
+pub fn khay_1_tu_byte(b: &[u8]) -> Option<(u16, u16)> {
+    if b.len() < 4 {
+        return None;
+    }
+    let suc_chua = u16::from_be_bytes([b[0], b[1]]);
+    let muc = u16::from_be_bytes([b[2], b[3]]);
+    (suc_chua != 0 && suc_chua != 0xFFFF && muc != 0xFFFF).then_some((suc_chua, muc))
 }
 
 /// Tình trạng máy suy ra từ một lần đọc.
@@ -88,6 +107,10 @@ pub enum TinhTrangUsb {
 
 impl DocUsb {
     pub fn tinh_trang(&self) -> TinhTrangUsb {
+        // Khay 1 có sức chứa mà mức giấy 0 = HẾT GIẤY (HP dòng SPL — đo HCM 25/09).
+        if self.khay_1.is_some_and(|(_, muc)| muc == 0) {
+            return TinhTrangUsb::Loi(MaSuCo::HetGiay);
+        }
         if self.byte & BIT_HET_GIAY != 0 {
             return TinhTrangUsb::Loi(MaSuCo::HetGiay);
         }
@@ -136,6 +159,9 @@ impl DocUsb {
             s.push_str(h);
         }
         match self.tinh_trang() {
+            TinhTrangUsb::Loi(MaSuCo::HetGiay) if self.khay_1.is_some_and(|(_, m)| m == 0) => {
+                s.push_str(" — khay giấy TRỐNG (máy in báo mức giấy 0)")
+            }
             TinhTrangUsb::Loi(MaSuCo::HetGiay) => s.push_str(" — máy in báo hết giấy qua USB"),
             TinhTrangUsb::Loi(_) => s.push_str(" — máy in báo lỗi qua USB (thường là hết giấy, kẹt giấy hoặc mở nắp)"),
             _ => {}
@@ -451,17 +477,20 @@ mod win {
         .and_then(|_| chuoi_1284(&bo_dem[..(nhan_id as usize).min(bo_dem.len())]));
         let status = chuoi.as_deref().and_then(tach_status);
         // Trạng thái riêng của hãng — chỉ HP dòng SPL (xem hoi_duoc_trang_thai_hang).
-        let (hang, khay) = if chuoi.as_deref().is_some_and(hoi_duoc_trang_thai_hang) {
-            (vendor_get(&h, [0x02, 0x00, 0x00], 64), vendor_get(&h, [0x0A, 0x00, 0x05], 255))
+        let (hang, khay_byte) = if chuoi.as_deref().is_some_and(hoi_duoc_trang_thai_hang) {
+            (vendor_get(&h, [0x02, 0x00, 0x00], 64).map(|r| r.map_or_else(|e| e, |b| hex(&b))), vendor_get(&h, [0x0A, 0x00, 0x05], 255))
         } else {
             (None, None)
         };
-        Ok((DocUsb { byte: byte[0], status, hang, khay }, chuoi))
+        let khay_1 = khay_byte.as_ref().and_then(|r| r.as_ref().ok()).and_then(|b| khay_1_tu_byte(b));
+        let khay = khay_byte.map(|r| r.map_or_else(|e| e, |b| hex(&b)));
+        Ok((DocUsb { byte: byte[0], status, hang, khay, khay_1 }, chuoi))
     }
 
     /// Một vendor GET trên đường điều khiển (EP0) — không đi vào luồng in.
-    /// `vao` = {bRequest, wValue cao, wValue thấp}. Lỗi → `LOI(<mã>)`.
-    fn vendor_get(h: &Handle, vao: [u8; 3], kich_thuoc: usize) -> Option<String> {
+    /// `vao` = {bRequest, wValue cao, wValue thấp}. Trả byte nhận được, hoặc
+    /// `LOI(<mã>)`. `Option` luôn `Some` (giữ chữ ký cho chỗ gọi đọc gọn).
+    fn vendor_get(h: &Handle, vao: [u8; 3], kich_thuoc: usize) -> Option<Result<Vec<u8>, String>> {
         let mut ra = vec![0u8; kich_thuoc];
         let mut nhan: u32 = 0;
         let kq = unsafe {
@@ -477,8 +506,11 @@ mod win {
             )
         };
         Some(match kq {
-            Ok(()) => hex(&ra[..(nhan as usize).min(kich_thuoc)]),
-            Err(e) => format!("LOI({})", e.code().0 & 0xFFFF),
+            Ok(()) => {
+                ra.truncate((nhan as usize).min(kich_thuoc));
+                Ok(ra)
+            }
+            Err(e) => Err(format!("LOI({})", e.code().0 & 0xFFFF)),
         })
     }
 
@@ -817,7 +849,7 @@ mod tests {
         assert!(!hoi_duoc_trang_thai_hang("MFG:Samsung;CMD:SPL;MDL:M2020;"), "không phải HP");
         assert!(!hoi_duoc_trang_thai_hang("MFG:Xprinter;CMD:ESC/POS;"));
         assert_eq!(hex(&[0x02, 0xAB, 0x00]), "02 AB 00");
-        let d = DocUsb { byte: 0x98, status: Some("BUSY".into()), hang: Some("00 01".into()), khay: Some("0A".into()) };
+        let d = DocUsb { byte: 0x98, status: Some("BUSY".into()), hang: Some("00 01".into()), khay: Some("0A".into()), khay_1: None };
         assert_eq!(d.mo_ta_ngan(), "0x98/BUSY h=00 01");
         assert!(d.mo_ta().contains("hang=00 01") && !d.mo_ta().contains("khay"), "khay ghi dòng riêng");
     }
@@ -833,5 +865,23 @@ mod tests {
         assert!(g.them_gioi_han("a1", t0 + Duration::from_millis(500), nhip, toi_thieu).is_none(), "đổi nhưng chưa đủ 2 s");
         assert!(g.them_gioi_han("a2", t0 + Duration::from_millis(1000), nhip, toi_thieu).is_none());
         assert_eq!(g.them_gioi_han("a3", t0 + Duration::from_millis(2000), nhip, toi_thieu).as_deref(), Some("a3 [+2 lan doc da gop]"));
+    }
+
+    /// Khay 1 từ trả lời 0x0A THẬT ở HCM (khay trống) → (150, 0) → HẾT GIẤY.
+    #[test]
+    fn khay_giay_do_that_hcm_la_het_giay() {
+        let that: Vec<u8> = [0x00, 0x96, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF].into_iter().chain(std::iter::repeat_n(0, 243)).collect();
+        assert_eq!(khay_1_tu_byte(&that), Some((150, 0)));
+        let d = DocUsb { byte: 0x98, status: Some("BUSY".into()), khay_1: khay_1_tu_byte(&that), ..Default::default() };
+        assert_eq!(d.tinh_trang(), TinhTrangUsb::Loi(MaSuCo::HetGiay), "khay trống thắng mọi STATUS");
+        assert!(d.mo_ta().contains("khay giấy TRỐNG"), "{}", d.mo_ta());
+        // Có giấy (mức > 0): không phải lỗi — STATUS quyết như cũ.
+        let co_giay = DocUsb { byte: 0x18, status: Some("IDLE".into()), khay_1: khay_1_tu_byte(&[0x00, 0x96, 0x00, 0x96]), ..Default::default() };
+        assert_eq!(co_giay.tinh_trang(), TinhTrangUsb::Ranh);
+        // Không có khay / không rõ / trả lời ngắn → không suy gì.
+        assert_eq!(khay_1_tu_byte(&[0xFF, 0xFF, 0x00, 0x00]), None);
+        assert_eq!(khay_1_tu_byte(&[0x00, 0x00, 0x00, 0x00]), None);
+        assert_eq!(khay_1_tu_byte(&[0x00, 0x96, 0xFF, 0xFF]), None);
+        assert_eq!(khay_1_tu_byte(&[0x00, 0x96]), None);
     }
 }

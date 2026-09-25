@@ -31,6 +31,11 @@ pub struct JobIn {
 pub const DA_IN: &str = "da_in";
 pub const LOI: &str = "loi";
 pub const KHONG_RO: &str = "khong_ro";
+/// Trạng thái TRUNG GIAN chỉ để hiện trên app ("In gần đây") — không bao giờ
+/// gửi backend (0.2.5, chủ yêu cầu 25/09: "lúc gửi xuống máy in không hiển thị").
+pub const DANG_GUI: &str = "dang_gui";
+/// Job đã rời hàng đợi Windows, app đang chờ máy in xác nhận (trung gian, chỉ app).
+pub const CHO_MAY_IN: &str = "cho_may_in";
 
 /// Kết quả emit về server qua event "ket-qua" (hợp đồng v2 §2):
 /// `{jobId, trangThai: "da_in"|"loi"|"khong_ro", loiCuoi?, loai?}`.

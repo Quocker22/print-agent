@@ -11,7 +11,7 @@ import { Button, LineEdit, ComboBox, ScrollView, CheckBox } from "std-widgets.sl
 import "../assets/font-regular.ttf";
 import "../assets/font-semibold.ttf";
 
-export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool, khong_ro: bool, luc: string }
+export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool, khong_ro: bool, dang_xu_ly: bool, luc: string }
 
 export component MainWindow inherits Window {
     title: "Incokit Print Agent";
@@ -159,7 +159,7 @@ export component MainWindow inherits Window {
                             }
                             Text {
                                 text: j.badge;
-                                color: j.da_in ? #16A34A : (j.khong_ro ? #B7791F : #C0392B);
+                                color: j.da_in ? #16A34A : (j.dang_xu_ly ? #1786BE : (j.khong_ro ? #B7791F : #C0392B));
                                 font-size: 11px; font-weight: 600; overflow: elide;
                             }
                         }
