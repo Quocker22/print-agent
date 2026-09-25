@@ -163,6 +163,9 @@ pub mod co {
 
     /// PRINTER_INFO_2W.Attributes — "Use Printer Offline" (spooler giữ mọi job).
     pub const PRINTER_ATTRIBUTE_WORK_OFFLINE: u32 = 0x0000_0400;
+    /// PRINTER_INFO_2W.Attributes — kết nối tới máy in chia sẻ của máy khác
+    /// (usb_may_in.rs: không đọc thiết bị USB cục bộ cho máy in này).
+    pub const PRINTER_ATTRIBUTE_NETWORK: u32 = 0x0000_0010;
 
     pub const JOB_STATUS_PAUSED: u32 = 0x0000_0001;
     pub const JOB_STATUS_ERROR: u32 = 0x0000_0002;
@@ -441,6 +444,7 @@ const _: () = {
     assert!(co::PRINTER_STATUS_DOOR_OPEN == w::PRINTER_STATUS_DOOR_OPEN);
     assert!(co::PRINTER_STATUS_SERVER_UNKNOWN == w::PRINTER_STATUS_SERVER_UNKNOWN);
     assert!(co::PRINTER_ATTRIBUTE_WORK_OFFLINE == w::PRINTER_ATTRIBUTE_WORK_OFFLINE);
+    assert!(co::PRINTER_ATTRIBUTE_NETWORK == w::PRINTER_ATTRIBUTE_NETWORK);
     assert!(co::JOB_STATUS_PAUSED == w::JOB_STATUS_PAUSED);
     assert!(co::JOB_STATUS_ERROR == w::JOB_STATUS_ERROR);
     assert!(co::JOB_STATUS_DELETING == w::JOB_STATUS_DELETING);

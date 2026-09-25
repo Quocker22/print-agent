@@ -251,6 +251,10 @@ fn in_va_xac_nhan(
 
     for lan in 0..copies.max(1) {
         let argv = lenh_in(&sumatra, tmp.to_str().unwrap_or(""), printer, paper_size, tray);
+        // Trong lúc Sumatra nộp job, KHÔNG luồng nào hỏi thiết bị USB (usb_may_in.rs):
+        // hàng đợi có thể còn rỗng đúng lúc usbmon sắp mở cổng — usbprint có thể
+        // không cho mở chung. Job vào hàng đợi rồi thì cổng hàng đợi tự chặn.
+        let tam_ngung_usb = crate::usb_may_in::TamNgungDocUsb::bat();
         // spawn + chờ có hạn (R8) thay cho `.output()` chờ vô hạn. stdout bỏ
         // (Sumatra -silent không in gì), stderr giữ để ghi lý do khi lỗi.
         let mut tien_trinh = match Command::new(&argv[0])
@@ -292,6 +296,7 @@ fn in_va_xac_nhan(
                 Some(format!("không chờ được SumatraPDF: {}", e))
             }
         };
+        drop(tam_ngung_usb);
 
         if let Some(mo_ta_loi) = mo_ta_loi {
             // Sumatra lỗi/quá hạn KHÔNG tự động = "chưa in": nếu spooler ĐÃ quan

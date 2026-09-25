@@ -319,8 +319,8 @@ struct BaoCaoTrongLuc<'a> {
     may_in_da_chuyen: Cell<Option<MaSuCo>>,
     da_thay_su_co: Cell<bool>,
     con_trong_hang_doi: Cell<Option<BangChungJob>>,
-    /// `Some(da_thay_loi)` = job nằm trong BỘ NHỚ máy in USB (U2) — theo dõi tiếp qua USB.
-    trong_may_in_usb: Cell<Option<bool>>,
+    /// `Some((da_thay_loi, da_thay_in))` = job nằm trong BỘ NHỚ máy in USB (U2) — theo dõi tiếp qua USB.
+    trong_may_in_usb: Cell<Option<(bool, bool)>>,
 }
 
 impl BaoCaoTrongLuc<'_> {
@@ -349,9 +349,9 @@ impl BaoCaoTrongLuc<'_> {
             QuanSat::ConTrongHangDoi(bc) => self.con_trong_hang_doi.set(Some(bc)),
             // Không còn trong hàng đợi Windows nhưng CÒN chờ trong máy in — với
             // backend nghĩa y hệt (`conTrongHangDoi:true`: tự in, KHÔNG in lại).
-            QuanSat::TrongMayInUsb { bang_chung, da_thay_loi } => {
+            QuanSat::TrongMayInUsb { bang_chung, da_thay_loi, da_thay_in } => {
                 self.con_trong_hang_doi.set(Some(bang_chung));
-                self.trong_may_in_usb.set(Some(da_thay_loi));
+                self.trong_may_in_usb.set(Some((da_thay_loi, da_thay_in)));
             }
         }
     }
@@ -421,7 +421,7 @@ fn xu_ly_viec_co_bao_cao(
             let j = JobTheoDoiTiep::moi(job_id.clone(), so_hoa_don.clone(), kq.loai, bc, Instant::now())
                 .tren_may_in(&cfg.printer_name);
             Some(match bao_cao.trong_may_in_usb.get() {
-                Some(da_thay_loi) => j.qua_usb(da_thay_loi),
+                Some((da_thay_loi, da_thay_in)) => j.qua_usb(da_thay_loi, da_thay_in),
                 None => j,
             })
         }
@@ -2082,7 +2082,11 @@ mod tests {
     fn u2_trong_may_in_usb_thi_con_trong_hang_doi_va_theo_doi_usb() {
         let in_gia = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, bao: &dyn Fn(QuanSat)| {
             bao(QuanSat::SuCo { loai: MaSuCo::CanXuLy, chi_tiet: "USB 0x90 STATUS:BUSY".into() });
-            bao(QuanSat::TrongMayInUsb { bang_chung: BangChungJob { da_thay_in: true, ..Default::default() }, da_thay_loi: true });
+            bao(QuanSat::TrongMayInUsb {
+                bang_chung: BangChungJob { da_thay_in: true, ..Default::default() },
+                da_thay_loi: true,
+                da_thay_in: false,
+            });
             KetQuaIn::KhongRo(LyDo::co_loai("may in bao loi qua USB", MaSuCo::CanXuLy))
         };
         let tt = Mutex::new(TrangThaiChung::default());
@@ -2108,7 +2112,7 @@ mod tests {
         let tt = Mutex::new(TrangThaiChung::default());
         let (e, gui) = gui_gia(du_ho_tro());
         let j = JobTheoDoiTiep::moi("1790251200000-7".into(), "INV_1".into(), Some(MaSuCo::CanXuLy), BangChungJob::default(), Instant::now())
-            .qua_usb(true);
+            .qua_usb(true, false);
         xu_ly_ket_luan_tiep(j, KetLuanTiep::HetHan, "HP", &tt, &gui);
         let v = e.lock().unwrap()[0].1.clone();
         let ct = v["chiTiet"].as_str().unwrap_or_default().to_string();

@@ -28,8 +28,13 @@
 //! hết giấy — một mình nó không nói được gì; chỉ bit3 phân biệt.
 //!
 //! CHỈ ĐỌC: mở thiết bị với quyền truy cập 0 (đủ để hỏi trạng thái), không
-//! bao giờ đọc/ghi dữ liệu in. spooler.rs chỉ gọi khi hàng đợi Windows của máy
-//! in đang RỖNG — không chen vào lúc spooler đẩy byte xuống cổng.
+//! bao giờ đọc/ghi dữ liệu in. Không chen vào lúc spooler đẩy byte xuống cổng:
+//! spooler.rs chỉ gọi khi mọi job trong hàng đợi đã gửi xong (`hang_doi_cho_doc_usb`),
+//! và worker tạm ngừng mọi lần đọc trong lúc Sumatra nộp job (`TamNgungDocUsb`).
+//! Chỉ máy in CỤC BỘ trên đúng một cổng `USBnnn`, thiết bị tìm theo ĐÚNG số
+//! cổng usbmon ghi trong registry — không bao giờ đoán "máy USB duy nhất đang
+//! cắm" (cửa hàng có thể cắm thêm máy in tem/bill: đọc nhầm là báo `da_in`
+//! cho hoá đơn đang kẹt trong máy HP).
 
 // Phần Win32 chỉ chạy trên Windows; trên Mac phần thuần chỉ chạy trong test.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -145,6 +150,63 @@ pub fn chuoi_1284(bo_dem: &[u8]) -> Option<String> {
     let khai = u16::from_be_bytes([bo_dem[0], bo_dem[1]]) as usize;
     let het = khai.clamp(2, bo_dem.len());
     Some(String::from_utf8_lossy(&bo_dem[2..het]).into_owned())
+}
+
+/// Kết quả một lần hỏi máy in theo cổng.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocCong {
+    /// Không phải máy in cục bộ trên đúng một cổng USB — lớp USB không áp dụng.
+    KhongPhaiUsb,
+    /// Worker đang cho Sumatra nộp job (`TamNgungDocUsb`) — không hỏi, không biết gì mới.
+    TamNgung,
+    /// Máy USB mà không tìm/mở/hỏi được thiết bị: máy in tắt, rút dây, hoặc
+    /// không đọc được registry. Theo dõi tiếp coi "mất thiết bị" lúc máy đang
+    /// giữ hoá đơn là hoá đơn có thể đã mất (tắt máy xoá bộ nhớ).
+    KhongDocDuoc,
+    Doc(DocUsb),
+}
+
+/// Máy in `cong` có phải máy CỤC BỘ trên đúng một cổng USB không → số cổng.
+/// `may_chu` = PRINTER_INFO_2W.pServerName (rỗng = máy cục bộ); kết nối máy in
+/// chia sẻ `\\PC\may` mang tên cổng CỦA MÁY CHỦ (`USB001`) — đọc thiết bị cục
+/// bộ cùng số cổng là đọc nhầm máy.
+pub fn la_cong_usb_cuc_bo(may_chu: &str, thuoc_tinh: u32, cong: &str) -> Option<u32> {
+    if !may_chu.trim().is_empty() || thuoc_tinh & crate::su_co::co::PRINTER_ATTRIBUTE_NETWORK != 0 {
+        return None;
+    }
+    so_cong_usb(cong)
+}
+
+/// Các đường dẫn thiết bị usbmon ghi cho ĐÚNG cổng `USB<cong>` (có thể nhiều:
+/// thiết bị đã rút còn khoá cũ — người gọi thử mở từng cái). KHÔNG có đường lùi
+/// "máy duy nhất": không khớp số cổng thì không đọc.
+pub fn thiet_bi_cua_cong(ds: &[(Option<u32>, String)], cong: u32) -> Vec<&str> {
+    ds.iter().filter(|(so, _)| *so == Some(cong)).map(|(_, d)| d.as_str()).collect()
+}
+
+static SO_TAM_NGUNG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tạm ngừng MỌI lần hỏi thiết bị USB (mọi luồng) khi còn giữ giá trị này —
+/// worker giữ trong lúc Sumatra nộp job, đúng khe hàng đợi có thể còn rỗng mà
+/// usbmon sắp mở cổng (usbprint có thể không cho mở chung).
+#[must_use]
+pub struct TamNgungDocUsb(());
+
+impl TamNgungDocUsb {
+    pub fn bat() -> Self {
+        SO_TAM_NGUNG.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TamNgungDocUsb(())
+    }
+}
+
+impl Drop for TamNgungDocUsb {
+    fn drop(&mut self) {
+        SO_TAM_NGUNG.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn dang_tam_ngung() -> bool {
+    SO_TAM_NGUNG.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
 // ===================== Phần Win32 thật (chỉ Windows) =====================
@@ -273,43 +335,69 @@ mod win {
             .collect()
     }
 
-    /// Dò thiết bị của cổng `USB<cong>`: ưu tiên khoá có "Port Number" khớp mà mở
-    /// được; không có mà MÁY CHỈ CÓ ĐÚNG MỘT thiết bị USB máy in đang cắm → dùng
-    /// nó (ghi nhật ký). Nhiều thiết bị mà không khớp số cổng → không đoán.
+    /// Dò thiết bị của cổng `USB<cong>`: khoá registry có "Port Number" KHỚP mà mở
+    /// + hỏi được. Không có → `None` (không đoán thiết bị khác).
     fn do_thiet_bi(cong: u32) -> Option<(String, DocUsb)> {
         let ds = cac_thiet_bi(cong);
-        for (_, duong_dan) in ds.iter().filter(|(so, _)| *so == Some(cong)) {
-            if let Some(doc) = doc_thiet_bi(duong_dan) {
-                return Some((duong_dan.clone(), doc));
-            }
+        let khop = thiet_bi_cua_cong(&ds, cong);
+        let ra = khop.iter().find_map(|d| doc_thiet_bi(d).map(|doc| (d.to_string(), doc)));
+        if ra.is_none() {
+            ghi_mot_lan("usb_khong_tim_thay_thiet_bi", cong, &format!("{} khoa khop so cong", khop.len()));
         }
-        let dang_cam: Vec<(String, DocUsb)> =
-            ds.iter().filter_map(|(_, d)| doc_thiet_bi(d).map(|doc| (d.clone(), doc))).collect();
-        if dang_cam.len() == 1 {
-            let (duong_dan, doc) = dang_cam.into_iter().next()?;
-            ghi_mot_lan("usb_dung_thiet_bi_duy_nhat", cong, &duong_dan);
-            return Some((duong_dan, doc));
-        }
-        ghi_mot_lan("usb_khong_tim_thay_thiet_bi", cong, &format!("{} thiet bi dang cam", dang_cam.len()));
-        None
+        ra
     }
 
-    /// Đọc máy in nằm trên cổng `cong` (tên cổng của PRINTER_INFO_2W). Không phải
-    /// cổng USB / không tìm/mở được thiết bị → `None` (spooler.rs giữ cách cũ).
-    pub fn doc_theo_cong(cong: &str) -> Option<DocUsb> {
-        let so = so_cong_usb(cong)?;
-        let da_do = DA_DO.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(s, _)| *s == so).map(|(_, d)| d.clone());
-        if let Some(duong_dan) = da_do {
-            if let Some(doc) = doc_thiet_bi(&duong_dan) {
-                return Some(doc);
-            }
-            // Rút ra cắm lại có thể đổi đường dẫn — bỏ bản nhớ, dò lại.
-            DA_DO.lock().unwrap_or_else(|p| p.into_inner()).retain(|(s, _)| *s != so);
+    /// Lần đọc gần nhất của mỗi cổng — chỉ để ghi nhật ký khi trạng thái ĐỔI
+    /// (dòng thời gian thật BUSY/IDLE/lỗi của máy ở cửa hàng, vài dòng mỗi hoá đơn).
+    static LAN_TRUOC: Mutex<Vec<(u32, Option<DocUsb>)>> = Mutex::new(Vec::new());
+
+    fn ghi_neu_doi(cong: u32, doc: Option<&DocUsb>) {
+        let mut ds = LAN_TRUOC.lock().unwrap_or_else(|p| p.into_inner());
+        let truoc = ds.iter_mut().find(|(c, _)| *c == cong);
+        let doi = match &truoc {
+            Some((_, t)) => t.as_ref() != doc,
+            None => true,
+        };
+        if !doi {
+            return;
         }
-        let (duong_dan, doc) = do_thiet_bi(so)?;
-        ghi_mot_lan("usb_doc_duoc", so, &format!("{} {}", doc.mo_ta(), duong_dan));
-        DA_DO.lock().unwrap_or_else(|p| p.into_inner()).push((so, duong_dan));
-        Some(doc)
+        match truoc {
+            Some((_, t)) => *t = doc.cloned(),
+            None => ds.push((cong, doc.cloned())),
+        }
+        drop(ds);
+        let chu = doc.map_or_else(|| "khong doc duoc thiet bi".to_string(), DocUsb::mo_ta);
+        nhat_ky::ghi("usb_trang_thai", &format!("cong=USB{:03} {}", cong, chu));
+    }
+
+    /// Hỏi máy in (PRINTER_INFO_2W: `may_chu` = pServerName, `thuoc_tinh`,
+    /// `cong` = pPortName). Không phải máy USB cục bộ → `KhongPhaiUsb`.
+    pub fn doc_theo_cong(may_chu: &str, thuoc_tinh: u32, cong: &str) -> DocCong {
+        let Some(so) = la_cong_usb_cuc_bo(may_chu, thuoc_tinh, cong) else {
+            return DocCong::KhongPhaiUsb;
+        };
+        if dang_tam_ngung() {
+            return DocCong::TamNgung;
+        }
+        let da_do = DA_DO.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(s, _)| *s == so).map(|(_, d)| d.clone());
+        let doc = match da_do.as_deref().and_then(doc_thiet_bi) {
+            Some(doc) => Some(doc),
+            None => {
+                // Chưa dò, hoặc rút ra cắm lại có thể đổi đường dẫn — dò lại theo số cổng.
+                let moi = do_thiet_bi(so);
+                let mut nho = DA_DO.lock().unwrap_or_else(|p| p.into_inner());
+                nho.retain(|(s, _)| *s != so);
+                if let Some((duong_dan, _)) = &moi {
+                    if da_do.as_deref() != Some(duong_dan.as_str()) {
+                        nhat_ky::ghi("usb_thiet_bi", &format!("cong=USB{:03} {}", so, duong_dan));
+                    }
+                    nho.push((so, duong_dan.clone()));
+                }
+                moi.map(|(_, doc)| doc)
+            }
+        };
+        ghi_neu_doi(so, doc.as_ref());
+        doc.map_or(DocCong::KhongDocDuoc, DocCong::Doc)
     }
 }
 
@@ -318,8 +406,8 @@ pub use win::doc_theo_cong;
 
 /// Mac/dev: không có thiết bị USB Windows để đọc.
 #[cfg(not(windows))]
-pub fn doc_theo_cong(_cong: &str) -> Option<DocUsb> {
-    None
+pub fn doc_theo_cong(_may_chu: &str, _thuoc_tinh: u32, _cong: &str) -> DocCong {
+    DocCong::KhongPhaiUsb
 }
 
 #[cfg(test)]
@@ -407,5 +495,41 @@ mod tests {
         // CTL_CODE(0x22, n, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0) = 0x22<<16 | n<<2.
         assert_eq!(IOCTL_USBPRINT_GET_LPT_STATUS, (0x22 << 16) | (12 << 2));
         assert_eq!(IOCTL_USBPRINT_GET_1284_ID, (0x22 << 16) | (13 << 2));
+    }
+
+    #[test]
+    fn chi_may_cuc_bo_tren_cong_usb() {
+        use crate::su_co::co::PRINTER_ATTRIBUTE_NETWORK;
+        assert_eq!(la_cong_usb_cuc_bo("", 0x40, "USB001"), Some(1));
+        // Kết nối máy in chia sẻ \\PC\may: cổng là của MÁY CHỦ — không đọc thiết bị cục bộ.
+        assert_eq!(la_cong_usb_cuc_bo(r"\\PC-KHO", 0, "USB001"), None);
+        assert_eq!(la_cong_usb_cuc_bo("", PRINTER_ATTRIBUTE_NETWORK, "USB001"), None);
+        assert_eq!(la_cong_usb_cuc_bo("", 0, "WSD-5a6b"), None);
+    }
+
+    /// Giám sát 25/09: KHÔNG có đường lùi "máy USB duy nhất" — cửa hàng cắm thêm
+    /// máy in tem/bill thì đọc nhầm, báo `da_in` cho hoá đơn đang kẹt trong máy HP.
+    #[test]
+    fn thiet_bi_chi_theo_dung_so_cong() {
+        let ds = vec![
+            (Some(2), r"\\?\usb#vid_tem".to_string()),
+            (None, r"\\?\usb#khong_so".to_string()),
+            (Some(1), r"\\?\usb#hp_cu".to_string()),
+            (Some(1), r"\\?\usb#hp".to_string()),
+        ];
+        assert_eq!(thiet_bi_cua_cong(&ds, 1), vec![r"\\?\usb#hp_cu", r"\\?\usb#hp"]);
+        assert!(thiet_bi_cua_cong(&ds, 3).is_empty(), "không khớp số cổng thì KHÔNG đoán");
+    }
+
+    /// Bộ đếm dùng chung cả tiến trình (test in khác chạy song song cũng giữ) —
+    /// chỉ kiểm điều luôn đúng: còn giữ ít nhất một khoá thì đang tạm ngừng.
+    #[test]
+    fn tam_ngung_doc_usb_long_nhau() {
+        let a = TamNgungDocUsb::bat();
+        let b = TamNgungDocUsb::bat();
+        assert!(dang_tam_ngung());
+        drop(a);
+        assert!(dang_tam_ngung(), "còn b");
+        drop(b);
     }
 }
