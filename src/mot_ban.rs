@@ -171,11 +171,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ngoai_windows_luon_cho_chay_va_ten_khoa_dung() {
-        assert!(giu_mot_ban().is_ok());
-        assert!(giu_mot_ban().is_ok(), "mac/test: no-op, gọi lại vẫn được");
+    fn ten_khoa_dung() {
         assert_eq!(TEN_KHOA, r"Global\print-agent-lednelia", "R-L: toàn máy, không theo phiên");
         assert_eq!(TEN_KHOA_PHIEN, r"Local\print-agent-lednelia");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ngoai_windows_luon_cho_chay() {
+        assert!(giu_mot_ban().is_ok());
+        assert!(giu_mot_ban().is_ok(), "mac/test: no-op, gọi lại vẫn được");
+    }
+
+    /// Windows THẬT (đo trên máy build .207, 25/09): lần giữ thứ hai trong CÙNG
+    /// phiên bị chặn và nhận ra là cùng phiên. Bản trước của test này không
+    /// gắn `cfg(not(windows))` nên đỏ trên Windows — chính vì khoá chạy đúng.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ban_thu_hai_cung_phien_bi_chan() {
+        let dau = giu_mot_ban();
+        if dau.is_err() {
+            // Máy đang chạy app print-agent thật (giữ khoá) — không kiểm được ở đây.
+            eprintln!("có print-agent đang chạy trên máy này — bỏ qua");
+            return;
+        }
+        assert_eq!(giu_mot_ban().err(), Some(BanKhac::CungPhien));
     }
 
     /// R-L: ACCESS_DENIED = mutex đã có, do phiên/người dùng khác tạo → bản kia
