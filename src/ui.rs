@@ -388,6 +388,7 @@ fn dong_hang_doi_sang_slint(d: &hang_doi::DongHangDoi) -> QueueRow {
         bat_nut: d.bat_nut,
         thong_diep: d.thong_diep.as_str().into(),
         co_nut_bo: d.co_nut_bo,
+        co_nut_huy_lai: d.co_nut_huy_lai,
     }
 }
 
@@ -634,6 +635,9 @@ pub fn chay_ui(
                     t.doi_cau_hinh();
                     tray.borrow_mut().cap_nhat_cfg(&cfg_moi);
                     *cfg_dang_dung.borrow_mut() = cfg_moi.clone();
+                    // Lưu xong về màn chính (hàng đợi + in gần đây) — trang Cấu hình
+                    // để mở là che mất hàng đợi (giám sát 0.2.6).
+                    w.set_cau_hinh_mo(false);
                     bom_view_model(&w, &cfg_moi, &t, &hd_model);
                 }
                 Err(e) => {
@@ -738,7 +742,7 @@ pub fn chay_ui(
         };
         window.on_hd_huy(gan(Box::new(|t, id| {
             let dn = t.da_noi;
-            t.hang_doi.bam_huy(id, dn);
+            t.hang_doi.bam_huy(id, dn, Instant::now());
             None
         })));
         window.on_hd_vi_sao(gan(Box::new(|t, id| {
@@ -747,7 +751,7 @@ pub fn chay_ui(
         })));
         window.on_hd_bo(gan(Box::new(|t, id| {
             let dn = t.da_noi;
-            t.hang_doi.bam_bo(id, dn);
+            t.hang_doi.bam_bo(id, dn, Instant::now());
             None
         })));
         window.on_hd_dong_lai(gan(Box::new(|t, id| {
@@ -756,21 +760,21 @@ pub fn chay_ui(
         })));
         window.on_hd_xac_nhan_huy(gan(Box::new(|t, id| {
             let dn = t.da_noi;
-            t.hang_doi.bat_dau(id, LoaiViec::Huy, dn).map(|m| (LoaiViec::Huy, vec![m]))
+            t.hang_doi.bat_dau(id, LoaiViec::Huy, dn, Instant::now()).map(|m| (LoaiViec::Huy, vec![m]))
         })));
         window.on_hd_xac_nhan_bo(gan(Box::new(|t, id| {
             let dn = t.da_noi;
-            t.hang_doi.bat_dau(id, LoaiViec::BoTheoDoi, dn).map(|m| (LoaiViec::BoTheoDoi, vec![m]))
+            t.hang_doi.bat_dau(id, LoaiViec::BoTheoDoi, dn, Instant::now()).map(|m| (LoaiViec::BoTheoDoi, vec![m]))
         })));
         let huy_ca = gan(Box::new(|t, _| {
             let dn = t.da_noi;
-            t.hang_doi.bam_huy_ca(dn);
+            t.hang_doi.bam_huy_ca(dn, Instant::now());
             None
         }));
         window.on_hd_huy_ca(move || huy_ca("".into()));
         let xn_huy_ca = gan(Box::new(|t, _| {
             let dn = t.da_noi;
-            Some((LoaiViec::Huy, t.hang_doi.bat_dau_loat(dn)))
+            Some((LoaiViec::Huy, t.hang_doi.bat_dau_loat(dn, Instant::now())))
         }));
         window.on_hd_xac_nhan_huy_ca(move || xn_huy_ca("".into()));
         let dong_loat = gan(Box::new(|t, _| {
@@ -856,6 +860,11 @@ pub fn chay_ui(
                 // không bao giờ thấy.
                 let bay_gio = Instant::now();
                 if nen_bat_cua_so(canh_bao_truoc.borrow().as_deref(), canh_bao.as_ref(), lan_bat_cuoi.get(), bay_gio) {
+                    // Sự cố mới: hiện màn chính (hàng đợi + nút Huỷ), không để kẹt ở
+                    // trang Cấu hình. Cấu hình còn thiếu thì giữ trang đó.
+                    if !cfg.server_url.is_empty() && !cfg.token.is_empty() && !cfg.printer_name.is_empty() {
+                        w.set_cau_hinh_mo(false);
+                    }
                     let _ = w.show();
                     if let Some(hwnd) = hwnd_cua(&w) {
                         nhay_cua_so(hwnd);
@@ -1030,11 +1039,12 @@ mod tests_chon {
             cua_so.set_size(slint::PhysicalSize::new(400, cao));
             slint::platform::update_timers_and_animations();
             cua_so.request_redraw();
-            cua_so.draw_if_needed(|r| {
+            let ve = cua_so.draw_if_needed(|r| {
                 let mut px = vec![PremultipliedRgbaColor::default(); 400 * cao as usize];
                 r.render(&mut px, 400);
                 ghi_bmp(ten, 400, cao as usize, &px);
             });
+            assert!(ve, "không vẽ được {ten}");
             ui.hide().unwrap();
         };
 
@@ -1089,13 +1099,13 @@ mod tests_chon {
             ("j3", Some(KetCuc::ChuaRo { ly_do: "het gio".into() })),
             ("j4", None),
         ] {
-            t.hang_doi.bam_huy(id, true);
-            t.hang_doi.bat_dau(id, LoaiViec::Huy, true);
+            t.hang_doi.bam_huy(id, true, t0);
+            t.hang_doi.bat_dau(id, LoaiViec::Huy, true, t0 + hang_doi::CHONG_BAM_DUP);
             if let Some(kc) = kc {
                 t.hang_doi.ket_thuc(id, LoaiViec::Huy, &kc, t0);
             }
         }
-        t.hang_doi.bam_huy("j0", true);
+        t.hang_doi.bam_huy("j0", true, t0);
         chup("2-trang-thai-dong", &t, &|_| {});
 
         // 3. Vì sao + bỏ theo dõi (chưa xác nhận).
@@ -1106,15 +1116,15 @@ mod tests_chon {
         });
         t.hang_doi.bam_vi_sao("k1");
         chup("3-vi-sao-chua-xac-nhan", &t, &|_| {});
-        t.hang_doi.bam_bo("k1", true);
+        t.hang_doi.bam_bo("k1", true, t0);
         chup("4-xac-nhan-bo", &t, &|_| {});
 
         // 5. Huỷ cả N — hỏi xác nhận; 6. tổng kết có lỗi.
         let mut t = co_so(HangDoiServer { cho_in: muoi[..4].to_vec(), chua_xac_nhan: vec![], cap_nhat: String::new() });
         t.ghi_may_in(MaSuCo::HetGiay, None, true);
-        t.hang_doi.bam_huy_ca(true);
+        t.hang_doi.bam_huy_ca(true, t0);
         chup("5-huy-ca-xac-nhan", &t, &|_| {});
-        let ds = t.hang_doi.bat_dau_loat(true);
+        let ds = t.hang_doi.bat_dau_loat(true, t0 + hang_doi::CHONG_BAM_DUP);
         for (i, m) in ds.iter().enumerate() {
             let kc = if i == 2 {
                 KetCuc::KhongDuoc { loi: "DANG_IN".into(), noi_dung: hang_doi::VI_SAO_DANG_IN.into() }
@@ -1133,6 +1143,11 @@ mod tests_chon {
         let mut t = co_so(HangDoiServer { cho_in: muoi[..3].to_vec(), chua_xac_nhan: vec![], cap_nhat: String::new() });
         t.da_noi = false;
         chup("7-mat-ket-noi", &t, &|_| {});
+
+        // 9. Cấu hình mở khi hàng đợi có hoá đơn — phải nhắc.
+        let mut t = co_so(HangDoiServer { cho_in: muoi[..2].to_vec(), chua_xac_nhan: vec![], cap_nhat: String::new() });
+        t.ghi_may_in(MaSuCo::HetGiay, None, true);
+        chup("9-cau-hinh-khi-co-hang-doi", &t, &|w| w.set_cau_hinh_mo(true));
 
         // 8. Cấu hình mở.
         let t = co_so(HangDoiServer::default());

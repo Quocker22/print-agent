@@ -107,6 +107,8 @@ pub fn doc_hang_doi(v: &Value) -> HangDoiServer {
 /// Kết quả huỷ / bỏ theo dõi (ack của `yeu-cau-huy` / `yeu-cau-bo-theo-doi`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KetQuaHuy {
+    /// `print_jobs.id` server trả — PHẢI khớp id đã hỏi (ack trùng id, xem net.rs CongSocket).
+    pub id: String,
     pub ok: bool,
     /// `chua_gui` | `da_huy_truoc` (huỷ) — rỗng với bỏ theo dõi.
     pub cach: String,
@@ -118,7 +120,7 @@ pub struct KetQuaHuy {
 /// Ack → `KetQuaHuy`. Ack lạ (không có `ok`) ⇒ `None` (người gọi coi là "chưa rõ").
 pub fn doc_ket_qua_huy(v: &Value) -> Option<KetQuaHuy> {
     let ok = v.get("ok").and_then(Value::as_bool)?;
-    Some(KetQuaHuy { ok, cach: chu(v, "cach"), loi: chu(v, "loi"), noi_dung: chu(v, "noiDung") })
+    Some(KetQuaHuy { id: chu(v, "id"), ok, cach: chu(v, "cach"), loi: chu(v, "loi"), noi_dung: chu(v, "noiDung") })
 }
 
 /// `su-co`: `{jobId, loai, chiTiet?, mayIn, luc}`.

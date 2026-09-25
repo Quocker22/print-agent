@@ -154,6 +154,9 @@ impl TrangThaiChung {
     /// dòng "Đã huỷ" — không để câu "nạp giấy là tự in" nằm cạnh hoá đơn đã huỷ.
     pub fn ghi_da_huy(&mut self, id_print_job: &str, so_hoa_don: &str, khach: Option<String>, luc: String) {
         self.jobs.retain(|j| print_job_id(&j.job_id) != Some(id_print_job));
+        // Dải đỏ "…chưa in — Hệ thống sẽ TỰ gửi in lại" của hoá đơn này thôi đúng
+        // (giám sát 0.2.6: dải còn hứa tự in cạnh dòng "Đã huỷ").
+        self.dai_jobs.retain(|d| print_job_id(&d.job_id) != Some(id_print_job));
         self.them_job(JobLog {
             job_id: format!("huy:{}", id_print_job),
             so_hoa_don: so_hoa_don.to_string(),
@@ -161,6 +164,19 @@ impl TrangThaiChung {
             trang_thai: job::DA_HUY.into(),
             luc,
             ..Default::default()
+        });
+    }
+
+    /// Sau mỗi ảnh chụp hàng đợi: dải `Loi` ("…Hệ thống sẽ TỰ gửi in lại") của
+    /// hoá đơn KHÔNG còn trong hàng đợi server (đã huỷ trên ZaloCRM, đã gửi lại
+    /// và in xong, …) thôi hứa — hàng đợi là sự thật hiện tại. Chỉ khi có ảnh
+    /// TƯƠI của kết nối này và job id đúng dạng backend 25/09; dải `KhongRo` giữ
+    /// nguyên luật riêng của nó (hoá đơn có thể đang nằm trong máy in).
+    pub fn dong_bo_dai_voi_hang_doi(&mut self) {
+        let hd = &self.hang_doi;
+        self.dai_jobs.retain(|d| {
+            d.loai_dai != LoaiDai::Loi
+                || print_job_id(&d.job_id).and_then(|p| hd.co_trong_anh(p)).unwrap_or(true)
         });
     }
 
@@ -660,5 +676,35 @@ mod tests {
         assert_eq!(t.jobs.len(), 2);
         assert_eq!((t.jobs[0].so_hoa_don.as_str(), t.jobs[0].trang_thai.as_str()), ("INV/1", job::DA_HUY));
         assert_eq!(t.jobs[1].so_hoa_don, "INV/2");
+    }
+
+    /// Giám sát 0.2.6 (H2): huỷ xong thì dải đỏ "sẽ TỰ gửi in lại" của đúng hoá
+    /// đơn đó tắt; dải của hoá đơn khác giữ nguyên.
+    #[test]
+    fn ghi_da_huy_tat_dai_loi_cua_hoa_don_do() {
+        let mut t = TrangThaiChung::default();
+        t.ghi_ket_qua_job("p1-1790000000001", "INV_1", job::LOI, Some(MaSuCo::HetGiay));
+        t.ghi_ket_qua_job("p2-1790000000002", "INV_2", job::LOI, Some(MaSuCo::HetGiay));
+        assert_eq!(t.dai_jobs.len(), 2);
+        t.ghi_da_huy("p1", "INV/1", None, "18:50:00".into());
+        assert_eq!(t.dai_jobs.iter().map(|d| d.so_hoa_don.as_str()).collect::<Vec<_>>(), ["INV_2"]);
+    }
+
+    /// Dải `Loi` của hoá đơn đã rời hàng đợi server tắt; còn trong hàng đợi / ảnh
+    /// chưa tươi / id kiểu cũ thì giữ.
+    #[test]
+    fn dai_loi_tat_khi_hoa_don_roi_hang_doi() {
+        use crate::bao_cao::{HangDoiServer, MucHangDoi};
+        let mut t = TrangThaiChung::default();
+        t.ghi_ket_qua_job("p1-1790000000001", "INV_1", job::LOI, Some(MaSuCo::HetGiay));
+        t.ghi_ket_qua_job("p2-1790000000002", "INV_2", job::LOI, Some(MaSuCo::HetGiay));
+        t.ghi_ket_qua_job("token_cu_INV_3", "INV_3", job::LOI, Some(MaSuCo::HetGiay));
+        t.dong_bo_dai_voi_hang_doi();
+        assert_eq!(t.dai_jobs.len(), 3, "chưa có ảnh chụp: không kết luận");
+        t.hang_doi.nhan_cau_hinh(true);
+        let muc = MucHangDoi { id: "p2".into(), trang_thai: "cho_in".into(), huy: "chac_chan".into(), ..Default::default() };
+        t.hang_doi.nhan_anh(HangDoiServer { cho_in: vec![muc], ..Default::default() }, std::time::Instant::now());
+        t.dong_bo_dai_voi_hang_doi();
+        assert_eq!(t.dai_jobs.iter().map(|d| d.so_hoa_don.as_str()).collect::<Vec<_>>(), ["INV_2", "INV_3"]);
     }
 }

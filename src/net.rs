@@ -143,19 +143,37 @@ fn khoa<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Cổng emit thật của MỘT kết nối: `RawClient` mà callback "open" nhận được.
-struct CongSocket(Mutex<RawClient>);
+///
+/// MỘT ack sống mỗi lúc (`cho_ack`, 0.2.6, giám sát): rust_socketio 0.6 chọn id ack
+/// NGẪU NHIÊN trong 0..999 và gọi MỌI callback đang chờ có cùng id — lô nhật ký
+/// (`{ok:true, soDong}`) và yêu cầu huỷ chờ song song thì 1/999 lần ack của bên
+/// này rơi vào bên kia: app có thể hiện "Đã huỷ" cho câu trả lời của lô nhật ký.
+/// Người đọc ack vẫn kiểm hình dạng (id khớp / có `soDong`) — ack TRỄ của yêu cầu
+/// đã hết giờ vẫn có thể trùng id với yêu cầu sau.
+struct CongSocket {
+    client: Mutex<RawClient>,
+    cho_ack: Mutex<()>,
+}
+
+impl CongSocket {
+    fn moi(client: RawClient) -> Self {
+        CongSocket { client: Mutex::new(client), cho_ack: Mutex::new(()) }
+    }
+}
 
 impl CongGui for CongSocket {
     fn emit(&self, su_kien: &str, gia_tri: serde_json::Value) -> Result<(), String> {
-        khoa(&self.0).emit(su_kien, gia_tri).map_err(|e| e.to_string())
+        khoa(&self.client).emit(su_kien, gia_tri).map_err(|e| e.to_string())
     }
 
     /// Ack về qua callback trên luồng poll — callback chỉ đẩy vào kênh (không
     /// chặn luồng poll: chặn callback = mất ping, bài học 14–17/09); luồng gọi
     /// chờ kênh SAU KHI đã nhả khoá client.
     fn emit_ack(&self, su_kien: &str, gia_tri: serde_json::Value, cho: Duration) -> Result<serde_json::Value, String> {
+        // Giữ suốt lúc chờ: yêu cầu ack thứ hai chờ ở đây (không bao giờ trên luồng callback).
+        let _mot_ack = khoa(&self.cho_ack);
         let (gui, nhan) = mpsc::channel::<serde_json::Value>();
-        khoa(&self.0)
+        khoa(&self.client)
             .emit_with_ack(su_kien, gia_tri, cho, move |p: Payload, _c: RawClient| {
                 let _ = gui.send(gia_tri_ack(p));
             })
@@ -1141,7 +1159,9 @@ fn chay_gui_nhat_ky(duong_gui: Arc<DuongGui>, dung: Arc<AtomicBool>) {
         let ket_qua = duong_gui
             .gui_ack("nhat-ky-app", payload_nhat_ky(&lo, bo_qua), CanHoTro::NhatKyApp, CHO_ACK_NHAT_KY)
             .and_then(|v| {
-                if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                // `soDong` bắt buộc: ack có `ok:true` mà thiếu nó là ack của yêu cầu KHÁC
+                // (trùng id ack — xem CongSocket) → coi như chưa gửi được, gửi lại lô.
+                if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) && v.get("soDong").is_some_and(|n| n.is_u64()) {
                     Ok(())
                 } else {
                     Err(v.get("loi").and_then(serde_json::Value::as_str).unwrap_or("ack khong ok").to_string())
@@ -1206,6 +1226,12 @@ pub fn khoi_chay_yeu_cau_hang_doi(
     let (dg, tt) = (duong_gui.clone(), trang_thai.clone());
     let da_spawn = std::thread::Builder::new().name("yeu-cau-hang-doi".into()).spawn(move || {
         for m in &muc {
+            // Bấm Lưu (cấu hình khác) giữa loạt: trạng thái đã dựng lại — thôi, không
+            // gửi thêm yêu cầu nào người dùng không còn thấy.
+            if !khoa(&tt).hang_doi.con_dang(&m.id) {
+                nhat_ky::ghi("huy_bo_qua", &format!("so={} id={} — yeu cau da bi xoa (luu cau hinh)", m.so_hoa_don, m.id));
+                continue;
+            }
             let (su_kien_yc, su_kien_kq) = match loai {
                 hang_doi::LoaiViec::Huy => ("huy_yeu_cau", "huy_ket_qua"),
                 hang_doi::LoaiViec::BoTheoDoi => ("bo_theo_doi_yeu_cau", "bo_theo_doi"),
@@ -1215,7 +1241,8 @@ pub fn khoi_chay_yeu_cau_hang_doi(
                 &dg,
                 loai,
                 &m.id,
-                &mut |lan| khoa(&tt).hang_doi.bao_lan(&m.id, lan),
+                &mut |lan, da_gui| khoa(&tt).hang_doi.bao_lan(&m.id, lan, da_gui),
+                &|| khoa(&tt).hang_doi.con_dang(&m.id),
                 &mut |d| std::thread::sleep(d),
                 &Instant::now,
             );
@@ -1422,7 +1449,7 @@ fn chay_net(
                 }
                 // Kết nối MỚI: quên hoTro của kết nối trước (§2); mọi event sau
                 // đây đi qua socket này (R4).
-                let cong: Arc<dyn CongGui> = Arc::new(CongSocket(Mutex::new(socket.clone())));
+                let cong: Arc<dyn CongGui> = Arc::new(CongSocket::moi(socket.clone()));
                 th.store(dg.mo_ket_noi(cong, Instant::now()), Ordering::SeqCst);
                 nhat_ky::ghi("ket_noi", &format!("server={}", c.server_url));
                 // Backend cũ bỏ qua event lạ — gửi không cần hoTro (§2).
@@ -1479,7 +1506,12 @@ fn chay_net(
                     return;
                 }
                 let anh = bao_cao::doc_hang_doi(&payload_dau(payload));
-                let doi = khoa(&tt).hang_doi.nhan_anh(anh, Instant::now());
+                let doi = {
+                    let mut t = khoa(&tt);
+                    let doi = t.hang_doi.nhan_anh(anh, Instant::now());
+                    t.dong_bo_dai_voi_hang_doi();
+                    doi
+                };
                 if let Some(tom_tat) = doi {
                     nhat_ky::ghi("hang_doi", &tom_tat);
                 }
@@ -2418,14 +2450,15 @@ mod tests {
         {
             let k = khoi(&khoa(&tt));
             assert_eq!(k.tieu_de, "HÀNG ĐỢI (3) · 1 chưa xác nhận");
-            assert!(k.dai_tam_giu.starts_with("2 hoá đơn đang chờ"));
+            assert!(k.dai_tam_giu.starts_with("2 hoá đơn đang được giữ lại"), "{}", k.dai_tam_giu);
         }
 
         // 2. Huỷ a1 qua đúng đường giao diện: bấm → xác nhận → luồng gửi yêu cầu.
         let m = {
             let mut t = khoa(&tt);
-            assert!(t.hang_doi.bam_huy("a1", true));
-            t.hang_doi.bat_dau("a1", LoaiViec::Huy, true).expect("xác nhận")
+            let t0 = Instant::now();
+            assert!(t.hang_doi.bam_huy("a1", true, t0));
+            t.hang_doi.bat_dau("a1", LoaiViec::Huy, true, t0 + hang_doi::CHONG_BAM_DUP).expect("xác nhận")
         };
         khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, vec![m]);
         cho("Đã huỷ a1", &|t| khoi(t).dong.iter().any(|d| d.id == "a1" && d.che_do == hang_doi::CheDo::DaHuy));
@@ -2433,16 +2466,17 @@ mod tests {
         assert_eq!(khoa(&tt).jobs[0].trang_thai, job::DA_HUY, "In gần đây ghi Đã huỷ");
 
         // 3. Huỷ lệnh đang gửi: giao diện không cho; hỏi thẳng server → KHÔNG huỷ được (DANG_IN).
-        assert!(!khoa(&tt).hang_doi.clone().bam_huy("d1", true));
-        let kc = hang_doi::gui_yeu_cau(&dg, LoaiViec::Huy, "d1", &mut |_| {}, &mut |d| std::thread::sleep(d), &Instant::now);
+        assert!(!khoa(&tt).hang_doi.clone().bam_huy("d1", true, Instant::now()));
+        let kc = hang_doi::gui_yeu_cau(&dg, LoaiViec::Huy, "d1", &mut |_, _| {}, &|| true, &mut |d| std::thread::sleep(d), &Instant::now);
         assert!(matches!(&kc, KetCuc::KhongDuoc { loi, .. } if loi == "DANG_IN"), "{kc:?}");
 
         // 4. Bỏ theo dõi k1 (chưa xác nhận): Vì sao? → Bỏ khỏi hàng đợi → xác nhận.
         let m = {
             let mut t = khoa(&tt);
+            let t0 = Instant::now();
             assert!(t.hang_doi.bam_vi_sao("k1"));
-            assert!(t.hang_doi.bam_bo("k1", true));
-            t.hang_doi.bat_dau("k1", LoaiViec::BoTheoDoi, true).expect("xác nhận bỏ")
+            assert!(t.hang_doi.bam_bo("k1", true, t0));
+            t.hang_doi.bat_dau("k1", LoaiViec::BoTheoDoi, true, t0 + hang_doi::CHONG_BAM_DUP).expect("xác nhận bỏ")
         };
         khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::BoTheoDoi, vec![m]);
         cho("Đã bỏ k1", &|t| khoi(t).dong.iter().any(|d| d.id == "k1" && d.che_do == hang_doi::CheDo::DaBo));
@@ -2452,8 +2486,9 @@ mod tests {
         let ds = {
             let mut t = khoa(&tt);
             // a2 là lệnh tạm giữ duy nhất còn lại.
-            assert!(t.hang_doi.bam_huy_ca(true));
-            t.hang_doi.bat_dau_loat(true)
+            let t0 = Instant::now();
+            assert!(t.hang_doi.bam_huy_ca(true, t0));
+            t.hang_doi.bat_dau_loat(true, t0 + hang_doi::CHONG_BAM_DUP)
         };
         assert_eq!(ds.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a2"]);
         khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, ds);
@@ -2489,11 +2524,11 @@ mod tests {
             .connect()
             .expect("connect");
         let raw = nhan_raw.recv_timeout(Duration::from_secs(5)).expect("open");
-        dg.mo_ket_noi(Arc::new(CongSocket(Mutex::new(raw))), Instant::now());
+        dg.mo_ket_noi(Arc::new(CongSocket::moi(raw)), Instant::now());
         dg.nhan_cau_hinh(HoTro { hang_doi: true, ..HoTro::default() });
         let bat_dau = Instant::now();
         let mut lan_cuoi = 0;
-        let kc = hang_doi::gui_yeu_cau(&dg, LoaiViec::Huy, "im_lang", &mut |n| lan_cuoi = n, &mut |d| std::thread::sleep(d), &Instant::now);
+        let kc = hang_doi::gui_yeu_cau(&dg, LoaiViec::Huy, "im_lang", &mut |n, _| lan_cuoi = n, &|| true, &mut |d| std::thread::sleep(d), &Instant::now);
         eprintln!("kết cục {:?} sau {:?}, {} lần", kc, bat_dau.elapsed(), lan_cuoi);
         assert!(matches!(kc, KetCuc::ChuaRo { .. }), "{kc:?}");
         assert_eq!(lan_cuoi, hang_doi::SO_LAN_GUI_TOI_DA);

@@ -10,12 +10,17 @@
 //! LUẬT CỦA FILE NÀY (v5.1):
 //! - App KHÔNG tự huỷ gì. Huỷ = hỏi server (`yeu-cau-huy`, có ack); server chỉ
 //!   huỷ được hoá đơn còn `cho_in` (chưa rời server) — chắc chắn không in.
-//! - "Đã huỷ" (xanh) CHỈ khi ack `ok:true`. Mọi đường khác nói đúng điều biết
-//!   được: KHÔNG huỷ được (kèm lý do server) / CHƯA huỷ (yêu cầu chưa rời máy)
-//!   / CHƯA RÕ (đã gửi mà không có trả lời).
+//! - "Đã huỷ" (xanh) CHỈ khi ack `ok:true` CÓ `id` ĐÚNG hoá đơn đã hỏi (ack trùng
+//!   id của rust_socketio — xem `net.rs` `CongSocket`). Mọi đường khác nói đúng
+//!   điều biết được: KHÔNG huỷ được (kèm lý do server) / CHƯA huỷ (yêu cầu chưa
+//!   rời máy) / CHƯA RÕ (đã gửi mà không có trả lời).
 //! - "Bỏ khỏi hàng đợi" (`bo_qua`) không bao giờ hiện thành "Đã huỷ".
 //! - Hết giờ chờ ack thì HỎI LẠI (huỷ lặp là an toàn: server trả `da_huy_truoc`)
 //!   — phần lớn "chưa rõ" thành câu trả lời chắc chắn.
+//! - Nút xác nhận KHÔNG ăn cú bấm trong `CHONG_BAM_DUP` sau khi hộp mở: hộp mở
+//!   làm danh sách tự cuộn, "Huỷ lệnh in" rơi đúng chỗ nút "Huỷ" vừa bấm — cú
+//!   bấm thứ hai của một lần bấm đúp sẽ huỷ luôn mà người dùng chưa đọc câu hỏi
+//!   (giám sát 0.2.6, đo trên ảnh chụp).
 //!
 //! Logic THUẦN (không socket, không Slint, thời gian truyền vào) — test được
 //! mọi nhánh; `net.rs` bơm ảnh chụp vào, `ui.rs` gọi các hàm `bam_*`.
@@ -43,6 +48,8 @@ pub const HAN_HOI_LAI: Duration = Duration::from_secs(60);
 pub const SO_LAN_GUI_TOI_DA: u32 = 3;
 /// Nghỉ giữa hai lần hỏi.
 pub const NGHI_HOI_LAI: Duration = Duration::from_secs(3);
+/// Nút xác nhận bỏ qua cú bấm tới sớm hơn chừng này sau khi hộp mở (bấm đúp).
+pub const CHONG_BAM_DUP: Duration = Duration::from_millis(500);
 
 /// Câu giải thích "Vì sao không huỷ được?" — cùng lời với server (§8.2).
 pub const VI_SAO_DANG_IN: &str =
@@ -50,9 +57,20 @@ pub const VI_SAO_DANG_IN: &str =
 pub const VI_SAO_CHUA_XAC_NHAN: &str = "Hoá đơn đã gửi xuống máy in nhưng chưa xác nhận đã in — có thể đang nằm \
      trong bộ nhớ máy in, không huỷ được từ xa. Muốn bỏ hẳn: xoá lệnh trong hàng đợi Windows (nếu còn), tắt máy in \
      10 giây (MỌI hoá đơn trong bộ nhớ máy sẽ mất) → bật lại → kiểm khay → in lại cái cần. Rồi bấm \"Bỏ khỏi hàng đợi\".";
-pub const XAC_NHAN_HUY: &str = "Huỷ lệnh in này? Hoá đơn sẽ KHÔNG được in.";
-pub const XAC_NHAN_BO: &str = "Bỏ khỏi hàng đợi? Việc này KHÔNG chặn việc in — hoá đơn còn trong máy in vẫn sẽ in \
-     ra. Hệ thống chỉ thôi theo dõi.";
+
+/// Câu hỏi xác nhận huỷ — NÊU SỐ HOÁ ĐƠN (bấm nhầm dòng thì đọc là biết).
+pub fn chu_xac_nhan_huy(so_hoa_don: &str) -> String {
+    format!("Huỷ lệnh in {}? Hoá đơn này sẽ KHÔNG được in.", so_hoa_don)
+}
+
+/// Câu hỏi xác nhận bỏ theo dõi.
+pub fn chu_xac_nhan_bo(so_hoa_don: &str) -> String {
+    format!(
+        "Bỏ {} khỏi hàng đợi? Việc này KHÔNG chặn việc in — hoá đơn còn trong máy in vẫn sẽ in ra. \
+         Hệ thống chỉ thôi theo dõi.",
+        so_hoa_don
+    )
+}
 
 /// Việc người dùng yêu cầu trên một hoá đơn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,11 +93,11 @@ impl LoaiViec {
 /// Kết cục một yêu cầu — mỗi nhánh là một điều app BIẾT CHẮC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KetCuc {
-    /// Server ack `ok:true`.
+    /// Server ack `ok:true` cho ĐÚNG id đã hỏi.
     Duoc { cach: String, noi_dung: String },
     /// Server ack `ok:false` — không làm được, kèm lý do.
     KhongDuoc { loi: String, noi_dung: String },
-    /// Không lần nào rời máy (mất kết nối suốt) — CHẮC CHẮN chưa làm.
+    /// Không lần nào rời máy (mất kết nối / server chưa hỗ trợ) — CHẮC CHẮN chưa làm.
     ChuaGui { ly_do: String },
     /// Đã gửi mà không có câu trả lời đọc được — server CÓ THỂ đã làm.
     ChuaRo { ly_do: String },
@@ -102,20 +120,28 @@ impl KetCuc {
 /// Trạng thái thao tác của MỘT hoá đơn trên giao diện.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ThaoTac {
-    XacNhanHuy,
-    XacNhanBo,
+    /// `luc` = lúc hộp mở (chống bấm đúp).
+    XacNhanHuy { luc: Instant },
+    XacNhanBo { luc: Instant },
     ViSao,
-    Dang { loai: LoaiViec, lan: u32 },
+    /// `lan` = lần hỏi thứ mấy; `da_gui` = số lần yêu cầu đã THỰC SỰ rời máy.
+    Dang { loai: LoaiViec, lan: u32, da_gui: u32 },
     Xong { loai: LoaiViec, luc: Instant, noi_dung: String },
     /// Không làm được / chưa gửi được — đỏ, giữ tới khi bấm ×.
     ThatBai { loai: LoaiViec, noi_dung: String },
-    /// Đã gửi mà không có trả lời — vàng, giữ tới khi bấm ×.
-    ChuaRo { loai: LoaiViec, noi_dung: String },
+    /// Đã gửi mà không có trả lời — vàng, giữ tới khi bấm ×. Câu chữ dựng lúc vẽ
+    /// theo việc hoá đơn CÒN hay ĐÃ RỜI hàng đợi.
+    ChuaRo { loai: LoaiViec },
 }
 
 impl ThaoTac {
     fn la_hop_thoai(&self) -> bool {
-        matches!(self, ThaoTac::XacNhanHuy | ThaoTac::XacNhanBo | ThaoTac::ViSao)
+        matches!(self, ThaoTac::XacNhanHuy { .. } | ThaoTac::XacNhanBo { .. } | ThaoTac::ViSao)
+    }
+
+    /// Việc đang chạy / kết quả vừa xong — không mở hộp đè lên.
+    fn dang_ban(&self) -> bool {
+        matches!(self, ThaoTac::Dang { .. } | ThaoTac::Xong { .. })
     }
 }
 
@@ -132,9 +158,11 @@ struct MucThaoTac {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Loat {
     /// Đang hỏi xác nhận — danh sách chốt LÚC MỞ hộp xác nhận (mục mới tới sau
-    /// không bị huỷ theo).
-    XacNhan { ids: Vec<String> },
-    Dang { tong: usize, xong: usize, duoc: usize },
+    /// không bị huỷ theo). `luc` = lúc mở (chống bấm đúp).
+    XacNhan { ids: Vec<String>, luc: Instant },
+    /// CHỈ đếm kết quả của `ids` — một lệnh huỷ lẻ chạy song song không được
+    /// làm tổng kết nói "đã huỷ hết" (giám sát 0.2.6).
+    Dang { ids: Vec<String>, xong: usize, duoc: usize },
     Xong { tong: usize, duoc: usize, luc: Instant },
 }
 
@@ -203,6 +231,8 @@ pub struct DongHangDoi {
     pub thong_diep: String,
     /// Trong "Vì sao?": có nút "Bỏ khỏi hàng đợi".
     pub co_nut_bo: bool,
+    /// Dòng báo lỗi / chưa rõ của lệnh HUỶ mà hoá đơn VẪN còn chờ huỷ được: nút "Huỷ lại".
+    pub co_nut_huy_lai: bool,
 }
 
 /// Khối "HÀNG ĐỢI" dựng cho giao diện.
@@ -210,7 +240,7 @@ pub struct DongHangDoi {
 pub struct KhoiHangDoi {
     pub hien: bool,
     pub tieu_de: String,
-    /// "(có thể chưa cập nhật — app đang mất kết nối)" …
+    /// "có thể chưa cập nhật — app đang mất kết nối" …
     pub ghi_chu: String,
     /// Dải cam khi có lệnh tạm giữ (rỗng = không có).
     pub dai_tam_giu: String,
@@ -263,9 +293,9 @@ fn vi_sao(muc: &MucHangDoi) -> &'static str {
     }
 }
 
-/// Việc NV cần làm với máy để lệnh tạm giữ tự in: (câu hoa đầu, vế thường).
-fn viec_cho_may(ma: Option<MaSuCo>) -> (String, &'static str, &'static str) {
-    match ma {
+/// Câu dải cam (hợp đồng §8.10). `ma_may_in` = trạng thái máy in app đọc gần nhất.
+pub fn chu_dai_tam_giu(so: usize, ma_may_in: Option<MaSuCo>) -> String {
+    let (ly_do, viec, viec_thuong): (String, &str, &str) = match ma_may_in {
         Some(MaSuCo::HetGiay) => ("máy in Hết giấy".into(), "Nạp giấy", "nạp giấy"),
         Some(MaSuCo::KetGiay) => ("máy in Kẹt giấy".into(), "Gỡ giấy kẹt", "gỡ giấy kẹt"),
         Some(MaSuCo::MoNap) => ("nắp máy in đang mở".into(), "Đóng nắp", "đóng nắp"),
@@ -274,20 +304,22 @@ fn viec_cho_may(ma: Option<MaSuCo>) -> (String, &'static str, &'static str) {
             ("không tìm thấy máy in trong Windows".into(), "Chọn lại máy in trong app", "chọn lại máy in")
         }
         Some(m) if m.chan_in() => (format!("máy in báo: {}", m.nhan()), "Xử lý xong máy in", "xử lý máy in"),
-        // Máy đã về bình thường mà server còn giữ: cầu dao sắp đóng.
-        _ => ("máy in vừa hết lỗi".into(), "Hệ thống sắp", "máy in in tiếp"),
-    }
-}
-
-/// Câu dải cam (hợp đồng §8.10).
-pub fn chu_dai_tam_giu(so: usize, ma_may_in: Option<MaSuCo>) -> String {
-    let (ly_do, viec, viec_thuong) = viec_cho_may(ma_may_in);
-    if viec == "Hệ thống sắp" {
-        return format!(
-            "{} hoá đơn đang chờ — {}, hệ thống sắp tự in. Hoá đơn nào không cần nữa: bấm Huỷ NGAY.",
-            so, ly_do
-        );
-    }
+        // Máy vừa báo bình thường mà server còn giữ: cầu dao sắp đóng.
+        Some(MaSuCo::BinhThuong) => {
+            return format!(
+                "{} hoá đơn đang chờ — máy in vừa hết lỗi, hệ thống sắp tự in. Hoá đơn nào không cần nữa: bấm Huỷ NGAY.",
+                so
+            )
+        }
+        // App chưa đọc được máy in (hoặc chỉ là cảnh báo mực): không đoán lý do.
+        _ => {
+            return format!(
+                "{} hoá đơn đang được giữ lại vì máy in đang lỗi. Xử lý xong máy in là tự in. Hoá đơn nào không \
+                 cần nữa: bấm Huỷ trước.",
+                so
+            )
+        }
+    };
     format!(
         "{} hoá đơn đang chờ — {}. {} là tự in. Hoá đơn nào không cần nữa: bấm Huỷ TRƯỚC khi {}.",
         so, ly_do, viec, viec_thuong
@@ -335,6 +367,17 @@ impl HangDoiApp {
         self.thao_tac.iter().position(|m| m.muc.id == id)
     }
 
+    /// Mục `print_job_id` có trong ảnh chụp TƯƠI (của kết nối này) không. `None`
+    /// = chưa có ảnh tươi — không kết luận được gì.
+    pub fn co_trong_anh(&self, print_job_id: &str) -> Option<bool> {
+        (self.ho_tro && self.cua_ket_noi_nay && self.anh.is_some()).then(|| self.tim_trong_anh(print_job_id).is_some())
+    }
+
+    /// Yêu cầu của `id` vẫn còn chờ gửi (chưa bị Lưu cấu hình / kết nối mới xoá).
+    pub fn con_dang(&self, id: &str) -> bool {
+        self.thao_tac.iter().any(|m| m.muc.id == id && matches!(m.tt, ThaoTac::Dang { .. }))
+    }
+
     /// Ảnh chụp mới từ server. Trả câu tóm tắt khi SỐ LƯỢNG đổi (để ghi nhật ký
     /// — không ghi một dòng mỗi 30 s).
     pub fn nhan_anh(&mut self, anh: HangDoiServer, bay_gio: Instant) -> Option<String> {
@@ -351,8 +394,8 @@ impl HangDoiApp {
             .thao_tac
             .iter()
             .map(|m| match m.tt {
-                ThaoTac::XacNhanHuy => self.tim_trong_anh(&m.muc.id).is_some_and(|(_, x)| huy_duoc(x)),
-                ThaoTac::XacNhanBo => self.tim_trong_anh(&m.muc.id).is_some_and(|(_, x)| la_chua_xac_nhan(x)),
+                ThaoTac::XacNhanHuy { .. } => self.tim_trong_anh(&m.muc.id).is_some_and(|(_, x)| huy_duoc(x)),
+                ThaoTac::XacNhanBo { .. } => self.tim_trong_anh(&m.muc.id).is_some_and(|(_, x)| la_chua_xac_nhan(x)),
                 ThaoTac::ViSao => self.tim_trong_anh(&m.muc.id).is_some_and(|(_, x)| !huy_duoc(x)),
                 _ => true,
             })
@@ -362,7 +405,7 @@ impl HangDoiApp {
             i += 1;
             con_ap_dung[i - 1]
         });
-        if let Some(Loat::XacNhan { ids }) = &mut self.loat {
+        if let Some(Loat::XacNhan { ids, .. }) = &mut self.loat {
             let anh = self.anh.as_ref().expect("vừa gán");
             ids.retain(|id| anh.cho_in.iter().any(|m| &m.id == id && huy_duoc(m)));
             if ids.is_empty() {
@@ -378,23 +421,25 @@ impl HangDoiApp {
 
     fn mo(&mut self, id: &str, tt: ThaoTac) -> bool {
         let Some((vi_tri, muc)) = self.tim_trong_anh(id).map(|(i, m)| (i, m.clone())) else { return false };
-        // Chỉ MỘT hộp thoại mở một lúc; dòng đang có việc / kết quả thì không mở đè.
+        // Chỉ MỘT hộp thoại mở một lúc; dòng đang có việc / kết quả vừa xong thì
+        // không mở đè. Dòng báo lỗi / chưa rõ thì ĐƯỢC mở lại ("Huỷ lại").
         if let Some(i) = self.vi_tri_thao_tac(id) {
-            if !self.thao_tac[i].tt.la_hop_thoai() {
+            if self.thao_tac[i].tt.dang_ban() {
                 return false;
             }
+            self.thao_tac.remove(i);
         }
         self.dong_hop_thoai();
         self.thao_tac.push(MucThaoTac { muc, vi_tri, tt });
         true
     }
 
-    /// Bấm "Huỷ" trên dòng → hỏi xác nhận tại chỗ.
-    pub fn bam_huy(&mut self, id: &str, da_noi: bool) -> bool {
+    /// Bấm "Huỷ" (hoặc "Huỷ lại") trên dòng → hỏi xác nhận tại chỗ.
+    pub fn bam_huy(&mut self, id: &str, da_noi: bool, bay_gio: Instant) -> bool {
         if !self.co_the_bam(da_noi) || !self.tim_trong_anh(id).is_some_and(|(_, m)| huy_duoc(m)) {
             return false;
         }
-        self.mo(id, ThaoTac::XacNhanHuy)
+        self.mo(id, ThaoTac::XacNhanHuy { luc: bay_gio })
     }
 
     /// Bấm "Vì sao?" (lệnh không huỷ được) → mở giải thích. Xem được cả khi mất kết nối.
@@ -406,44 +451,43 @@ impl HangDoiApp {
     }
 
     /// Bấm "Bỏ khỏi hàng đợi" trong phần giải thích → hỏi xác nhận.
-    pub fn bam_bo(&mut self, id: &str, da_noi: bool) -> bool {
+    pub fn bam_bo(&mut self, id: &str, da_noi: bool, bay_gio: Instant) -> bool {
         if !self.co_the_bam(da_noi) || !self.tim_trong_anh(id).is_some_and(|(_, m)| la_chua_xac_nhan(m)) {
             return false;
         }
-        self.mo(id, ThaoTac::XacNhanBo)
+        self.mo(id, ThaoTac::XacNhanBo { luc: bay_gio })
     }
 
     /// "Giữ lại" / "Đóng" (hộp thoại) hoặc "×" (kết quả lỗi / chưa rõ).
     pub fn dong(&mut self, id: &str) {
-        self.thao_tac.retain(|m| {
-            m.muc.id != id || matches!(m.tt, ThaoTac::Dang { .. } | ThaoTac::Xong { .. })
-        });
+        self.thao_tac.retain(|m| m.muc.id != id || m.tt.dang_ban());
     }
 
     /// Bấm nút xác nhận ("Huỷ lệnh in" / "Bỏ khỏi hàng đợi") → chuyển "Đang…".
-    /// Trả mục để luồng gửi yêu cầu; `None` = không hợp lệ (bấm đôi, hộp đã
-    /// đóng, mất kết nối) — KHÔNG gửi gì.
-    pub fn bat_dau(&mut self, id: &str, loai: LoaiViec, da_noi: bool) -> Option<MucHangDoi> {
+    /// Trả mục để luồng gửi yêu cầu; `None` = không hợp lệ (bấm đúp, hộp vừa mở
+    /// chưa đủ `CHONG_BAM_DUP`, hộp đã đóng, mất kết nối) — KHÔNG gửi gì.
+    pub fn bat_dau(&mut self, id: &str, loai: LoaiViec, da_noi: bool, bay_gio: Instant) -> Option<MucHangDoi> {
         if !self.co_the_bam(da_noi) {
             return None;
         }
         let i = self.vi_tri_thao_tac(id)?;
-        let dung_hop = match loai {
-            LoaiViec::Huy => ThaoTac::XacNhanHuy,
-            LoaiViec::BoTheoDoi => ThaoTac::XacNhanBo,
+        let luc_mo = match (loai, &self.thao_tac[i].tt) {
+            (LoaiViec::Huy, ThaoTac::XacNhanHuy { luc }) | (LoaiViec::BoTheoDoi, ThaoTac::XacNhanBo { luc }) => *luc,
+            _ => return None,
         };
-        if self.thao_tac[i].tt != dung_hop {
+        if bay_gio.saturating_duration_since(luc_mo) < CHONG_BAM_DUP {
             return None;
         }
-        self.thao_tac[i].tt = ThaoTac::Dang { loai, lan: 1 };
+        self.thao_tac[i].tt = ThaoTac::Dang { loai, lan: 1, da_gui: 0 };
         Some(self.thao_tac[i].muc.clone())
     }
 
-    /// Luồng gửi báo đang ở lần hỏi thứ `lan`.
-    pub fn bao_lan(&mut self, id: &str, lan: u32) {
+    /// Luồng gửi báo đang ở lần hỏi thứ `lan`, đã có `da_gui` lần rời máy.
+    pub fn bao_lan(&mut self, id: &str, lan: u32, da_gui: u32) {
         if let Some(m) = self.thao_tac.iter_mut().find(|m| m.muc.id == id) {
-            if let ThaoTac::Dang { lan: l, .. } = &mut m.tt {
+            if let ThaoTac::Dang { lan: l, da_gui: g, .. } = &mut m.tt {
                 *l = lan;
+                *g = da_gui;
             }
         }
     }
@@ -451,6 +495,9 @@ impl HangDoiApp {
     /// Kết cục của một yêu cầu. Mục không còn (đã Lưu cấu hình khác) → bỏ qua.
     pub fn ket_thuc(&mut self, id: &str, loai: LoaiViec, kc: &KetCuc, bay_gio: Instant) {
         let Some(m) = self.thao_tac.iter_mut().find(|m| m.muc.id == id) else { return };
+        if !matches!(m.tt, ThaoTac::Dang { .. }) {
+            return;
+        }
         m.tt = match (loai, kc) {
             (LoaiViec::Huy, KetCuc::Duoc { noi_dung, .. }) => ThaoTac::Xong {
                 loai,
@@ -472,42 +519,35 @@ impl HangDoiApp {
                 loai,
                 noi_dung: format!("Không bỏ được: {}", if noi_dung.is_empty() { "server từ chối" } else { noi_dung }),
             },
-            (LoaiViec::Huy, KetCuc::ChuaGui { .. }) => ThaoTac::ThatBai {
-                loai,
-                noi_dung: "CHƯA huỷ — không gửi được yêu cầu (app mất kết nối với ZaloCRM). Nối lại rồi bấm Huỷ lần nữa."
-                    .into(),
-            },
-            (LoaiViec::BoTheoDoi, KetCuc::ChuaGui { .. }) => ThaoTac::ThatBai {
-                loai,
-                noi_dung: "CHƯA bỏ — không gửi được yêu cầu (app mất kết nối với ZaloCRM).".into(),
-            },
-            (LoaiViec::Huy, KetCuc::ChuaRo { .. }) => ThaoTac::ChuaRo {
-                loai,
-                noi_dung: "Chưa rõ đã huỷ được chưa — ZaloCRM không trả lời. Hoá đơn còn trong hàng đợi là CHƯA huỷ; \
-                           xem Nhật ký in trên ZaloCRM."
-                    .into(),
-            },
-            (LoaiViec::BoTheoDoi, KetCuc::ChuaRo { .. }) => ThaoTac::ChuaRo {
-                loai,
-                noi_dung: "Chưa rõ đã bỏ được chưa — ZaloCRM không trả lời.".into(),
-            },
+            (_, KetCuc::ChuaGui { ly_do }) => {
+                let viec = if loai == LoaiViec::Huy { "huỷ" } else { "bỏ" };
+                let vi_sao = if ly_do.contains("ho tro") {
+                    "server ZaloCRM chưa hỗ trợ việc này từ app — làm trên trang ZaloCRM › Máy in".to_string()
+                } else {
+                    format!("không gửi được yêu cầu (app mất kết nối với ZaloCRM). Nối lại rồi bấm {} lại", viec)
+                };
+                ThaoTac::ThatBai { loai, noi_dung: format!("CHƯA {} — {}.", viec, vi_sao) }
+            }
+            (_, KetCuc::ChuaRo { .. }) => ThaoTac::ChuaRo { loai },
         };
-        // Tiến độ "Huỷ cả N".
+        // Tiến độ "Huỷ cả N" — CHỈ id của loạt.
         if loai == LoaiViec::Huy {
-            if let Some(Loat::Dang { tong, xong, duoc }) = &mut self.loat {
-                *xong += 1;
-                if matches!(kc, KetCuc::Duoc { .. }) {
-                    *duoc += 1;
-                }
-                if *xong >= *tong {
-                    self.loat = Some(Loat::Xong { tong: *tong, duoc: *duoc, luc: bay_gio });
+            if let Some(Loat::Dang { ids, xong, duoc }) = &mut self.loat {
+                if ids.iter().any(|x| x == id) {
+                    *xong += 1;
+                    if matches!(kc, KetCuc::Duoc { .. }) {
+                        *duoc += 1;
+                    }
+                    if *xong >= ids.len() {
+                        self.loat = Some(Loat::Xong { tong: ids.len(), duoc: *duoc, luc: bay_gio });
+                    }
                 }
             }
         }
     }
 
     /// Bấm "Huỷ cả N" trên dải cam → hỏi xác nhận; chốt danh sách NGAY LÚC NÀY.
-    pub fn bam_huy_ca(&mut self, da_noi: bool) -> bool {
+    pub fn bam_huy_ca(&mut self, da_noi: bool, bay_gio: Instant) -> bool {
         if !self.co_the_bam(da_noi) || matches!(self.loat, Some(Loat::Dang { .. })) {
             return false;
         }
@@ -516,22 +556,22 @@ impl HangDoiApp {
             return false;
         }
         self.dong_hop_thoai();
-        self.loat = Some(Loat::XacNhan { ids });
+        self.loat = Some(Loat::XacNhan { ids, luc: bay_gio });
         true
     }
 
-    /// Mục tạm giữ huỷ được và chưa có việc gì đang chạy / kết quả đang hiện.
+    /// Mục tạm giữ huỷ được và chưa có việc gì đang chạy / kết quả vừa xong.
     fn ids_huy_ca(&self) -> Vec<String> {
         let Some(anh) = &self.anh else { return Vec::new() };
         anh.cho_in
             .iter()
             .filter(|m| m.tam_giu && huy_duoc(m))
-            .filter(|m| self.vi_tri_thao_tac(&m.id).is_none_or(|i| self.thao_tac[i].tt.la_hop_thoai()))
+            .filter(|m| self.vi_tri_thao_tac(&m.id).is_none_or(|i| !self.thao_tac[i].tt.dang_ban()))
             .map(|m| m.id.clone())
             .collect()
     }
 
-    /// "Giữ lại" / "×" trên dải.
+    /// "Giữ lại" / "Đóng" trên dải.
     pub fn dong_loat(&mut self) {
         if !matches!(self.loat, Some(Loat::Dang { .. })) {
             self.loat = None;
@@ -540,22 +580,36 @@ impl HangDoiApp {
 
     /// Bấm "Huỷ N lệnh in" (xác nhận loạt) → mọi dòng thành "Đang huỷ…". Trả các
     /// mục để một luồng gửi TUẦN TỰ.
-    pub fn bat_dau_loat(&mut self, da_noi: bool) -> Vec<MucHangDoi> {
+    pub fn bat_dau_loat(&mut self, da_noi: bool, bay_gio: Instant) -> Vec<MucHangDoi> {
         if !self.co_the_bam(da_noi) {
             return Vec::new();
         }
-        let Some(Loat::XacNhan { ids }) = self.loat.clone() else { return Vec::new() };
+        let Some(Loat::XacNhan { ids, luc }) = self.loat.clone() else { return Vec::new() };
+        if bay_gio.saturating_duration_since(luc) < CHONG_BAM_DUP {
+            return Vec::new();
+        }
         self.dong_hop_thoai();
         let mut ra = Vec::new();
         for id in ids {
             let Some((vi_tri, muc)) = self.tim_trong_anh(&id).map(|(i, m)| (i, m.clone())) else { continue };
-            if !huy_duoc(&muc) || self.vi_tri_thao_tac(&id).is_some() {
+            if !huy_duoc(&muc) {
                 continue;
             }
-            self.thao_tac.push(MucThaoTac { muc: muc.clone(), vi_tri, tt: ThaoTac::Dang { loai: LoaiViec::Huy, lan: 1 } });
+            match self.vi_tri_thao_tac(&id) {
+                Some(i) if self.thao_tac[i].tt.dang_ban() => continue,
+                Some(i) => {
+                    self.thao_tac.remove(i);
+                }
+                None => {}
+            }
+            self.thao_tac.push(MucThaoTac {
+                muc: muc.clone(),
+                vi_tri,
+                tt: ThaoTac::Dang { loai: LoaiViec::Huy, lan: 1, da_gui: 0 },
+            });
             ra.push(muc);
         }
-        self.loat = (!ra.is_empty()).then_some(Loat::Dang { tong: ra.len(), xong: 0, duoc: 0 });
+        self.loat = (!ra.is_empty()).then(|| Loat::Dang { ids: ra.iter().map(|m| m.id.clone()).collect(), xong: 0, duoc: 0 });
         ra
     }
 
@@ -581,7 +635,7 @@ impl HangDoiApp {
         let Some(anh) = self.anh.as_ref().filter(|_| self.ho_tro) else { return KhoiHangDoi::default() };
         let bat = self.co_the_bam(da_noi);
         let mut dong: Vec<DongHangDoi> = Vec::new();
-        let dong_cua = |muc: &MucHangDoi, tt: Option<&ThaoTac>| -> DongHangDoi {
+        let dong_cua = |muc: &MucHangDoi, tt: Option<&ThaoTac>, con_trong_anh: bool| -> DongHangDoi {
             let tieu_de = match &muc.ten_khach {
                 Some(k) => format!("{} · {}", muc.so_hoa_don, k),
                 None => muc.so_hoa_don.clone(),
@@ -590,24 +644,46 @@ impl HangDoiApp {
             let (che_do, thong_diep) = match tt {
                 None => (CheDo::BinhThuong, String::new()),
                 // Hộp xác nhận khi mất kết nối: về bình thường (nút đã khoá).
-                Some(ThaoTac::XacNhanHuy) if bat => (CheDo::XacNhanHuy, XAC_NHAN_HUY.to_string()),
-                Some(ThaoTac::XacNhanBo) if bat => (CheDo::XacNhanBo, XAC_NHAN_BO.to_string()),
-                Some(ThaoTac::XacNhanHuy | ThaoTac::XacNhanBo) => (CheDo::BinhThuong, String::new()),
+                Some(ThaoTac::XacNhanHuy { .. }) if bat => (CheDo::XacNhanHuy, chu_xac_nhan_huy(&muc.so_hoa_don)),
+                Some(ThaoTac::XacNhanBo { .. }) if bat => (CheDo::XacNhanBo, chu_xac_nhan_bo(&muc.so_hoa_don)),
+                Some(ThaoTac::XacNhanHuy { .. } | ThaoTac::XacNhanBo { .. }) => (CheDo::BinhThuong, String::new()),
                 Some(ThaoTac::ViSao) => (CheDo::ViSao, vi_sao(muc).to_string()),
-                Some(ThaoTac::Dang { loai, lan }) => {
+                Some(ThaoTac::Dang { loai, lan, da_gui }) => {
                     let chu = if *loai == LoaiViec::Huy { "Đang huỷ…" } else { "Đang bỏ khỏi hàng đợi…" };
-                    let chu = if *lan > 1 {
-                        format!("{} (chưa có trả lời — hỏi lại lần {})", chu, lan)
-                    } else {
+                    let chu = if *lan <= 1 {
                         chu.to_string()
+                    } else if *da_gui == 0 {
+                        format!("{} (chờ nối lại ZaloCRM để gửi yêu cầu)", chu)
+                    } else {
+                        format!("{} (ZaloCRM chưa trả lời — hỏi lại, lần {}/{})", chu, da_gui + 1, SO_LAN_GUI_TOI_DA)
                     };
                     (CheDo::Dang, chu)
                 }
                 Some(ThaoTac::Xong { loai: LoaiViec::Huy, noi_dung, .. }) => (CheDo::DaHuy, noi_dung.clone()),
                 Some(ThaoTac::Xong { noi_dung, .. }) => (CheDo::DaBo, noi_dung.clone()),
                 Some(ThaoTac::ThatBai { noi_dung, .. }) => (CheDo::ThatBai, noi_dung.clone()),
-                Some(ThaoTac::ChuaRo { noi_dung, .. }) => (CheDo::ChuaRo, noi_dung.clone()),
+                // Chưa rõ: nói đúng điều ảnh chụp mới nhất cho biết về hoá đơn.
+                Some(ThaoTac::ChuaRo { loai }) => {
+                    let viec = if *loai == LoaiViec::Huy { "huỷ" } else { "bỏ" };
+                    let chu = if con_trong_anh && *loai == LoaiViec::Huy && huy_duoc(muc) {
+                        "Chưa rõ đã huỷ được chưa — ZaloCRM không trả lời. Hoá đơn VẪN đang chờ trong hàng đợi: \
+                         bấm \"Huỷ lại\" để hỏi lại."
+                            .to_string()
+                    } else if con_trong_anh {
+                        format!("Chưa rõ đã {} được chưa — ZaloCRM không trả lời. Hoá đơn vẫn còn trong hàng đợi.", viec)
+                    } else {
+                        format!(
+                            "Chưa rõ đã {} được chưa — ZaloCRM không trả lời, và hoá đơn đã rời hàng đợi (đã huỷ hoặc \
+                             đã gửi in). Xem Nhật ký in trên ZaloCRM.",
+                            viec
+                        )
+                    };
+                    (CheDo::ChuaRo, chu)
+                }
             };
+            let co_nut_huy_lai = con_trong_anh
+                && huy_duoc(muc)
+                && matches!(tt, Some(ThaoTac::ThatBai { loai: LoaiViec::Huy, .. } | ThaoTac::ChuaRo { loai: LoaiViec::Huy }));
             DongHangDoi {
                 id: muc.id.clone(),
                 tieu_de,
@@ -619,11 +695,12 @@ impl HangDoiApp {
                 bat_nut: bat,
                 thong_diep,
                 co_nut_bo: che_do == CheDo::ViSao && la_chua_xac_nhan(muc),
+                co_nut_huy_lai,
             }
         };
         let tt_cua = |id: &str| self.thao_tac.iter().find(|m| m.muc.id == id).map(|m| &m.tt);
         for muc in anh.cho_in.iter().chain(anh.chua_xac_nhan.iter()) {
-            dong.push(dong_cua(muc, tt_cua(&muc.id)));
+            dong.push(dong_cua(muc, tt_cua(&muc.id), true));
         }
         // Mục đã rời ảnh chụp nhưng còn kết quả / việc đang chạy: hiện bản sao ở
         // ĐÚNG chỗ cũ (hộp thoại của mục đã rời thì thôi).
@@ -634,7 +711,7 @@ impl HangDoiApp {
             .collect();
         con_lai.sort_by_key(|m| m.vi_tri);
         for m in con_lai {
-            let d = dong_cua(&m.muc, Some(&m.tt));
+            let d = dong_cua(&m.muc, Some(&m.tt), false);
             dong.insert(m.vi_tri.min(dong.len()), d);
         }
 
@@ -658,17 +735,17 @@ impl HangDoiApp {
         };
         let so_huy_ca = if bat { self.ids_huy_ca().len() } else { 0 };
         let loat_nut = match &self.loat {
-            Some(Loat::XacNhan { ids }) => format!("Huỷ {} lệnh in", ids.len()),
+            Some(Loat::XacNhan { ids, .. }) => format!("Huỷ {} lệnh in", ids.len()),
             _ => String::new(),
         };
         let (loat_che_do, loat_chu) = match &self.loat {
             None => (0, String::new()),
-            Some(Loat::XacNhan { ids }) if bat => (
+            Some(Loat::XacNhan { ids, .. }) if bat => (
                 1,
                 format!("Huỷ cả {} lệnh in đang tạm giữ? Các hoá đơn này sẽ KHÔNG được in.", ids.len()),
             ),
             Some(Loat::XacNhan { .. }) => (0, String::new()),
-            Some(Loat::Dang { tong, xong, .. }) => (2, format!("Đang huỷ {}/{} lệnh in…", xong, tong)),
+            Some(Loat::Dang { ids, xong, .. }) => (2, format!("Đang huỷ {}/{} lệnh in…", xong, ids.len())),
             Some(Loat::Xong { tong, duoc, .. }) if duoc == tong => (3, format!("Đã huỷ {}/{} lệnh in", duoc, tong)),
             Some(Loat::Xong { tong, duoc, .. }) => (
                 4,
@@ -698,29 +775,35 @@ impl HangDoiApp {
 /// theo dõi lặp lại là AN TOÀN (server: `da_huy_truoc` / điều kiện `khong_ro`)
 /// nên hết giờ chờ ack thì hỏi lại thay vì bỏ ngang ở "chưa rõ".
 ///
-/// `bao_lan(n)`: báo giao diện lần hỏi thứ n. `ngu`/`bay_gio` tiêm vào cho test.
+/// Ack chỉ được tin khi `id` của nó ĐÚNG `id` đã hỏi — ack trùng id của
+/// rust_socketio (net.rs `CongSocket`) coi như không đọc được, hỏi lại.
+///
+/// `bao_lan(lần, số lần đã rời máy)`: báo giao diện. `con_tiep()`: `false` = người
+/// dùng đã Lưu cấu hình khác / yêu cầu bị xoá — thôi, không gửi thêm.
+/// `ngu`/`bay_gio` tiêm vào cho test.
 pub fn gui_yeu_cau(
     dg: &DuongGui,
     loai: LoaiViec,
     id: &str,
-    bao_lan: &mut dyn FnMut(u32),
+    bao_lan: &mut dyn FnMut(u32, u32),
+    con_tiep: &dyn Fn() -> bool,
     ngu: &mut dyn FnMut(Duration),
     bay_gio: &dyn Fn() -> Instant,
 ) -> KetCuc {
     let han = bay_gio() + HAN_HOI_LAI;
     let mut lan = 0_u32;
     let mut da_gui = 0_u32;
-    let mut ly_do: String;
-    loop {
+    let mut ly_do = String::from("da thoi yeu cau");
+    while con_tiep() {
         lan += 1;
-        bao_lan(lan);
+        bao_lan(lan, da_gui);
         match dg.gui_ack_ro(loai.su_kien(), serde_json::json!({ "printJobId": id }), CanHoTro::HangDoi, CHO_ACK) {
             Ok(v) => match bao_cao::doc_ket_qua_huy(&v) {
-                Some(kq) if kq.ok => return KetCuc::Duoc { cach: kq.cach, noi_dung: kq.noi_dung },
-                Some(kq) => return KetCuc::KhongDuoc { loi: kq.loi, noi_dung: kq.noi_dung },
-                None => {
+                Some(kq) if kq.id == id && kq.ok => return KetCuc::Duoc { cach: kq.cach, noi_dung: kq.noi_dung },
+                Some(kq) if kq.id == id => return KetCuc::KhongDuoc { loi: kq.loi, noi_dung: kq.noi_dung },
+                _ => {
                     da_gui += 1;
-                    ly_do = "tra loi khong doc duoc".into();
+                    ly_do = "tra loi khong dung hoa don".into();
                 }
             },
             Err(LoiGuiAck::ChuaGui(e)) => ly_do = e,
@@ -783,6 +866,21 @@ mod tests {
         khoi(h, true, t).dong.into_iter().map(|d| (d.id, d.che_do)).collect()
     }
 
+    /// Sau khi hộp mở đủ lâu (vượt chống bấm đúp).
+    fn sau(t: Instant) -> Instant {
+        t + CHONG_BAM_DUP
+    }
+
+    /// Huỷ `id` tới "Đang huỷ…" (mở hộp lúc `t`, xác nhận sau chống bấm đúp).
+    fn dang_huy(h: &mut HangDoiApp, id: &str, t: Instant) -> MucHangDoi {
+        assert!(h.bam_huy(id, true, t), "mở hộp {id}");
+        h.bat_dau(id, LoaiViec::Huy, true, sau(t)).expect("xác nhận")
+    }
+
+    fn duoc() -> KetCuc {
+        KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: String::new() }
+    }
+
     /// Mười hoá đơn tạm giữ lúc hết giấy (ca HCM 25/09): hiện đủ, dải cam nói
     /// đúng việc, mỗi dòng có nút Huỷ.
     #[test]
@@ -804,20 +902,20 @@ mod tests {
         assert_eq!(k.dong[0].trang_thai, "Tạm giữ — chờ máy in hết lỗi", "server không gửi lyDo → câu dự phòng");
     }
 
-    /// Luồng chuẩn: Huỷ → xác nhận → Đang huỷ… → Đã huỷ (5 s) → rời danh sách,
-    /// kể cả khi server đã bỏ mục khỏi ảnh chụp.
+    /// Luồng chuẩn: Huỷ → xác nhận (nêu số hoá đơn) → Đang huỷ… → Đã huỷ (5 s)
+    /// → rời danh sách, kể cả khi server đã bỏ mục khỏi ảnh chụp.
     #[test]
     fn huy_thanh_cong_hien_5_giay_roi_bien_mat() {
         let t = Instant::now();
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true)], vec![]), t);
-        assert!(h.bam_huy("a", true));
+        assert!(h.bam_huy("a", true, t));
         assert_eq!(che_do(&h, t)[0].1, CheDo::XacNhanHuy);
-        assert_eq!(khoi(&h, true, t).dong[0].thong_diep, XAC_NHAN_HUY);
-        let m = h.bat_dau("a", LoaiViec::Huy, true).expect("xác nhận hợp lệ");
+        assert_eq!(khoi(&h, true, t).dong[0].thong_diep, "Huỷ lệnh in INV/a? Hoá đơn này sẽ KHÔNG được in.");
+        let m = h.bat_dau("a", LoaiViec::Huy, true, sau(t)).expect("xác nhận hợp lệ");
         assert_eq!(m.id, "a");
-        assert_eq!(h.bat_dau("a", LoaiViec::Huy, true), None, "bấm đôi không gửi hai lần");
+        assert_eq!(h.bat_dau("a", LoaiViec::Huy, true, sau(t)), None, "bấm đôi không gửi hai lần");
         assert_eq!(che_do(&h, t)[0].1, CheDo::Dang);
-        h.ket_thuc("a", LoaiViec::Huy, &KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: String::new() }, t);
+        h.ket_thuc("a", LoaiViec::Huy, &duoc(), t);
         // Server đẩy ảnh mới không còn "a" — dòng vẫn hiện ở ĐÚNG chỗ cũ.
         h.nhan_anh(anh(vec![muc("b", "cho_in", true)], vec![]), t);
         let k = khoi(&h, true, t);
@@ -830,13 +928,29 @@ mod tests {
         assert_eq!(che_do(&h, t), vec![("b".to_string(), CheDo::BinhThuong)]);
     }
 
+    /// Bấm đúp "Huỷ": cú thứ hai rơi đúng chỗ "Huỷ lệnh in" (danh sách tự cuộn) —
+    /// trong `CHONG_BAM_DUP` sau khi hộp mở thì KHÔNG huỷ.
+    #[test]
+    fn bam_dup_khong_huy_ngay() {
+        let t = Instant::now();
+        let mut h = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
+        assert!(h.bam_huy("a", true, t));
+        assert_eq!(h.bat_dau("a", LoaiViec::Huy, true, t + Duration::from_millis(150)), None);
+        assert_eq!(che_do(&h, t)[0].1, CheDo::XacNhanHuy, "hộp vẫn mở, chờ bấm thật");
+        assert!(h.bat_dau("a", LoaiViec::Huy, true, sau(t)).is_some());
+        // Loạt cũng vậy.
+        let mut h = san_sang(anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true)], vec![]), t);
+        assert!(h.bam_huy_ca(true, t));
+        assert!(h.bat_dau_loat(true, t + Duration::from_millis(100)).is_empty());
+        assert_eq!(h.bat_dau_loat(true, sau(t)).len(), 2);
+    }
+
     /// Không huỷ được: đỏ, giữ nguyên tới khi bấm ×, KHÔNG bao giờ nói "Đã huỷ".
     #[test]
     fn huy_that_bai_giu_do_toi_khi_dong() {
         let t = Instant::now();
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
-        h.bam_huy("a", true);
-        h.bat_dau("a", LoaiViec::Huy, true).unwrap();
+        dang_huy(&mut h, "a", t);
         h.ket_thuc(
             "a",
             LoaiViec::Huy,
@@ -852,22 +966,37 @@ mod tests {
         assert_eq!(che_do(&h, t)[0].1, CheDo::BinhThuong);
     }
 
-    /// Chưa gửi được = CHẮC CHẮN chưa huỷ; gửi rồi không trả lời = CHƯA RÕ.
+    /// Chưa gửi được = CHẮC CHẮN chưa huỷ; gửi rồi không trả lời = CHƯA RÕ, câu
+    /// chữ theo việc hoá đơn còn / đã rời hàng đợi; còn chờ thì có "Huỷ lại".
     #[test]
     fn chua_gui_va_chua_ro_noi_dung_su_that() {
         let t = Instant::now();
-        let mut h = san_sang(anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true)], vec![]), t);
-        for id in ["a", "b"] {
-            h.bam_huy(id, true);
-            h.bat_dau(id, LoaiViec::Huy, true).unwrap();
+        let mut h = san_sang(anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true), muc("c", "cho_in", true)], vec![]), t);
+        for id in ["a", "b", "c"] {
+            dang_huy(&mut h, id, t);
         }
         h.ket_thuc("a", LoaiViec::Huy, &KetCuc::ChuaGui { ly_do: "chua ket noi".into() }, t);
         h.ket_thuc("b", LoaiViec::Huy, &KetCuc::ChuaRo { ly_do: "het gio".into() }, t);
+        h.ket_thuc("c", LoaiViec::Huy, &KetCuc::ChuaGui { ly_do: "backend chua ho tro".into() }, t);
         let k = khoi(&h, true, t);
         assert_eq!(k.dong[0].che_do, CheDo::ThatBai);
-        assert!(k.dong[0].thong_diep.starts_with("CHƯA huỷ"));
+        assert!(k.dong[0].thong_diep.starts_with("CHƯA huỷ — không gửi được"), "{}", k.dong[0].thong_diep);
+        assert!(k.dong[0].co_nut_huy_lai);
         assert_eq!(k.dong[1].che_do, CheDo::ChuaRo);
-        assert!(k.dong[1].thong_diep.starts_with("Chưa rõ"));
+        assert!(k.dong[1].thong_diep.contains("VẪN đang chờ"), "{}", k.dong[1].thong_diep);
+        assert!(k.dong[1].co_nut_huy_lai);
+        assert!(k.dong[2].thong_diep.contains("chưa hỗ trợ"), "{}", k.dong[2].thong_diep);
+        // "Huỷ lại" mở lại hộp xác nhận trên dòng lỗi.
+        assert!(h.bam_huy("b", true, t));
+        assert_eq!(khoi(&h, true, t).dong[1].che_do, CheDo::XacNhanHuy);
+        h.dong("b");
+        // Server bỏ "a" khỏi ảnh chụp (đã in / huỷ nơi khác): chưa rõ → nói đã rời hàng đợi, không "Huỷ lại".
+        let mut h2 = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
+        dang_huy(&mut h2, "a", t);
+        h2.ket_thuc("a", LoaiViec::Huy, &KetCuc::ChuaRo { ly_do: "het gio".into() }, t);
+        h2.nhan_anh(anh(vec![], vec![]), t);
+        let d = &khoi(&h2, true, t).dong[0];
+        assert!(d.thong_diep.contains("đã rời hàng đợi") && !d.co_nut_huy_lai, "{}", d.thong_diep);
     }
 
     /// Đang hỏi xác nhận mà server vừa gửi hoá đơn xuống máy: hộp đóng (câu
@@ -876,12 +1005,12 @@ mod tests {
     fn xac_nhan_dong_khi_hoa_don_vua_duoc_gui() {
         let t = Instant::now();
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
-        h.bam_huy("a", true);
+        h.bam_huy("a", true, t);
         h.nhan_anh(anh(vec![muc("a", "dang_gui", false)], vec![]), t);
         let d = &khoi(&h, true, t).dong[0];
         assert_eq!((d.che_do, d.nut, d.mau), (CheDo::BinhThuong, NutDong::ViSao, MauDong::DangIn));
-        assert_eq!(h.bat_dau("a", LoaiViec::Huy, true), None, "không gửi huỷ cho hoá đơn đã rời server");
-        assert!(!h.bam_huy("a", true));
+        assert_eq!(h.bat_dau("a", LoaiViec::Huy, true, sau(t)), None, "không gửi huỷ cho hoá đơn đã rời server");
+        assert!(!h.bam_huy("a", true, t));
     }
 
     /// Mất kết nối: ghi chú, khoá nút, hộp xác nhận không bấm được; nối lại thì
@@ -890,20 +1019,23 @@ mod tests {
     fn mat_ket_noi_khoa_nut_va_ghi_chu() {
         let t = Instant::now();
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
-        h.bam_huy("a", true);
+        h.bam_huy("a", true, t);
         let k = khoi(&h, false, t);
         assert_eq!(k.ghi_chu, "có thể chưa cập nhật — app đang mất kết nối");
         assert!(!k.dong[0].bat_nut);
         assert_eq!(k.dong[0].che_do, CheDo::BinhThuong);
         assert_eq!(k.so_huy_ca, 0);
-        assert_eq!(h.bat_dau("a", LoaiViec::Huy, false), None);
-        assert!(!h.bam_huy("a", false));
+        assert_eq!(h.bat_dau("a", LoaiViec::Huy, false, sau(t)), None);
+        assert!(!h.bam_huy("a", false, t));
         h.ket_noi_moi();
         let k = khoi(&h, true, t);
         assert_eq!(k.ghi_chu, "đang tải lại…");
         assert!(!k.dong[0].bat_nut, "ảnh chụp cũ: chưa cho bấm");
+        assert_eq!(h.co_trong_anh("a"), None, "ảnh cũ không dùng để kết luận");
         h.nhan_anh(anh(vec![muc("a", "cho_in", true)], vec![]), t);
         assert!(khoi(&h, true, t).dong[0].bat_nut);
+        assert_eq!(h.co_trong_anh("a"), Some(true));
+        assert_eq!(h.co_trong_anh("x"), Some(false));
         assert_eq!(khoi(&h, true, t + CU_SAU).ghi_chu, "có thể chưa cập nhật");
     }
 
@@ -916,15 +1048,15 @@ mod tests {
         let k = khoi(&h, true, t);
         assert_eq!(k.tieu_de, "HÀNG ĐỢI (0) · 1 chưa xác nhận");
         assert_eq!((k.dong[0].nut, k.dong[0].mau), (NutDong::ViSao, MauDong::ChuaXacNhan));
-        assert!(!h.bam_huy("k", true), "khong_ro không có nút Huỷ");
+        assert!(!h.bam_huy("k", true, t), "khong_ro không có nút Huỷ");
         assert!(h.bam_vi_sao("k"));
         let d = &khoi(&h, true, t).dong[0];
         assert_eq!((d.che_do, d.co_nut_bo), (CheDo::ViSao, true));
         assert_eq!(d.thong_diep, VI_SAO_CHUA_XAC_NHAN);
-        assert!(h.bam_bo("k", true));
-        assert_eq!(khoi(&h, true, t).dong[0].thong_diep, XAC_NHAN_BO);
-        assert_eq!(h.bat_dau("k", LoaiViec::Huy, true), None, "xác nhận BỎ không được dùng để HUỶ");
-        h.bat_dau("k", LoaiViec::BoTheoDoi, true).unwrap();
+        assert!(h.bam_bo("k", true, t));
+        assert!(khoi(&h, true, t).dong[0].thong_diep.starts_with("Bỏ INV/k khỏi hàng đợi?"));
+        assert_eq!(h.bat_dau("k", LoaiViec::Huy, true, sau(t)), None, "xác nhận BỎ không được dùng để HUỶ");
+        h.bat_dau("k", LoaiViec::BoTheoDoi, true, sau(t)).unwrap();
         h.ket_thuc("k", LoaiViec::BoTheoDoi, &KetCuc::Duoc { cach: String::new(), noi_dung: "Đã huỷ".into() }, t);
         let d = &khoi(&h, true, t).dong[0];
         assert_eq!(d.che_do, CheDo::DaBo);
@@ -944,7 +1076,7 @@ mod tests {
         assert!(h.bam_vi_sao("a"));
         let d = &khoi(&h, true, t).dong[0];
         assert_eq!((d.thong_diep.as_str(), d.co_nut_bo), (VI_SAO_DANG_IN, false));
-        assert!(!h.bam_bo("a", true));
+        assert!(!h.bam_bo("a", true, t));
         h.dong("a");
         assert_eq!(khoi(&h, true, t).dong[0].che_do, CheDo::BinhThuong);
     }
@@ -954,10 +1086,10 @@ mod tests {
     fn mot_hop_thoai_mot_luc() {
         let t = Instant::now();
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true)], vec![]), t);
-        h.bam_huy("a", true);
-        h.bam_huy("b", true);
+        h.bam_huy("a", true, t);
+        h.bam_huy("b", true, t);
         assert_eq!(che_do(&h, t), vec![("a".into(), CheDo::BinhThuong), ("b".into(), CheDo::XacNhanHuy)]);
-        assert_eq!(h.bat_dau("a", LoaiViec::Huy, true), None);
+        assert_eq!(h.bat_dau("a", LoaiViec::Huy, true, sau(t)), None);
     }
 
     /// "Huỷ cả N": chốt danh sách lúc hỏi — hoá đơn tới SAU không bị huỷ theo;
@@ -966,37 +1098,69 @@ mod tests {
     fn huy_ca_chot_danh_sach_luc_hoi_va_tong_ket() {
         let t = Instant::now();
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true)], vec![]), t);
-        assert!(h.bam_huy_ca(true));
+        assert!(h.bam_huy_ca(true, t));
         assert_eq!(khoi(&h, true, t).loat_che_do, 1);
         assert!(khoi(&h, true, t).loat_chu.starts_with("Huỷ cả 2 lệnh"));
         assert_eq!(khoi(&h, true, t).loat_nut, "Huỷ 2 lệnh in");
         // Hoá đơn mới tới trong lúc hộp xác nhận mở.
         h.nhan_anh(anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true), muc("c", "cho_in", true)], vec![]), t);
-        let ds = h.bat_dau_loat(true);
+        let ds = h.bat_dau_loat(true, sau(t));
         assert_eq!(ds.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
         assert_eq!(khoi(&h, true, t).loat_chu, "Đang huỷ 0/2 lệnh in…");
-        h.ket_thuc("a", LoaiViec::Huy, &KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: String::new() }, t);
+        h.ket_thuc("a", LoaiViec::Huy, &duoc(), t);
         h.ket_thuc("b", LoaiViec::Huy, &KetCuc::KhongDuoc { loi: "DANG_IN".into(), noi_dung: "x".into() }, t);
         let k = khoi(&h, true, t);
         assert_eq!(k.loat_che_do, 4);
         assert!(k.loat_chu.starts_with("Đã huỷ 1/2"));
         assert_eq!(k.dong.iter().find(|d| d.id == "c").unwrap().che_do, CheDo::BinhThuong);
         h.don_dep(t + Duration::from_secs(3600));
-        assert_eq!(khoi(&h, true, t).loat_che_do, 4, "có lỗi thì giữ tổng kết tới khi bấm ×");
+        assert_eq!(khoi(&h, true, t).loat_che_do, 4, "có lỗi thì giữ tổng kết tới khi bấm Đóng");
         h.dong_loat();
         assert_eq!(khoi(&h, true, t).loat_che_do, 0);
+    }
+
+    /// Giám sát 0.2.6: một lệnh huỷ LẺ chạy song song không được tính vào loạt —
+    /// tổng kết chỉ nói "đã huỷ hết" khi CHÍNH các hoá đơn của loạt đã huỷ.
+    #[test]
+    fn huy_ca_khong_dem_lenh_le_song_song() {
+        let t = Instant::now();
+        let mut h = san_sang(
+            anh(vec![muc("a", "cho_in", true), muc("b", "cho_in", true), muc("c", "cho_in", false)], vec![]),
+            t,
+        );
+        dang_huy(&mut h, "c", t);
+        assert!(h.bam_huy_ca(true, t));
+        let ds = h.bat_dau_loat(true, sau(t));
+        assert_eq!(ds.len(), 2);
+        h.ket_thuc("c", LoaiViec::Huy, &duoc(), t);
+        h.ket_thuc("a", LoaiViec::Huy, &duoc(), t);
+        assert_eq!(khoi(&h, true, t).loat_chu, "Đang huỷ 1/2 lệnh in…", "c không thuộc loạt");
+        h.ket_thuc("b", LoaiViec::Huy, &KetCuc::KhongDuoc { loi: "DANG_IN".into(), noi_dung: "x".into() }, t);
+        assert!(khoi(&h, true, t).loat_chu.starts_with("Đã huỷ 1/2"));
     }
 
     #[test]
     fn huy_ca_thanh_cong_het_tu_tat() {
         let t = Instant::now();
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
-        h.bam_huy_ca(true);
-        let ds = h.bat_dau_loat(true);
-        h.ket_thuc(&ds[0].id, LoaiViec::Huy, &KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: String::new() }, t);
+        h.bam_huy_ca(true, t);
+        let ds = h.bat_dau_loat(true, sau(t));
+        h.ket_thuc(&ds[0].id, LoaiViec::Huy, &duoc(), t);
         assert_eq!(khoi(&h, true, t).loat_chu, "Đã huỷ 1/1 lệnh in");
         h.don_dep(t + GIU_TONG_KET);
         assert_eq!(khoi(&h, true, t).loat_che_do, 0);
+    }
+
+    /// Lưu cấu hình giữa chừng (trạng thái dựng lại): luồng gửi thấy yêu cầu không
+    /// còn và thôi gửi.
+    #[test]
+    fn con_dang_sau_khi_luu() {
+        let t = Instant::now();
+        let mut h = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
+        dang_huy(&mut h, "a", t);
+        assert!(h.con_dang("a"));
+        let h = HangDoiApp::default();
+        assert!(!h.con_dang("a"));
     }
 
     /// Backend cũ (không `hang_doi`) → không có khối nào.
@@ -1006,16 +1170,18 @@ mod tests {
         let mut h = san_sang(anh(vec![muc("a", "cho_in", true)], vec![]), t);
         h.nhan_cau_hinh(false);
         assert!(!khoi(&h, true, t).hien);
-        assert!(!h.bam_huy("a", true));
+        assert!(!h.bam_huy("a", true, t));
     }
 
-    /// Dải cam theo mã máy in; máy đã hết lỗi mà server còn giữ → "sắp tự in".
+    /// Dải cam theo mã máy in; máy đã hết lỗi mà server còn giữ → "sắp tự in";
+    /// app chưa đọc được máy in → không đoán lý do.
     #[test]
     fn cau_dai_tam_giu_theo_ma() {
         assert!(chu_dai_tam_giu(2, Some(MaSuCo::KetGiay)).contains("Gỡ giấy kẹt là tự in"));
         assert!(chu_dai_tam_giu(2, Some(MaSuCo::BinhThuong)).contains("sắp tự in"));
-        assert!(chu_dai_tam_giu(2, None).contains("sắp tự in"));
-        for ma in [None, Some(MaSuCo::HetGiay), Some(MaSuCo::Offline), Some(MaSuCo::LoiMayIn)] {
+        assert!(chu_dai_tam_giu(2, None).contains("đang được giữ lại vì máy in đang lỗi"));
+        assert!(!chu_dai_tam_giu(2, None).contains("sắp"));
+        for ma in [None, Some(MaSuCo::HetGiay), Some(MaSuCo::Offline), Some(MaSuCo::LoiMayIn), Some(MaSuCo::HetMuc)] {
             assert!(!chu_dai_tam_giu(3, ma).to_lowercase().contains("in lại"), "R1: không bảo NV in lại");
         }
     }
@@ -1033,7 +1199,7 @@ mod tests {
     #[test]
     fn dong_nhat_ky_bat_dau_ok() {
         let m = muc("a", "cho_in", true);
-        assert!(KetCuc::Duoc { cach: "chua_gui".into(), noi_dung: String::new() }.dong_nhat_ky(&m).starts_with("ok=true "));
+        assert!(duoc().dong_nhat_ky(&m).starts_with("ok=true "));
         for kc in [
             KetCuc::KhongDuoc { loi: "DA_IN".into(), noi_dung: "x".into() },
             KetCuc::ChuaGui { ly_do: "x".into() },
@@ -1077,7 +1243,8 @@ mod tests {
             dg,
             loai,
             "a",
-            &mut |n| lan_cuoi = n,
+            &mut |n, _| lan_cuoi = n,
+            &|| true,
             &mut |d| dong_ho.set(dong_ho.get() + d + CHO_ACK),
             &|| dong_ho.get(),
         );
@@ -1093,11 +1260,31 @@ mod tests {
         assert_eq!(cong.da_gui.lock().unwrap()[0], ("yeu-cau-huy".to_string(), json!({"printJobId": "a"})));
     }
 
+    /// Giám sát 0.2.6 (C1): ack của yêu cầu KHÁC (lô nhật ký `{ok:true, soDong}`,
+    /// hay huỷ hoá đơn khác) KHÔNG BAO GIỜ thành "Đã huỷ" — hỏi lại, lấy câu thật.
+    #[test]
+    fn ack_khong_dung_id_khong_bao_gio_la_da_huy() {
+        let (dg, cong) = duong(
+            vec![
+                Ok(json!({"ok": true, "soDong": 5})),
+                Ok(json!({"id": "khac", "ok": true, "cach": "chua_gui", "noiDung": "Đã huỷ"})),
+                Ok(json!({"id": "a", "ok": false, "loi": "DANG_IN", "noiDung": "đang in"})),
+            ],
+            true,
+        );
+        let (kc, _) = chay(&dg, LoaiViec::Huy);
+        assert_eq!(kc, KetCuc::KhongDuoc { loi: "DANG_IN".into(), noi_dung: "đang in".into() });
+        assert_eq!(cong.da_gui.lock().unwrap().len(), 3);
+        // Chỉ toàn ack lạ → chưa rõ, không bao giờ "được".
+        let (dg, _) = duong(vec![Ok(json!({"ok": true, "soDong": 1})); 3], true);
+        assert!(matches!(chay(&dg, LoaiViec::Huy).0, KetCuc::ChuaRo { .. }));
+    }
+
     /// Hết giờ lần đầu, lần hai server trả `da_huy_truoc` → ĐÃ HUỶ chắc chắn.
     #[test]
     fn het_gio_hoi_lai_ra_cau_tra_loi_chac() {
         let (dg, _) = duong(
-            vec![Err("het gio cho ack".into()), Ok(json!({"ok": true, "cach": "da_huy_truoc", "noiDung": ""}))],
+            vec![Err("het gio cho ack".into()), Ok(json!({"id": "a", "ok": true, "cach": "da_huy_truoc", "noiDung": ""}))],
             true,
         );
         let (kc, lan) = chay(&dg, LoaiViec::Huy);
@@ -1107,7 +1294,7 @@ mod tests {
 
     #[test]
     fn khong_duoc_tra_ngay_khong_hoi_lai() {
-        let (dg, cong) = duong(vec![Ok(json!({"ok": false, "loi": "DA_IN", "noiDung": "đã in"}))], true);
+        let (dg, cong) = duong(vec![Ok(json!({"id": "a", "ok": false, "loi": "DA_IN", "noiDung": "đã in"}))], true);
         let (kc, _) = chay(&dg, LoaiViec::Huy);
         assert_eq!(kc, KetCuc::KhongDuoc { loi: "DA_IN".into(), noi_dung: "đã in".into() });
         assert_eq!(cong.da_gui.lock().unwrap().len(), 1);
@@ -1136,6 +1323,15 @@ mod tests {
     fn backend_khong_ho_tro_la_chua_gui() {
         let (dg, cong) = duong(vec![], false);
         let (kc, _) = chay(&dg, LoaiViec::Huy);
+        assert!(matches!(kc, KetCuc::ChuaGui { .. }));
+        assert!(cong.da_gui.lock().unwrap().is_empty());
+    }
+
+    /// Yêu cầu bị xoá giữa chừng (Lưu cấu hình) → thôi gửi.
+    #[test]
+    fn thoi_gui_khi_yeu_cau_bi_xoa() {
+        let (dg, cong) = duong(vec![], true);
+        let kc = gui_yeu_cau(&dg, LoaiViec::Huy, "a", &mut |_, _| {}, &|| false, &mut |_| {}, &Instant::now);
         assert!(matches!(kc, KetCuc::ChuaGui { .. }));
         assert!(cong.da_gui.lock().unwrap().is_empty());
     }
