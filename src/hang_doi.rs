@@ -14,7 +14,10 @@
 //!   id của rust_socketio — xem `net.rs` `CongSocket`). Mọi đường khác nói đúng
 //!   điều biết được: KHÔNG huỷ được (kèm lý do server) / CHƯA huỷ (yêu cầu chưa
 //!   rời máy) / CHƯA RÕ (đã gửi mà không có trả lời).
-//! - "Bỏ khỏi hàng đợi" (`bo_qua`) không bao giờ hiện thành "Đã huỷ".
+//! - "Thôi theo dõi" (`bo_qua`, 0.2.6 tên là "Bỏ khỏi hàng đợi" — chủ hiểu là
+//!   HUỶ, sự cố 030134) không bao giờ hiện thành "Đã huỷ", kết quả không tự biến mất.
+//! - Hoá đơn đang NẰM TRONG BỘ NHỚ máy in (0.2.7) tách riêng: "sẽ in khi nạp
+//!   giấy — KHÔNG huỷ được từ app".
 //! - Hết giờ chờ ack thì HỎI LẠI (huỷ lặp là an toàn: server trả `da_huy_truoc`)
 //!   — phần lớn "chưa rõ" thành câu trả lời chắc chắn.
 //! - Nút xác nhận KHÔNG ăn cú bấm trong `CHONG_BAM_DUP` sau khi hộp mở: hộp mở
@@ -32,8 +35,6 @@ use std::time::{Duration, Instant};
 
 /// "Đã huỷ" hiện bao lâu rồi dòng rời danh sách (hợp đồng §6.2).
 pub const GIU_DA_HUY: Duration = Duration::from_secs(5);
-/// "Đã bỏ khỏi hàng đợi" dài hơn — câu dài, có việc cần làm.
-pub const GIU_DA_BO: Duration = Duration::from_secs(8);
 /// Tổng kết "Huỷ cả N" (toàn bộ thành công) hiện bao lâu.
 pub const GIU_TONG_KET: Duration = Duration::from_secs(6);
 /// App hỏi lại ảnh chụp theo nhịp này (server chỉ đẩy khi đổi).
@@ -56,20 +57,24 @@ pub const CHONG_BAM_DUP: Duration = Duration::from_millis(900);
 /// Câu giải thích "Vì sao không huỷ được?" — cùng lời với server (§8.2).
 pub const VI_SAO_DANG_IN: &str =
     "Hoá đơn đang được gửi/in ở máy in — không huỷ được nữa. Nếu không cần tờ này: bỏ tờ in ra.";
-pub const VI_SAO_CHUA_XAC_NHAN: &str = "Hoá đơn đã gửi xuống máy in nhưng chưa xác nhận đã in — có thể đang nằm \
-     trong bộ nhớ máy in, không huỷ được từ xa. Muốn bỏ hẳn: xoá lệnh trong hàng đợi Windows (nếu còn), tắt máy in \
-     10 giây (MỌI hoá đơn trong bộ nhớ máy sẽ mất) → bật lại → kiểm khay → in lại cái cần. Rồi bấm \"Bỏ khỏi hàng đợi\".";
+pub const VI_SAO_CHUA_XAC_NHAN: &str = "Hoá đơn đã gửi xuống máy in nhưng CHƯA xác nhận đã in — có thể đã in, có thể \
+     còn trong bộ nhớ máy in. App và ZaloCRM KHÔNG huỷ được. Kiểm các tờ đã ra: có tờ này rồi thì bấm \"Thôi theo \
+     dõi\"; CHƯA có thì in lại hoá đơn này.";
+/// "Vì sao?" của hoá đơn app BIẾT đang nằm trong bộ nhớ máy in (0.2.7).
+pub const VI_SAO_TRONG_MAY_IN: &str = "Tờ này ĐÃ nằm trong máy in — app và ZaloCRM KHÔNG huỷ được; nạp giấy là máy \
+     in ra. Máy HP này từng in TRÙNG tờ kẹt và làm MẤT tờ gửi ngay sau → nạp giấy xong hãy kiểm các tờ. Muốn tờ này \
+     KHÔNG in: tắt máy in 10 giây TRƯỚC khi nạp giấy (chưa kiểm chứng).";
 
 /// Câu hỏi xác nhận huỷ — NÊU SỐ HOÁ ĐƠN (bấm nhầm dòng thì đọc là biết).
 pub fn chu_xac_nhan_huy(so_hoa_don: &str) -> String {
     format!("Huỷ lệnh in {}? Hoá đơn này sẽ KHÔNG được in.", so_hoa_don)
 }
 
-/// Câu hỏi xác nhận bỏ theo dõi.
+/// Câu hỏi xác nhận "Thôi theo dõi" — nói thẳng KHÔNG huỷ.
 pub fn chu_xac_nhan_bo(so_hoa_don: &str) -> String {
     format!(
-        "Bỏ {} khỏi hàng đợi? Việc này KHÔNG chặn việc in — hoá đơn còn trong máy in vẫn sẽ in ra. \
-         Hệ thống chỉ thôi theo dõi.",
+        "Thôi theo dõi {}? Việc này KHÔNG huỷ gì — nếu tờ còn trong máy in, nó VẪN in ra. Hệ thống chỉ không chờ \
+         tờ này nữa.",
         so_hoa_don
     )
 }
@@ -192,6 +197,8 @@ pub enum MauDong {
     DangIn,
     /// `khong_ro`.
     ChuaXacNhan,
+    /// `khong_ro` mà app đang theo dõi nó trong BỘ NHỚ máy in (0.2.7).
+    TrongMayIn,
 }
 
 /// Dòng đang ở chế độ nào (UI vẽ theo đây).
@@ -231,7 +238,7 @@ pub struct DongHangDoi {
     pub bat_nut: bool,
     /// Chữ của chế độ: câu xác nhận / kết quả / giải thích.
     pub thong_diep: String,
-    /// Trong "Vì sao?": có nút "Bỏ khỏi hàng đợi".
+    /// Trong "Vì sao?": có nút "Thôi theo dõi".
     pub co_nut_bo: bool,
     /// Dòng báo lỗi / chưa rõ của lệnh HUỶ mà hoá đơn VẪN còn chờ huỷ được: nút "Huỷ lại".
     pub co_nut_huy_lai: bool,
@@ -253,6 +260,9 @@ pub struct KhoiHangDoi {
     pub loat_chu: String,
     /// Chữ nút xác nhận loạt: "Huỷ 10 lệnh in".
     pub loat_nut: String,
+    /// Có dòng đang mở hộp xác nhận / giải thích — danh sách được cao hơn để
+    /// hiện đủ nút (0.2.7).
+    pub co_mo_rong: bool,
     pub dong: Vec<DongHangDoi>,
 }
 
@@ -287,8 +297,10 @@ fn la_chua_xac_nhan(muc: &MucHangDoi) -> bool {
     muc.nhom == "chua_xac_nhan" || muc.trang_thai == "khong_ro"
 }
 
-fn vi_sao(muc: &MucHangDoi) -> &'static str {
-    if la_chua_xac_nhan(muc) {
+fn vi_sao(muc: &MucHangDoi, trong_may: bool) -> &'static str {
+    if trong_may {
+        VI_SAO_TRONG_MAY_IN
+    } else if la_chua_xac_nhan(muc) {
         VI_SAO_CHUA_XAC_NHAN
     } else {
         VI_SAO_DANG_IN
@@ -452,7 +464,7 @@ impl HangDoiApp {
         self.mo(id, ThaoTac::ViSao)
     }
 
-    /// Bấm "Bỏ khỏi hàng đợi" trong phần giải thích → hỏi xác nhận.
+    /// Bấm "Thôi theo dõi" trong phần giải thích → hỏi xác nhận.
     pub fn bam_bo(&mut self, id: &str, da_noi: bool, bay_gio: Instant) -> bool {
         if !self.co_the_bam(da_noi) || !self.tim_trong_anh(id).is_some_and(|(_, m)| la_chua_xac_nhan(m)) {
             return false;
@@ -460,12 +472,15 @@ impl HangDoiApp {
         self.mo(id, ThaoTac::XacNhanBo { luc: bay_gio })
     }
 
-    /// "Giữ lại" / "Đóng" (hộp thoại) hoặc "×" (kết quả lỗi / chưa rõ).
+    /// "Giữ lại" / "Đóng" (hộp thoại) hoặc "×" (kết quả lỗi / chưa rõ / đã
+    /// thôi theo dõi).
     pub fn dong(&mut self, id: &str) {
-        self.thao_tac.retain(|m| m.muc.id != id || m.tt.dang_ban());
+        self.thao_tac.retain(|m| {
+            m.muc.id != id || matches!(m.tt, ThaoTac::Dang { .. } | ThaoTac::Xong { loai: LoaiViec::Huy, .. })
+        });
     }
 
-    /// Bấm nút xác nhận ("Huỷ lệnh in" / "Bỏ khỏi hàng đợi") → chuyển "Đang…".
+    /// Bấm nút xác nhận ("Huỷ lệnh in" / "Thôi theo dõi") → chuyển "Đang…".
     /// Trả mục để luồng gửi yêu cầu; `None` = không hợp lệ (bấm đúp, hộp vừa mở
     /// chưa đủ `CHONG_BAM_DUP`, hộp đã đóng, mất kết nối) — KHÔNG gửi gì.
     pub fn bat_dau(&mut self, id: &str, loai: LoaiViec, da_noi: bool, bay_gio: Instant) -> Option<MucHangDoi> {
@@ -510,8 +525,7 @@ impl HangDoiApp {
                 loai,
                 luc: bay_gio,
                 // KHÔNG BAO GIỜ "Đã huỷ" (§8.5) — câu cố định, không lấy chữ server.
-                noi_dung: "Đã bỏ khỏi hàng đợi — hệ thống KHÔNG biết hoá đơn đã in hay chưa. Kiểm giấy trước khi in lại."
-                    .into(),
+                noi_dung: "Đã thôi theo dõi — KHÔNG huỷ: tờ còn trong máy in vẫn in ra. Kiểm các tờ đã ra.".into(),
             },
             (LoaiViec::Huy, KetCuc::KhongDuoc { noi_dung, .. }) => ThaoTac::ThatBai {
                 loai,
@@ -519,10 +533,10 @@ impl HangDoiApp {
             },
             (LoaiViec::BoTheoDoi, KetCuc::KhongDuoc { noi_dung, .. }) => ThaoTac::ThatBai {
                 loai,
-                noi_dung: format!("Không bỏ được: {}", if noi_dung.is_empty() { "server từ chối" } else { noi_dung }),
+                noi_dung: format!("Chưa thôi theo dõi được: {}", if noi_dung.is_empty() { "server từ chối" } else { noi_dung }),
             },
             (_, KetCuc::ChuaGui { ly_do }) => {
-                let viec = if loai == LoaiViec::Huy { "huỷ" } else { "bỏ" };
+                let viec = if loai == LoaiViec::Huy { "huỷ" } else { "thôi theo dõi" };
                 let vi_sao = if ly_do.contains("ho tro") {
                     "server ZaloCRM chưa hỗ trợ việc này từ app — làm trên trang ZaloCRM › Máy in".to_string()
                 } else {
@@ -617,11 +631,10 @@ impl HangDoiApp {
 
     /// Xoá kết quả "đã xong" quá hạn (gọi mỗi nhịp giao diện).
     pub fn don_dep(&mut self, bay_gio: Instant) {
+        // "Đã huỷ" rời sau 5 s; "Đã thôi theo dõi" GIỮ tới khi bấm × (0.2.7:
+        // dòng biến mất như huỷ là một lý do chủ tưởng đã huỷ 134).
         self.thao_tac.retain(|m| match m.tt {
-            ThaoTac::Xong { loai, luc, .. } => {
-                let giu = if loai == LoaiViec::Huy { GIU_DA_HUY } else { GIU_DA_BO };
-                bay_gio.saturating_duration_since(luc) < giu
-            }
+            ThaoTac::Xong { loai: LoaiViec::Huy, luc, .. } => bay_gio.saturating_duration_since(luc) < GIU_DA_HUY,
             _ => true,
         });
         if let Some(Loat::Xong { tong, duoc, luc }) = self.loat {
@@ -633,11 +646,21 @@ impl HangDoiApp {
 
     /// Dựng khối cho giao diện. `ma_may_in` = trạng thái máy in app đọc gần nhất
     /// (cho câu dải cam), `gio` = đổi ISO → giờ máy.
-    pub fn khoi(&self, da_noi: bool, ma_may_in: Option<MaSuCo>, bay_gio: Instant, gio: &dyn Fn(&str) -> String) -> KhoiHangDoi {
+    /// `trong_may_in` = `print_jobs.id` app ĐANG theo dõi trong bộ nhớ máy in.
+    pub fn khoi(
+        &self,
+        da_noi: bool,
+        ma_may_in: Option<MaSuCo>,
+        trong_may_in: &[String],
+        bay_gio: Instant,
+        gio: &dyn Fn(&str) -> String,
+    ) -> KhoiHangDoi {
         let Some(anh) = self.anh.as_ref().filter(|_| self.ho_tro) else { return KhoiHangDoi::default() };
         let bat = self.co_the_bam(da_noi);
         let mut dong: Vec<DongHangDoi> = Vec::new();
+        let la_trong_may = |muc: &MucHangDoi| la_chua_xac_nhan(muc) && trong_may_in.iter().any(|x| x == &muc.id);
         let dong_cua = |muc: &MucHangDoi, tt: Option<&ThaoTac>, con_trong_anh: bool| -> DongHangDoi {
+            let trong_may = la_trong_may(muc);
             let tieu_de = match &muc.ten_khach {
                 Some(k) => format!("{} · {}", muc.so_hoa_don, k),
                 None => muc.so_hoa_don.clone(),
@@ -649,7 +672,7 @@ impl HangDoiApp {
                 Some(ThaoTac::XacNhanHuy { .. }) if bat => (CheDo::XacNhanHuy, chu_xac_nhan_huy(&muc.so_hoa_don)),
                 Some(ThaoTac::XacNhanBo { .. }) if bat => (CheDo::XacNhanBo, chu_xac_nhan_bo(&muc.so_hoa_don)),
                 Some(ThaoTac::XacNhanHuy { .. } | ThaoTac::XacNhanBo { .. }) => (CheDo::BinhThuong, String::new()),
-                Some(ThaoTac::ViSao) => (CheDo::ViSao, vi_sao(muc).to_string()),
+                Some(ThaoTac::ViSao) => (CheDo::ViSao, vi_sao(muc, trong_may).to_string()),
                 Some(ThaoTac::Dang { loai, lan, da_gui }) => {
                     let chu = if *loai == LoaiViec::Huy { "Đang huỷ…" } else { "Đang bỏ khỏi hàng đợi…" };
                     let chu = if *lan <= 1 {
@@ -694,8 +717,12 @@ impl HangDoiApp {
                 id: muc.id.clone(),
                 tieu_de,
                 gio: gio(&muc.tao),
-                trang_thai: nhan_trang_thai(muc),
-                mau: mau_cua(muc),
+                trang_thai: if trong_may {
+                    "Trong máy in — sẽ in khi nạp giấy (không huỷ được từ app)".to_string()
+                } else {
+                    nhan_trang_thai(muc)
+                },
+                mau: if trong_may { MauDong::TrongMayIn } else { mau_cua(muc) },
                 che_do,
                 nut,
                 bat_nut: bat,
@@ -722,14 +749,17 @@ impl HangDoiApp {
         }
 
         let so_cho = anh.cho_in.len();
-        let so_chua_xn = anh.chua_xac_nhan.len();
+        let trong_may: Vec<&MucHangDoi> = anh.chua_xac_nhan.iter().filter(|m| la_trong_may(m)).collect();
+        let so_chua_xn = anh.chua_xac_nhan.len() - trong_may.len();
         let so_tam_giu = anh.cho_in.iter().filter(|m| m.tam_giu).count();
         let hien = !dong.is_empty() || self.loat.is_some();
-        let tieu_de = if so_chua_xn > 0 {
-            format!("HÀNG ĐỢI ({}) · {} chưa xác nhận", so_cho, so_chua_xn)
-        } else {
-            format!("HÀNG ĐỢI ({})", so_cho)
-        };
+        let mut tieu_de = format!("HÀNG ĐỢI ({})", so_cho);
+        if !trong_may.is_empty() {
+            tieu_de.push_str(&format!(" · {} trong máy in", trong_may.len()));
+        }
+        if so_chua_xn > 0 {
+            tieu_de.push_str(&format!(" · {} chưa xác nhận", so_chua_xn));
+        }
         let ghi_chu = if !da_noi {
             "có thể chưa cập nhật — app đang mất kết nối".to_string()
         } else if !self.cua_ket_noi_nay {
@@ -767,11 +797,28 @@ impl HangDoiApp {
             hien,
             tieu_de,
             ghi_chu,
-            dai_tam_giu: if so_tam_giu > 0 { chu_dai_tam_giu(so_tam_giu, ma_may_in) } else { String::new() },
+            dai_tam_giu: {
+                // Hoá đơn trong máy ra TRƯỚC mọi hoá đơn đang giữ khi nạp giấy —
+                // nói rõ để không ai tưởng chỉ các hoá đơn chờ mới in (0.2.7).
+                let so: Vec<&str> = trong_may.iter().map(|m| m.so_hoa_don.as_str()).collect();
+                let dau = match so.len() {
+                    0 => String::new(),
+                    _ => format!(
+                        "{} ĐANG TRONG MÁY IN — nạp giấy là in ra trước, không huỷ được từ app. ",
+                        so.join(", ")
+                    ),
+                };
+                match (so_tam_giu, dau.is_empty()) {
+                    (0, true) => String::new(),
+                    (0, false) => format!("{}Nạp giấy xong hãy kiểm các tờ ra.", dau),
+                    (n, _) => format!("{}{}", dau, chu_dai_tam_giu(n, ma_may_in)),
+                }
+            },
             so_huy_ca,
             loat_che_do,
             loat_chu,
             loat_nut,
+            co_mo_rong: dong.iter().any(|d| matches!(d.che_do, CheDo::XacNhanHuy | CheDo::XacNhanBo | CheDo::ViSao)),
             dong,
         }
     }
@@ -876,7 +923,7 @@ mod tests {
     }
 
     fn khoi(h: &HangDoiApp, da_noi: bool, t: Instant) -> KhoiHangDoi {
-        h.khoi(da_noi, Some(MaSuCo::HetGiay), t, &|_| "18:45".into())
+        h.khoi(da_noi, Some(MaSuCo::HetGiay), &[], t, &|_| "18:45".into())
     }
 
     fn che_do(h: &HangDoiApp, t: Instant) -> Vec<(String, CheDo)> {
@@ -1071,17 +1118,18 @@ mod tests {
         assert_eq!((d.che_do, d.co_nut_bo), (CheDo::ViSao, true));
         assert_eq!(d.thong_diep, VI_SAO_CHUA_XAC_NHAN);
         assert!(h.bam_bo("k", true, t));
-        assert!(khoi(&h, true, t).dong[0].thong_diep.starts_with("Bỏ INV/k khỏi hàng đợi?"));
+        assert!(khoi(&h, true, t).dong[0].thong_diep.starts_with("Thôi theo dõi INV/k? Việc này KHÔNG huỷ gì"));
         assert_eq!(h.bat_dau("k", LoaiViec::Huy, true, sau(t)), None, "xác nhận BỎ không được dùng để HUỶ");
         h.bat_dau("k", LoaiViec::BoTheoDoi, true, sau(t)).unwrap();
         h.ket_thuc("k", LoaiViec::BoTheoDoi, &KetCuc::Duoc { cach: String::new(), noi_dung: "Đã huỷ".into() }, t);
         let d = &khoi(&h, true, t).dong[0];
         assert_eq!(d.che_do, CheDo::DaBo);
-        assert!(!d.thong_diep.contains("huỷ") && !d.thong_diep.contains("Huỷ"), "{}", d.thong_diep);
-        h.don_dep(t + GIU_DA_HUY);
-        assert_eq!(che_do(&h, t)[0].1, CheDo::DaBo, "bỏ theo dõi giữ lâu hơn");
-        h.don_dep(t + GIU_DA_BO);
+        assert!(!d.thong_diep.contains("Đã huỷ") && d.thong_diep.contains("KHÔNG huỷ"), "{}", d.thong_diep);
+        // 0.2.7: không tự biến mất như một lệnh huỷ — giữ tới khi bấm ×.
         h.nhan_anh(anh(vec![], vec![]), t);
+        h.don_dep(t + Duration::from_secs(3600));
+        assert_eq!(che_do(&h, t)[0].1, CheDo::DaBo, "giữ tới khi bấm ×");
+        h.dong("k");
         assert!(!khoi(&h, true, t).hien);
     }
 
@@ -1365,5 +1413,34 @@ mod tests {
         let kc = gui_yeu_cau(&dg, LoaiViec::Huy, "a", &mut |_, _| {}, &|| false, &mut |_| {}, &Instant::now);
         assert!(matches!(kc, KetCuc::ChuaGui { .. }));
         assert!(cong.da_gui.lock().unwrap().is_empty());
+    }
+
+    /// 0.2.7: hoá đơn app biết đang NẰM TRONG máy in — nhãn riêng, tiêu đề và
+    /// dải nói rõ "nạp giấy là in ra trước, không huỷ được từ app".
+    #[test]
+    fn hoa_don_trong_may_in_tach_rieng() {
+        let t = Instant::now();
+        let h = san_sang(
+            anh(vec![muc("a", "cho_in", true)], vec![muc("p134", "khong_ro", false), muc("k", "khong_ro", false)]),
+            t,
+        );
+        let k = h.khoi(true, Some(MaSuCo::HetGiay), &["p134".to_string()], t, &|_| "18:45".into());
+        assert_eq!(k.tieu_de, "HÀNG ĐỢI (1) · 1 trong máy in · 1 chưa xác nhận");
+        let d = k.dong.iter().find(|d| d.id == "p134").unwrap();
+        assert_eq!(d.mau, MauDong::TrongMayIn);
+        assert!(d.trang_thai.starts_with("Trong máy in — sẽ in khi nạp giấy"));
+        assert_eq!(d.nut, NutDong::ViSao);
+        assert!(k.dai_tam_giu.starts_with("INV/p134 ĐANG TRONG MÁY IN — nạp giấy là in ra trước"), "{}", k.dai_tam_giu);
+        assert!(k.dai_tam_giu.contains("1 hoá đơn đang chờ"), "{}", k.dai_tam_giu);
+        let mut h = h;
+        assert!(h.bam_vi_sao("p134"));
+        let k = h.khoi(true, Some(MaSuCo::HetGiay), &["p134".to_string()], t, &|_| "".into());
+        let d = k.dong.iter().find(|d| d.id == "p134").unwrap();
+        assert_eq!(d.thong_diep, VI_SAO_TRONG_MAY_IN);
+        assert!(d.co_nut_bo);
+        // Chỉ còn hoá đơn trong máy (không có hoá đơn tạm giữ): dải vẫn nhắc.
+        let h2 = san_sang(anh(vec![], vec![muc("p134", "khong_ro", false)]), t);
+        let k = h2.khoi(true, Some(MaSuCo::HetGiay), &["p134".to_string()], t, &|_| "".into());
+        assert_eq!(k.dai_tam_giu, "INV/p134 ĐANG TRONG MÁY IN — nạp giấy là in ra trước, không huỷ được từ app. Nạp giấy xong hãy kiểm các tờ ra.");
     }
 }

@@ -176,6 +176,12 @@ pub fn xu_ly_job(payload: &serde_json::Value, cfg: &Config, in_fn: &HamIn<'_>) -
     let paper = job.paper_size.unwrap_or_else(|| cfg.paper_size.clone());
     let tray = job.tray.unwrap_or_else(|| cfg.tray.clone());
     let copies = job.copies.unwrap_or(1);
+    // Dấu vân tay PDF (0.2.7): đối chiếu được với PDF tải lại từ Odoo
+    // (`shasum -a 256`) — sự cố 030134/030136 không ai chứng minh được byte đã in.
+    crate::nhat_ky::ghi(
+        "pdf_nhan",
+        &format!("job={} byte={} ban={} sha256={}", rut_gon_job_id(&job.id), pdf.len(), copies, crate::sha256::hex(&pdf)),
+    );
 
     match in_fn(&pdf, &cfg.printer_name, &paper, &tray, copies, &job.id, job.name.as_deref()) {
         KetQuaIn::DaIn => KetQua::da_in(job.id),

@@ -372,6 +372,7 @@ fn dong_hang_doi_sang_slint(d: &hang_doi::DongHangDoi) -> QueueRow {
             MauDong::TamGiu => 1,
             MauDong::DangIn => 2,
             MauDong::ChuaXacNhan => 3,
+            MauDong::TrongMayIn => 4,
         },
         che_do: match d.che_do {
             CheDo::BinhThuong => 0,
@@ -431,7 +432,7 @@ fn cap_nhat_theo_id(model: &VecModel<QueueRow>, moi: Vec<QueueRow>) {
 fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung, hd: &VecModel<QueueRow>) -> Option<CanhBao> {
     let lech = crate::thoi_gian::lech_gio_may_phut();
     let bay_gio_he = SystemTime::now();
-    let k = t.hang_doi.khoi(t.da_noi, t.may_in.as_ref().map(|(m, _)| *m), Instant::now(), &|iso| {
+    let k = t.hang_doi.khoi(t.da_noi, t.may_in.as_ref().map(|(m, _)| *m), &t.trong_may_in, Instant::now(), &|iso| {
         crate::thoi_gian::gio_may_tu_iso(iso, lech, bay_gio_he)
     });
     w.set_hd_hien(k.hien);
@@ -442,6 +443,7 @@ fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung, hd: &VecMode
     w.set_hd_loat_che_do(i32::from(k.loat_che_do));
     w.set_hd_loat_chu(k.loat_chu.into());
     w.set_hd_loat_nut(k.loat_nut.into());
+    w.set_hd_mo_rong(k.co_mo_rong);
     cap_nhat_theo_id(hd, k.dong.iter().map(dong_hang_doi_sang_slint).collect());
 
     let vm = build_view_model(cfg, t);
@@ -1143,6 +1145,55 @@ mod tests_chon {
         let mut t = co_so(HangDoiServer { cho_in: muoi[..3].to_vec(), chua_xac_nhan: vec![], cap_nhat: String::new() });
         t.da_noi = false;
         chup("7-mat-ket-noi", &t, &|_| {});
+
+        // 10. Đúng sự cố 25/09: 134 đang NẰM TRONG máy in, 135 + 136 tạm giữ.
+        let ds_su_co = vec![
+            muc("p135", "INV/2026/030135", "Anh Dev Test", "cho_in", true, "Tạm giữ — máy in Hết giấy (từ 21:43)", "2026-09-25T14:44:13.000Z"),
+            muc("p136", "INV/2026/030136", "Anh Dev Test", "cho_in", true, "Tạm giữ — máy in Hết giấy (từ 21:43)", "2026-09-25T14:45:26.000Z"),
+        ];
+        let cxn_su_co = vec![muc(
+            "p134",
+            "INV/2026/030134",
+            "Anh Dev Test",
+            "khong_ro",
+            false,
+            "Chưa xác nhận đã in — có thể đang nằm trong máy in",
+            "2026-09-25T14:42:12.000Z",
+        )];
+        let mut t = co_so(HangDoiServer { cho_in: ds_su_co.clone(), chua_xac_nhan: cxn_su_co.clone(), cap_nhat: String::new() });
+        t.ghi_may_in(MaSuCo::HetGiay, None, true);
+        t.trong_may_in = vec!["p134".into()];
+        chup("10-su-co-134-trong-may-in", &t, &|_| {});
+        t.hang_doi.bam_vi_sao("p134");
+        chup("11-vi-sao-trong-may-in", &t, &|_| {});
+
+        // 12. Sau nạp giấy: đã thôi theo dõi 134, 136 bị báo "chưa xác nhận — kiểm tờ".
+        let mut t = co_so(HangDoiServer { cho_in: vec![], chua_xac_nhan: cxn_su_co.clone(), cap_nhat: String::new() });
+        t.trong_may_in = vec!["p134".into()];
+        t.hang_doi.bam_vi_sao("p134");
+        t.hang_doi.bam_bo("p134", true, t0);
+        t.hang_doi.bat_dau("p134", LoaiViec::BoTheoDoi, true, t0 + hang_doi::CHONG_BAM_DUP);
+        t.hang_doi.ket_thuc("p134", LoaiViec::BoTheoDoi, &KetCuc::Duoc { cach: String::new(), noi_dung: String::new() }, t0);
+        t.hang_doi.nhan_anh(HangDoiServer { cho_in: vec![], chua_xac_nhan: vec![], cap_nhat: String::new() }, t0);
+        t.them_job(JobLog {
+            job_id: "p136-1790347622423".into(),
+            so_hoa_don: "INV/2026/030136".into(),
+            khach: Some("Anh Dev Test".into()),
+            trang_thai: job::KHONG_RO.into(),
+            loai: Some(MaSuCo::KhongXacNhan),
+            luc: "21:47:15".into(),
+            ..Default::default()
+        });
+        t.them_job(JobLog {
+            job_id: "p134-1790347382418".into(),
+            so_hoa_don: "INV/2026/030134".into(),
+            khach: Some("Anh Dev Test".into()),
+            trang_thai: job::DA_IN.into(),
+            sau_khac_phuc: true,
+            luc: "21:47:06".into(),
+            ..Default::default()
+        });
+        chup("12-sau-nap-giay", &t, &|_| {});
 
         // 9. Cấu hình mở khi hàng đợi có hoá đơn — phải nhắc.
         let mut t = co_so(HangDoiServer { cho_in: muoi[..2].to_vec(), chua_xac_nhan: vec![], cap_nhat: String::new() });

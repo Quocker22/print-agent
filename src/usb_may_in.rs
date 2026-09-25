@@ -43,6 +43,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::su_co::MaSuCo;
+use std::sync::Mutex;
 
 /// `CTL_CODE(FILE_DEVICE_UNKNOWN, USBPRINT_IOCTL_INDEX + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)` (usbprint.h).
 pub const IOCTL_USBPRINT_GET_LPT_STATUS: u32 = 0x0022_0030;
@@ -63,8 +64,8 @@ pub struct DocUsb {
     /// `None` khi máy không có trường này (hoặc hỏi chuỗi 1284 lỗi).
     pub status: Option<String>,
     /// Trạng thái RIÊNG của hãng (hex) — chỉ máy HP dòng SPL (gốc Samsung):
-    /// vendor GET 0x02 như "HP Printer Status" (shj2msm.exe) hỏi. CHỈ GHI NHẬT KÝ
-    /// để giải mã (25/09) — chưa dùng để quyết.
+    /// vendor GET 0x02 như "HP Printer Status" (shj2msm.exe) hỏi. Từ 0.2.7 byte 2
+    /// quyết "đang chạy / rảnh" thay cho 1284 STATUS (xem `pha_hp`).
     pub hang: Option<String>,
     /// Vendor GET 0x0A wValue 0x0005 (sức chứa / mức giấy khay), hex.
     pub khay: Option<String>,
@@ -89,6 +90,31 @@ pub fn khay_1_tu_byte(b: &[u8]) -> Option<(u16, u16)> {
     (suc_chua != 0 && suc_chua != 0xFFFF && muc != 0xFFFF).then_some((suc_chua, muc))
 }
 
+/// Pha máy HP dòng SPL — byte 2 của 8 byte vendor GET 0x02.
+///
+/// ĐO THẬT HCM 25/09 (HP Laser 108a; sự cố 030134/030136, docs điều tra
+/// `dieu-tra-134`): `01` sẵn sàng · `03` ngủ (≈ 60 s sau sẵn sàng, đúng mức
+/// "sleep 1 phút" của HP) · `04` đang chạy một job (suốt pha in của 133 và 136)
+/// · `05` đang khởi động/làm nóng (sau khi nạp giấy) · `02` lỗi (kèm `0C 03 …
+/// 02` khi khay trống). Thay cho 1284 `STATUS`: trên dòng máy này BUSY cả lúc
+/// NGỦ và IDLE giữa lúc `04` — 0.2.6 báo "đã in" hoá đơn kẹt lúc máy mới bắt
+/// đầu chạy, và báo 136 "đã in" dù tờ ra là 134.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaHp {
+    SanSang,
+    Ngu,
+    DangChay,
+    KhoiDong,
+    Loi,
+    /// Mã chưa đo — coi như máy đang làm việc (không bao giờ đoán "xong").
+    ChuaDo(u8),
+}
+
+/// Byte của chuỗi hex "01 01 04 FF 46 00 00 00".
+fn byte_hex(hex: &str) -> Vec<u8> {
+    hex.split_whitespace().filter_map(|t| u8::from_str_radix(t, 16).ok()).collect()
+}
+
 /// Tình trạng máy suy ra từ một lần đọc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TinhTrangUsb {
@@ -106,6 +132,20 @@ pub enum TinhTrangUsb {
 }
 
 impl DocUsb {
+    /// Pha máy HP dòng SPL (`None` = máy không có trạng thái của hãng).
+    pub fn pha_hp(&self) -> Option<PhaHp> {
+        let b = byte_hex(self.hang.as_deref()?);
+        let pha = *b.get(2)?;
+        Some(match pha {
+            0x01 => PhaHp::SanSang,
+            0x03 => PhaHp::Ngu,
+            0x04 => PhaHp::DangChay,
+            0x05 => PhaHp::KhoiDong,
+            0x02 => PhaHp::Loi,
+            khac => PhaHp::ChuaDo(khac),
+        })
+    }
+
     pub fn tinh_trang(&self) -> TinhTrangUsb {
         // Khay 1 có sức chứa mà mức giấy 0 = HẾT GIẤY (HP dòng SPL — đo HCM 25/09).
         if self.khay_1.is_some_and(|(_, muc)| muc == 0) {
@@ -116,6 +156,15 @@ impl DocUsb {
         }
         if self.byte & BIT_KHONG_LOI == 0 {
             return TinhTrangUsb::Loi(MaSuCo::CanXuLy);
+        }
+        // Máy HP dòng SPL: pha của hãng quyết (0.2.7) — 1284 STATUS trên dòng
+        // này không nói gì (BUSY lúc ngủ, IDLE giữa lúc đang chạy job).
+        if let Some(pha) = self.pha_hp() {
+            return match pha {
+                PhaHp::SanSang | PhaHp::Ngu => TinhTrangUsb::Ranh,
+                PhaHp::Loi => TinhTrangUsb::Loi(MaSuCo::CanXuLy),
+                PhaHp::DangChay | PhaHp::KhoiDong | PhaHp::ChuaDo(_) => TinhTrangUsb::DangIn,
+            };
         }
         // CHỈ `IDLE` (đã đo) mới là rảnh. Giá trị lạ = máy đang làm việc (25/09:
         // 0.2.1 báo `da_in` lúc máy HP còn "Preparing print job" — không bao giờ
@@ -268,10 +317,30 @@ impl GopDong {
 
 /// Nhịp tối thiểu ghi lại dòng giữ nguyên (nhật ký USB liên tục, 25/09).
 pub const NHIP_GHI_LAI: std::time::Duration = std::time::Duration::from_secs(10);
-/// Dòng `usb_doc` đổi cũng chỉ ghi tối đa một dòng mỗi chừng này.
-pub const GHI_USB_TOI_THIEU: std::time::Duration = std::time::Duration::from_secs(2);
-/// Dòng `usb_khay` (255 byte hex) chỉ ghi khi đổi, tối đa một dòng mỗi chừng này.
-pub const GHI_KHAY_TOI_THIEU: std::time::Duration = std::time::Duration::from_secs(60);
+/// Dòng `usb_doc` ĐỔI được ghi ngay (chỉ chặn dội: tối đa 4 dòng/giây). 0.2.6
+/// gộp đổi trong 2 s → sự cố 030134 mất đúng các pha cần để đếm tờ.
+pub const GHI_USB_TOI_THIEU: std::time::Duration = std::time::Duration::from_millis(250);
+/// Dòng `usb_khay` (255 byte hex) ghi khi đổi — nạp/rút giấy là mốc dòng thời gian.
+pub const GHI_KHAY_TOI_THIEU: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Đọc máy in DÀY (mỗi 500 ms) tới mốc này — sau mỗi job / đổi trạng thái / kết
+/// luận theo dõi tiếp (0.2.7): khoảng mù 13 s của sự cố 030134 là do luồng đọc
+/// lúc rảnh hạ về 20 s ngay khi kết luận.
+static DOC_NHANH_TOI: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Đọc dày thêm `trong` kể từ bây giờ (không rút ngắn mốc đã đặt xa hơn).
+pub fn doc_nhanh_trong(trong: std::time::Duration) {
+    let moi = std::time::Instant::now() + trong;
+    let mut m = DOC_NHANH_TOI.lock().unwrap_or_else(|p| p.into_inner());
+    if m.is_none_or(|cu| cu < moi) {
+        *m = Some(moi);
+    }
+}
+
+/// Còn trong khoảng đọc dày không.
+pub fn dang_doc_nhanh() -> bool {
+    DOC_NHANH_TOI.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|t| std::time::Instant::now() < t)
+}
 
 /// `IOCTL_USBPRINT_VENDOR_GET_COMMAND` (usbprint.h, index 15).
 pub const IOCTL_USBPRINT_VENDOR_GET_COMMAND: u32 = 0x0022_003C;
@@ -333,8 +402,12 @@ static SO_TAM_NGUNG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 pub struct TamNgungDocUsb(());
 
 impl TamNgungDocUsb {
+    /// Bật tạm ngừng rồi CHỜ lần đọc thiết bị đang chạy (nếu có) xong — 0.2.6
+    /// chỉ tăng bộ đếm: một lần đọc đã qua bước kiểm cờ vẫn hỏi thiết bị đúng lúc
+    /// Sumatra nộp job (review Codex 25/09).
     pub fn bat() -> Self {
         SO_TAM_NGUNG.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(KHOA_DOC_THIET_BI.lock().unwrap_or_else(|p| p.into_inner()));
         TamNgungDocUsb(())
     }
 }
@@ -344,6 +417,10 @@ impl Drop for TamNgungDocUsb {
         SO_TAM_NGUNG.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+/// Giữ suốt MỘT lần hỏi thiết bị (kiểm cờ tạm ngừng NẰM TRONG khoá) —
+/// `TamNgungDocUsb::bat` lấy khoá này để chờ lần đọc đang dở.
+static KHOA_DOC_THIET_BI: Mutex<()> = Mutex::new(());
 
 pub fn dang_tam_ngung() -> bool {
     SO_TAM_NGUNG.load(std::sync::atomic::Ordering::SeqCst) > 0
@@ -638,6 +715,9 @@ mod win {
         let Some(so) = la_cong_usb_cuc_bo(may_chu, thuoc_tinh, cong) else {
             return DocCong::KhongPhaiUsb;
         };
+        // Kiểm cờ TRONG khoá: `TamNgungDocUsb::bat` đã bật cờ thì lần đọc mới
+        // dừng ở đây; lần đọc đã qua thì `bat` chờ nó xong mới trả về.
+        let _dang_doc = super::KHOA_DOC_THIET_BI.lock().unwrap_or_else(|p| p.into_inner());
         if dang_tam_ngung() {
             return DocCong::TamNgung;
         }
@@ -883,5 +963,38 @@ mod tests {
         assert_eq!(khay_1_tu_byte(&[0x00, 0x00, 0x00, 0x00]), None);
         assert_eq!(khay_1_tu_byte(&[0x00, 0x96, 0xFF, 0xFF]), None);
         assert_eq!(khay_1_tu_byte(&[0x00, 0x96]), None);
+    }
+
+    /// 0.2.7: pha HP (byte 2 trạng thái của hãng) quyết "đang chạy / rảnh",
+    /// không phải 1284 STATUS — đúng các mẫu đo trong sự cố 030134/030136.
+    #[test]
+    fn pha_hp_quyet_thay_status_1284() {
+        let d = |hang: &str, status: &str, khay: Option<(u16, u16)>| DocUsb {
+            byte: 0x18,
+            status: Some(status.into()),
+            hang: Some(hang.into()),
+            khay: None,
+            khay_1: khay,
+        };
+        let day = Some((150, 150));
+        // Ngủ mà 1284 báo BUSY (21:39:28–21:43:06) → rảnh.
+        assert_eq!(d("01 01 03 FF 46 00 00 00", "BUSY", day).tinh_trang(), TinhTrangUsb::Ranh);
+        assert_eq!(d("01 01 03 FF 46 00 00 00", "BUSY", day).pha_hp(), Some(PhaHp::Ngu));
+        // Đang chạy job mà 1284 báo IDLE (21:43:08.7, 21:46:53.3) → đang in.
+        assert_eq!(d("01 01 04 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::DangIn);
+        assert_eq!(d("09 01 04 FF 46 00 00 00", "BUSY", day).tinh_trang(), TinhTrangUsb::DangIn);
+        // Khởi động sau nạp giấy (21:46:47) → đang in (chưa xong).
+        assert_eq!(d("01 01 05 FF 46 00 00 00", "BUSY", day).tinh_trang(), TinhTrangUsb::DangIn);
+        assert_eq!(d("01 01 01 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::Ranh);
+        // Khay trống: hết giấy; lỗi hãng mà khay còn giấy: cần xử lý.
+        assert_eq!(d("0C 03 02 02 46 00 00 00", "IDLE", Some((150, 0))).tinh_trang(), TinhTrangUsb::Loi(MaSuCo::HetGiay));
+        assert_eq!(d("0C 03 02 02 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::Loi(MaSuCo::CanXuLy));
+        // Mã chưa đo → đang làm việc, không bao giờ "xong".
+        assert_eq!(d("01 01 07 FF 46 00 00 00", "IDLE", day).pha_hp(), Some(PhaHp::ChuaDo(7)));
+        assert_eq!(d("01 01 07 FF 46 00 00 00", "IDLE", day).tinh_trang(), TinhTrangUsb::DangIn);
+        // Không có trạng thái hãng (máy khác): luật 1284 cũ.
+        let khac = DocUsb { byte: 0x18, status: Some("IDLE".into()), hang: None, khay: None, khay_1: None };
+        assert_eq!(khac.pha_hp(), None);
+        assert_eq!(khac.tinh_trang(), TinhTrangUsb::Ranh);
     }
 }

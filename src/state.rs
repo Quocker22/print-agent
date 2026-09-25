@@ -114,6 +114,16 @@ pub struct TrangThaiChung {
     pub tu_choi_ket_noi: Option<String>,
     /// Hàng đợi server giữ + huỷ / bỏ theo dõi (hợp đồng v5.1 §8, 0.2.6).
     pub hang_doi: HangDoiApp,
+    /// `print_jobs.id` của các hoá đơn đang NẰM TRONG BỘ NHỚ máy in (theo dõi
+    /// tiếp qua USB) — giao diện tách riêng "sẽ in khi nạp giấy" (0.2.7).
+    pub trong_may_in: Vec<String>,
+    /// `print_jobs.id` người dùng đã "Thôi theo dõi": kết luận sau đó của theo
+    /// dõi tiếp chỉ ghi nhật ký quan sát, không gửi "đã in" (0.2.7).
+    pub thoi_theo_doi: Vec<String>,
+    /// Lúc một hoá đơn nằm trong bộ nhớ máy in vừa có kết luận (máy vừa hồi
+    /// phục sau lỗi). Hoá đơn gửi NGAY SAU đó không được báo "đã in" — sự cố
+    /// 030134/030136 (25/09): máy in 134 hai lần, 136 không ra mà vẫn "đã in".
+    pub hoi_phuc_co_hoa_don_ket: Option<std::time::Instant>,
 }
 
 /// `print_jobs.id` của một job id backend gửi (`<id>-<13 chữ số ms>`, 25/09).

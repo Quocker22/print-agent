@@ -29,7 +29,7 @@ import "../assets/font-semibold.ttf";
 export struct JobRow { so_hoa_don: string, khach: string, badge: string, da_in: bool, khong_ro: bool, dang_xu_ly: bool, da_huy: bool, luc: string }
 
 // Một dòng khối HÀNG ĐỢI (hợp đồng v5.1 §8) — Rust dựng ở hang_doi::HangDoiApp::khoi.
-// mau: 0 chờ gửi · 1 tạm giữ · 2 đang gửi/in · 3 chưa xác nhận.
+// mau: 0 chờ gửi · 1 tạm giữ · 2 đang gửi/in · 3 chưa xác nhận · 4 trong bộ nhớ máy in.
 // che_do: 0 thường · 1 hỏi xác nhận huỷ · 2 hỏi xác nhận bỏ · 3 vì sao · 4 đang làm
 //         · 5 đã huỷ · 6 đã bỏ · 7 không được · 8 chưa rõ.
 export struct QueueRow {
@@ -122,12 +122,12 @@ component DongHangDoi inherits Rectangle {
     // Dòng vừa mở rộng (hỏi xác nhận / giải thích / báo lỗi): khung cuộn kéo nó vào tầm nhìn.
     callback can_hien(length, length);
 
-    property <color> mau_tt: d.mau == 1 ? #C2410C : (d.mau == 2 ? #1786BE : (d.mau == 3 ? #B7791F : #69727F));
-    property <bool> mo_rong: (d.che_do >= 1 && d.che_do <= 3) || d.che_do >= 7;
+    property <color> mau_tt: d.mau == 1 ? #C2410C : (d.mau == 2 ? #1786BE : (d.mau == 3 ? #B7791F : (d.mau == 4 ? #7C3AED : #69727F)));
+    property <bool> mo_rong: (d.che_do >= 1 && d.che_do <= 3) || d.che_do >= 6;
     changed height => {
         if (root.mo_rong) { root.can_hien(self.y, self.height); }
     }
-    background: d.che_do == 5 ? #EEF8F1 : (d.che_do == 7 ? #FDF1F0 : (d.che_do == 8 ? #FFF8E6 : (d.che_do == 1 || d.che_do == 2 ? #FBF7F2 : transparent)));
+    background: d.che_do == 5 ? #EEF8F1 : (d.che_do == 7 ? #FDF1F0 : (d.che_do == 8 || d.che_do == 6 ? #FFF8E6 : (d.che_do == 1 || d.che_do == 2 ? #FBF7F2 : (d.mau == 4 ? #F6F2FF : transparent))));
 
     VerticalLayout {
         if !root.dau: Rectangle { height: 1px; background: #EEF0F3; }
@@ -154,7 +154,7 @@ component DongHangDoi inherits Rectangle {
                     chu: "Huỷ lại"; kieu: 1; bat: root.d.bat_nut;
                     bam => { root.huy(root.d.id); }
                 }
-                if root.d.che_do == 7 || root.d.che_do == 8: NutNho {
+                if root.d.che_do >= 6: NutNho {
                     chu: "×"; kieu: 0; co_chu: 16px;
                     bam => { root.dong(root.d.id); }
                 }
@@ -184,7 +184,7 @@ component DongHangDoi inherits Rectangle {
                     bam => { root.xac_nhan_huy(root.d.id); }
                 }
                 if root.d.che_do == 2: NutNho {
-                    chu: "Bỏ khỏi hàng đợi"; kieu: 3; bat: root.d.bat_nut;
+                    chu: "Thôi theo dõi"; kieu: 3; bat: root.d.bat_nut;
                     bam => { root.xac_nhan_bo(root.d.id); }
                 }
             }
@@ -194,14 +194,14 @@ component DongHangDoi inherits Rectangle {
                 alignment: end; spacing: 8px;
                 NutNho { chu: "Đóng"; kieu: 0; bam => { root.dong(root.d.id); } }
                 if root.d.co_nut_bo: NutNho {
-                    chu: "Bỏ khỏi hàng đợi"; kieu: 0; bat: root.d.bat_nut;
+                    chu: "Thôi theo dõi (máy vẫn in)"; kieu: 0; bat: root.d.bat_nut;
                     bam => { root.bo(root.d.id); }
                 }
             }
             // Đang gửi yêu cầu / đã huỷ (CHỈ khi server ack ok) / đã bỏ / không được / chưa rõ.
             if root.d.che_do == 4: ChuIcon { chu: root.d.thong_diep; mau: #1786BE; icon: 2; }
             if root.d.che_do == 5: ChuIcon { chu: root.d.thong_diep; mau: #15803D; icon: 3; }
-            if root.d.che_do == 6: ChuIcon { chu: root.d.thong_diep; mau: #4B5563; dam: 400; }
+            if root.d.che_do == 6: ChuIcon { chu: root.d.thong_diep; mau: #8A5A00; }
             if root.d.che_do == 7: ChuIcon { chu: root.d.thong_diep; mau: #A12A1E; }
             if root.d.che_do == 8: ChuIcon { chu: root.d.thong_diep; mau: #8A5A00; }
         }
@@ -259,6 +259,8 @@ export component MainWindow inherits Window {
     in property <string> hd_loat_chu: "";
     in property <string> hd_loat_nut: "";
     in property <[QueueRow]> hd_dong: [];
+    // Có dòng đang mở xác nhận / giải thích → danh sách cao hơn cho đủ nút.
+    in property <bool> hd_mo_rong: false;
     // Trang Cấu hình thay chỗ Hàng đợi + In gần đây (cửa sổ vừa màn hình laptop
     // 768px cả khi hết giấy: dải đỏ + dải cam + hàng đợi). Rust mở sẵn khi thiếu cấu hình.
     in-out property <bool> cau_hinh_mo: false;
@@ -394,7 +396,7 @@ export component MainWindow inherits Window {
                 // Danh sách: cao theo nội dung, tối đa 170px rồi cuộn; dòng vừa
                 // mở rộng được kéo vào tầm nhìn (nút "Huỷ lệnh in" không nằm khuất).
                 khung_hd := ScrollView {
-                    height: min(ds_hd.preferred-height, 170px);
+                    height: min(ds_hd.preferred-height, root.hd_mo_rong ? 230px : 170px);
                     ds_hd := VerticalLayout {
                         for d[i] in root.hd_dong: DongHangDoi {
                             d: d; dau: i == 0;
@@ -424,7 +426,7 @@ export component MainWindow inherits Window {
             background: white; border-radius: 10px; border-width: 1px; border-color: #E2E6EC;
             // Hàng đợi hiện: còn MỘT dòng (cuộn xem thêm) — ca nặng nhất (dải đỏ nhiều
             // dòng + hàng đợi + loạt) vẫn vừa màn 1366×768 có thanh taskbar.
-            height: root.hd_hien ? 50px : 160px;
+            height: root.hd_mo_rong ? 50px : (root.hd_hien ? 98px : 160px);
             ScrollView {
                 VerticalLayout {
                     // Dòng 1: số hoá đơn · khách (hoặc id job đã cắt token) + giờ.

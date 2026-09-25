@@ -266,16 +266,34 @@ impl DanhSachTheoDoiTiep {
         self.xu_ly(vong, bay_gio, |j| j.may_in_that(mac_dinh) == may_in)
     }
 
+    /// MỘT chu kỳ máy (thấy chạy → về rảnh) chỉ xác nhận MỘT hoá đơn nằm trong
+    /// bộ nhớ máy — hoá đơn CŨ NHẤT (0.2.7, review Codex 25/09). 0.2.6 cho một
+    /// cặp mẫu BUSY→IDLE xác nhận MỌI hoá đơn trong máy cùng lúc: nạp giấy, máy
+    /// thức dậy rồi rảnh là N hoá đơn "đã in" dù không ra tờ nào. Các hoá đơn còn
+    /// lại phải thấy chu kỳ chạy MỚI; không thấy thì hết hạn rảnh → `Mat` (báo
+    /// "kiểm tờ"), không bao giờ `da_in` đoán.
     fn xu_ly(&mut self, vong: &VongDoc, bay_gio: Instant, cua: impl Fn(&JobTheoDoiTiep) -> bool) -> Vec<(JobTheoDoiTiep, KetLuanTiep)> {
         let tap = spooler::tap_may_in(vong);
         let mut xong = Vec::new();
         let mut con = VecDeque::with_capacity(self.ds.len());
+        let mut da_xac_nhan_qua_usb = false;
         for mut job in self.ds.drain(..) {
             if !cua(&job) {
                 con.push_back(job);
                 continue;
             }
             match xet_mot_job(&mut job, vong.hang_doi.as_deref(), tap, UsbVong::tu(vong), bay_gio) {
+                Some(KetLuanTiep::DaIn) if job.usb.is_some() => {
+                    if da_xac_nhan_qua_usb {
+                        if let Some(u) = job.usb.as_mut() {
+                            u.da_thay_in = false;
+                        }
+                        con.push_back(job);
+                    } else {
+                        da_xac_nhan_qua_usb = true;
+                        xong.push((job, KetLuanTiep::DaIn));
+                    }
+                }
                 Some(kl) => xong.push((job, kl)),
                 None => con.push_back(job),
             }
@@ -498,6 +516,24 @@ impl KhoTheoDoiTiep {
 
     pub fn so_job(&self) -> usize {
         self.khoa().ds.ds.len()
+    }
+
+    /// `print_jobs.id` các hoá đơn đang nằm trong BỘ NHỚ máy in (theo dõi qua
+    /// USB) trên máy `may_in` — giao diện hiện "sẽ in khi nạp giấy" (0.2.7).
+    pub fn id_trong_may_in(&self, may_in: &str) -> Vec<String> {
+        self.khoa()
+            .ds
+            .ds
+            .iter()
+            .filter(|j| j.la_qua_usb() && j.may_in_that(may_in) == may_in)
+            .filter_map(|j| crate::state::print_job_id(&j.job_id).map(str::to_string))
+            .collect()
+    }
+
+    /// Còn hoá đơn trong bộ nhớ máy `may_in` chưa có kết luận — máy CHƯA xong
+    /// phần việc tồn (0.2.7: chưa báo "bình thường" để server nhả hoá đơn mới).
+    pub fn co_hoa_don_trong_may(&self, may_in: &str) -> bool {
+        self.khoa().ds.ds.iter().any(|j| j.la_qua_usb() && j.may_in_that(may_in) == may_in)
     }
 
     /// Luồng mới nhận quyền chủ — luồng cũ (lần chạy mạng trước) mất quyền và tự thoát.
@@ -1147,13 +1183,23 @@ mod tests {
         assert_eq!(j.ghi_chu_da_in(), None);
     }
 
-    /// Nhiều hoá đơn cùng nằm trong máy (3 lần gửi lúc hết giấy): máy in hết
-    /// rồi IDLE → CẢ BA cùng `da_in` trong cùng một vòng.
+    /// Nhiều hoá đơn cùng nằm trong máy (3 lần gửi lúc hết giấy): MỖI chu kỳ
+    /// chạy → rảnh chỉ xác nhận MỘT hoá đơn (cũ nhất) — 0.2.7; 0.2.6 cho cả ba
+    /// cùng `da_in` từ một cặp mẫu (review Codex 25/09).
     #[test]
-    fn u3_nhieu_hoa_don_trong_may_cung_da_in_khi_may_in_xong() {
+    fn u3_nhieu_hoa_don_trong_may_moi_chu_ky_mot_hoa_don() {
         let t0 = Instant::now();
         let mut sp = SpoolerGia {
-            vong: vec![vong_usb(USB_HET_GIAY), vong_usb(USB_DANG_IN), vong_usb(USB_RANH)],
+            vong: vec![
+                vong_usb(USB_HET_GIAY),
+                vong_usb(USB_DANG_IN),
+                vong_usb(USB_RANH),
+                vong_usb(USB_RANH),
+                vong_usb(USB_DANG_IN),
+                vong_usb(USB_RANH),
+                vong_usb(USB_DANG_IN),
+                vong_usb(USB_RANH),
+            ],
             ..Default::default()
         };
         let mut ds = DanhSachTheoDoiTiep::default();
@@ -1163,10 +1209,14 @@ mod tests {
             ds.them(j);
         }
         let mut ra = Vec::new();
-        for i in 0..3 {
-            ra.push(vong_theo_doi_tiep(&mut sp, &mut ds, t0 + CHU_KY * i).len());
+        let mut thu_tu = Vec::new();
+        for i in 0..8 {
+            let xong = vong_theo_doi_tiep(&mut sp, &mut ds, t0 + CHU_KY * i);
+            thu_tu.extend(xong.iter().map(|(j, _)| j.job_id.clone()));
+            ra.push(xong.len());
         }
-        assert_eq!(ra, vec![0, 0, 3]);
+        assert_eq!(ra, vec![0, 0, 1, 0, 0, 1, 0, 1], "rảnh lần hai KHÔNG xác nhận thêm");
+        assert_eq!(thu_tu, vec![format!("{}-1", ID), format!("{}-2", ID), format!("{}-3", ID)], "cũ nhất trước");
     }
 
     /// R3 → U3 (giám sát 25/09): job kẹt trong hàng đợi Windows (máy in tắt lúc
@@ -1224,5 +1274,27 @@ mod tests {
         assert_eq!(buoc(&mut j, &vong_usb_mat(), t0), None);
         assert_eq!(buoc(&mut j, &vong_usb_mat(), t0), Some(KetLuanTiep::DaIn));
         assert!(!j.la_qua_usb());
+    }
+
+    /// 0.2.7 — phát lại đúng chuỗi USB của hoá đơn 134 sau khi nạp giấy (sự cố
+    /// 25/09): 0.2.6 báo "đã in" lúc 1284 IDLE mà máy còn `04` (vừa chạy).
+    /// Nay chỉ xác nhận khi máy về `01` sẵn sàng.
+    #[test]
+    fn phat_lai_134_chi_xac_nhan_khi_may_ve_san_sang() {
+        use crate::usb_may_in::DocUsb;
+        let d = |hang: &str, status: &str, muc: u16| DocUsb {
+            byte: 0x18,
+            status: Some(status.into()),
+            hang: Some(hang.into()),
+            khay: None,
+            khay_1: Some((150, muc)),
+        };
+        let mut u = TheoDoiUsb { da_thay_loi: true, ma_loi: Some(MaSuCo::HetGiay), ..TheoDoiUsb::default() };
+        let buoc = |u: &mut TheoDoiUsb, doc: &DocUsb| xet_qua_usb(u, UsbVong { la_may_usb: true, doc: Some(doc), khong_doc_duoc: false });
+        assert_eq!(buoc(&mut u, &d("0C 03 02 02 46 00 00 00", "IDLE", 0)), None, "hết giấy");
+        assert_eq!(buoc(&mut u, &d("01 01 03 FF 46 00 00 00", "BUSY", 150)), None, "21:46:45 nạp giấy, máy ngủ");
+        assert_eq!(buoc(&mut u, &d("01 01 05 FF 46 00 00 00", "BUSY", 150)), None, "21:46:47 khởi động");
+        assert_eq!(buoc(&mut u, &d("01 01 04 FF 46 00 00 00", "IDLE", 150)), None, "21:46:53 — 0.2.6 báo đã in ở đây");
+        assert_eq!(buoc(&mut u, &d("01 01 01 FF 46 00 00 00", "IDLE", 150)), Some(KetLuanTiep::DaIn), "về sẵn sàng");
     }
 }

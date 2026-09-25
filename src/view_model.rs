@@ -96,7 +96,9 @@ pub fn nhan_job_co_hang_doi(trang_thai: &str, loai: Option<MaSuCo>, sau_khac_phu
         job::LOI if co_hang_doi && loai == Some(MaSuCo::HetGiay) => {
             return "Chưa in: Hết giấy — đã trả về hàng đợi".into()
         }
-        job::DA_IN if sau_khac_phuc => return "Đã in (sau khi khắc phục)".into(),
+        // Hoá đơn kẹt trong máy: app chỉ thấy MÁY chạy một chu kỳ sau khi nạp
+        // giấy, không thấy tờ nào (máy HP 108a từng in trùng/bỏ tờ — 25/09).
+        job::DA_IN if sau_khac_phuc => return "Máy đã in sau khi khắc phục — kiểm tờ".into(),
         job::DA_IN => return "Đã in".into(),
         job::DANG_GUI => return "Đang gửi xuống máy in…".into(),
         job::CHO_MAY_IN => return "Đã gửi xuống máy in — đang chờ in ra…".into(),
@@ -127,8 +129,11 @@ fn dong_job(j: &JobLog, co_hang_doi: bool) -> JobRow {
             Some((k, n)) if j.trang_thai == job::KHONG_RO => printing::chu_thieu_ban(k, n),
             _ => nhan_job_co_hang_doi(&j.trang_thai, j.loai, j.sau_khac_phuc, co_hang_doi),
         },
-        da_in: j.trang_thai == job::DA_IN,
-        khong_ro: j.trang_thai == job::KHONG_RO || (j.trang_thai == job::LOI && j.loai == Some(MaSuCo::HetGiay)),
+        // "Máy đã in sau khi khắc phục — kiểm tờ" KHÔNG tô xanh "đã in chắc chắn" (0.2.7).
+        da_in: j.trang_thai == job::DA_IN && !j.sau_khac_phuc,
+        khong_ro: j.trang_thai == job::KHONG_RO
+            || (j.trang_thai == job::LOI && j.loai == Some(MaSuCo::HetGiay))
+            || (j.trang_thai == job::DA_IN && j.sau_khac_phuc),
         dang_xu_ly: j.trang_thai == job::DANG_GUI || j.trang_thai == job::CHO_MAY_IN,
         da_huy: j.trang_thai == job::DA_HUY,
         luc: j.luc.clone(),
@@ -364,7 +369,7 @@ mod tests {
     fn nhan_job_theo_ket_qua() {
         assert_eq!(nhan_job("da_in", None, false), "Đã in");
         assert_eq!(nhan_job("da_in", Some(MaSuCo::HetGiay), false), "Đã in");
-        assert_eq!(nhan_job("da_in", None, true), "Đã in (sau khi khắc phục)");
+        assert_eq!(nhan_job("da_in", None, true), "Máy đã in sau khi khắc phục — kiểm tờ");
         // 0.2.5: từ chối gửi vì khay trống — nói việc cần làm, không "Lỗi".
         assert_eq!(nhan_job("loi", Some(MaSuCo::HetGiay), false), "Chờ giấy — nạp giấy vào khay là tự in");
         assert_eq!(nhan_job("dang_gui", None, false), "Đang gửi xuống máy in…");

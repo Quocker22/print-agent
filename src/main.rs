@@ -19,6 +19,7 @@ mod mot_ban;
 mod net;
 mod nhat_ky;
 mod printing;
+mod sha256;
 mod spooler;
 mod state;
 mod su_co;

@@ -479,10 +479,18 @@ pub struct VongDoc {
 }
 
 /// Được hỏi thiết bị USB khi mọi job trong hàng đợi đã GỬI XONG xuống máy in
-/// (PRINTED / COMPLETE / RETAINED — "Keep printed documents" giữ job lại mãi)
-/// hoặc hàng đợi rỗng: không còn byte nào đang đi xuống cổng.
+/// (PRINTED / COMPLETE; RETAINED chỉ khi KHÔNG còn PRINTING/SPOOLING) hoặc
+/// hàng đợi rỗng: không còn byte nào đang đi xuống cổng.
+///
+/// 0.2.7 (review Codex 25/09): máy HP 108a đặt RETAINED (0x2000) cho job ngay
+/// từ lúc đang gửi (`0x2010` = PRINTING|RETAINED ở mọi job) — 0.2.6 coi đó là
+/// "đã gửi xong" nên hỏi thiết bị đúng lúc byte đang đi xuống cổng.
 pub fn hang_doi_cho_doc_usb(jobs: &[JobHangDoi]) -> bool {
-    jobs.iter().all(|j| j.status & (co::JOB_STATUS_PRINTED | co::JOB_STATUS_COMPLETE | co::JOB_STATUS_RETAINED) != 0)
+    jobs.iter().all(|j| {
+        j.status & (co::JOB_STATUS_PRINTED | co::JOB_STATUS_COMPLETE) != 0
+            || (j.status & co::JOB_STATUS_RETAINED != 0
+                && j.status & (co::JOB_STATUS_PRINTING | co::JOB_STATUS_SPOOLING) == 0)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -919,6 +927,9 @@ pub enum SauKhiRoi {
     TrongMayInUsb(MaSuCo),
     /// Máy USB vẫn BUSY quá `SO_LAN_USB_TOI_DA` lần đọc — chưa biết in xong chưa.
     UsbChuaXong,
+    /// Máy USB mà KHÔNG đọc được thiết bị lần nào sau khi job rời hàng đợi —
+    /// không có bằng chứng in (0.2.7, review Codex: 0.2.6 ra `Sach` sau 4 lần).
+    UsbKhongDoc,
 }
 
 /// Bộ quyết THUẦN của bước sau khi rời hàng đợi (R5c + U2), mỗi lần đọc một bước.
@@ -937,6 +948,8 @@ pub enum SauKhiRoi {
 #[derive(Debug, Default)]
 pub struct BoSauKhiRoi {
     so_lan: usize,
+    /// Máy in nằm trên cổng USB cục bộ (dù lần này đọc được thiết bị hay không).
+    pub la_may_usb: bool,
     da_thay_usb: bool,
     /// Máy đã từng báo STATUS đo được (IDLE/BUSY).
     co_status: bool,
@@ -960,6 +973,11 @@ impl BoSauKhiRoi {
             return Some(if self.da_thay_usb { SauKhiRoi::TrongMayInUsb(ma) } else { SauKhiRoi::SuCo(ma) });
         }
         if !self.da_thay_usb {
+            // Máy USB chưa đọc được thiết bị lần nào: KHÔNG có bằng chứng — chờ
+            // tới trần (`het_gio` → `UsbKhongDoc`), không bao giờ `Sach`.
+            if self.la_may_usb {
+                return (self.so_lan >= SO_LAN_USB_TOI_DA).then(|| self.het_gio());
+            }
             return (self.so_lan >= SO_LAN_DOC_MAY_IN_SAU_KHI_ROI).then_some(SauKhiRoi::Sach);
         }
         match usb {
@@ -1000,6 +1018,8 @@ impl BoSauKhiRoi {
     pub fn het_gio(&self) -> SauKhiRoi {
         if self.da_thay_usb {
             SauKhiRoi::UsbChuaXong
+        } else if self.la_may_usb {
+            SauKhiRoi::UsbKhongDoc
         } else {
             SauKhiRoi::Sach
         }
@@ -1027,6 +1047,7 @@ fn kiem_may_in_sau_khi_roi(
         let vong = sp.doc_vong();
         vet.ghi("sau_roi", &vong, job_id);
         let chan_moi = bao_may_in(&vong, nen, bao).chan_moi;
+        bo.la_may_usb |= vong.la_may_usb;
         if let Some(kl) = bo.them(chan_moi, vong.usb.as_ref().map(DocUsb::tinh_trang)) {
             return (kl, bo.da_thay_dang_in());
         }
@@ -1253,6 +1274,10 @@ fn ket_thuc(
                     bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: true, da_thay_in: false });
                     KetQuaIn::KhongRo(LyDo::co_loai(chu_trong_may_in_usb(ma), ma))
                 }
+                (SauKhiRoi::UsbKhongDoc, _) => KetQuaIn::KhongRo(LyDo::co_loai(
+                    "khong doc duoc may in USB sau khi job roi hang doi — khong co bang chung da in, kiem to",
+                    MaSuCo::KhongXacNhan,
+                )),
                 (SauKhiRoi::UsbChuaXong, da_thay_in) => {
                     bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: false, da_thay_in });
                     KetQuaIn::KhongRo(LyDo::co_loai(
@@ -3426,5 +3451,35 @@ mod tests {
             d.khay_1 = Some((150, 0));
         }
         assert!(matches!(kiem_truoc_khi_in(&v, "HP", None, false), KiemTruoc::In { .. }));
+    }
+
+    /// 0.2.7 (review Codex): máy USB không đọc được thiết bị lần nào sau khi
+    /// job rời hàng đợi → KHÔNG `Sach` (0.2.6: 4 lần là "đã in").
+    #[test]
+    fn may_usb_khong_doc_duoc_khong_bao_gio_la_da_in() {
+        let mut bo = BoSauKhiRoi { la_may_usb: true, ..Default::default() };
+        for _ in 0..SO_LAN_USB_TOI_DA - 1 {
+            assert_eq!(bo.them(None, None), None);
+        }
+        assert_eq!(bo.them(None, None), Some(SauKhiRoi::UsbKhongDoc));
+        assert_eq!(bo.het_gio(), SauKhiRoi::UsbKhongDoc);
+        // Máy không USB: luật cũ giữ nguyên.
+        let mut bo = BoSauKhiRoi::default();
+        for _ in 0..SO_LAN_DOC_MAY_IN_SAU_KHI_ROI - 1 {
+            assert_eq!(bo.them(None, None), None);
+        }
+        assert_eq!(bo.them(None, None), Some(SauKhiRoi::Sach));
+    }
+
+    /// 0.2.7: RETAINED lúc còn PRINTING/SPOOLING chưa phải "đã gửi xong".
+    #[test]
+    fn retained_dang_gui_chua_cho_doc_usb() {
+        let j = |status: u32| job(1, status);
+        assert!(!hang_doi_cho_doc_usb(&[j(co::JOB_STATUS_RETAINED | co::JOB_STATUS_PRINTING)]), "0x2010 của HP 108a");
+        assert!(!hang_doi_cho_doc_usb(&[j(co::JOB_STATUS_RETAINED | co::JOB_STATUS_SPOOLING)]));
+        assert!(hang_doi_cho_doc_usb(&[j(co::JOB_STATUS_RETAINED)]));
+        assert!(hang_doi_cho_doc_usb(&[j(co::JOB_STATUS_RETAINED | co::JOB_STATUS_PRINTED)]));
+        assert!(hang_doi_cho_doc_usb(&[j(co::JOB_STATUS_COMPLETE)]));
+        assert!(hang_doi_cho_doc_usb(&[]));
     }
 }
