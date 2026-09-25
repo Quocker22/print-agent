@@ -2383,7 +2383,7 @@ mod tests {
 
     /// ĐẦU-CUỐI hàng đợi v5.1 (chạy tay): NGUYÊN ngăn mạng thật của app
     /// (`khoi_chay` → callback `cau-hinh`/`hang-doi`, luồng hỏi lại, luồng gửi yêu
-    /// cầu) nối vào server socket.io 4.x giả theo hợp đồng (scratch `mock-hd/server.js`).
+    /// cầu) nối vào server socket.io 4.x giả theo hợp đồng (`tests/e2e-hang-doi/server.js`).
     /// `HD_URL=http://127.0.0.1:47812 cargo test -- --ignored hang_doi_dau_cuoi --nocapture`
     #[test]
     #[ignore]
