@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! File nhật ký cục bộ `%LOCALAPPDATA%\print-agent\logs\print-agent-YYYY-MM-DD.txt`
-//! — mỗi dòng một sự kiện, giữ 14 ngày (hợp đồng v2 §4.5). Đuôi `.txt` (0.2.3,
-//! chủ yêu cầu): bấm đúp là mở bằng Notepad; nút "Nhật ký" trên app mở file hôm
-//! nay. File `.log` của bản cũ vẫn được dọn theo 14 ngày.
+//! — mỗi dòng một sự kiện, giữ 30 ngày (0.2.7, chủ: "toàn bộ log chỉ lưu 30
+//! ngày"; trước là 14). Đuôi `.txt` (0.2.3, chủ yêu cầu): bấm đúp là mở bằng
+//! Notepad; nút "Nhật ký" trên app mở file hôm nay. File `.log` của bản cũ vẫn
+//! được dọn theo cùng hạn.
+//!
+//! TRẦN DUNG LƯỢNG (0.2.7, "tránh tăng bộ nhớ"): mỗi file ngày tối đa
+//! `MOI_NGAY_TOI_DA` (quá thì ghi MỘT dòng báo rồi bỏ các dòng còn lại của
+//! ngày — vòng lặp lỗi không làm đầy đĩa), cả thư mục tối đa `TONG_TOI_DA`
+//! (quá thì xoá file CŨ NHẤT trước, không bao giờ xoá file hôm nay).
 //!
 //! VÌ SAO CẦN: trước bản này app chỉ in ra stderr, mà mở bằng double-click thì
 //! không ai thấy stderr (handoff §12.1) — shop kêu "không in được" là không có
@@ -32,8 +38,12 @@ const TIEN_TO: &str = "print-agent-";
 const DUOI: &str = ".txt";
 /// Đuôi của bản ≤ 0.2.2 — chỉ để dọn file cũ.
 const DUOI_CU: &str = ".log";
-/// Giữ file của 14 ngày gần nhất (kể cả hôm nay).
-const SO_NGAY_GIU: u64 = 14;
+/// Giữ file của 30 ngày gần nhất (kể cả hôm nay).
+const SO_NGAY_GIU: u64 = 30;
+/// Trần một file ngày (bình thường ~1 MB/ngày).
+const MOI_NGAY_TOI_DA: u64 = 20 * 1024 * 1024;
+/// Trần cả thư mục nhật ký.
+const TONG_TOI_DA: u64 = 200 * 1024 * 1024;
 /// Token ngắn hơn ngưỡng này không đem đi thay — thay chuỗi 2–3 ký tự là nát
 /// cả dòng nhật ký mà không che được gì đáng kể.
 const DO_DAI_BI_MAT_TOI_THIEU: usize = 6;
@@ -181,17 +191,66 @@ pub fn ghi(su_kien: &str, noi_dung: &str) {
 fn chay_luong_ghi(dir: PathBuf, nhan: mpsc::Receiver<Dong>) {
     // Ngày (UTC) đã dọn file cũ — dọn lúc ghi dòng đầu tiên và mỗi khi sang ngày.
     let mut ngay_da_don: Option<String> = None;
+    let mut tran = TranNgay::default();
     while let Ok((luc, su_kien, noi_dung)) = nhan.recv() {
         let hom_nay = thoi_gian::ngay_utc(luc);
         if ngay_da_don.as_deref() != Some(hom_nay.as_str()) {
             don_file_cu(&dir, luc);
-            ngay_da_don = Some(hom_nay);
+            ngay_da_don = Some(hom_nay.clone());
         }
         let bi_mat = BI_MAT.lock().map(|ds| ds.clone()).unwrap_or_default();
         let noi_dung = che(&noi_dung, &bi_mat);
-        if let Err(e) = ghi_vao(&dir, luc, &su_kien, &noi_dung) {
+        let dong = dong_nhat_ky(luc, &su_kien, &noi_dung);
+        let ghi_gi = tran.xet(&hom_nay, dong.len() as u64, || {
+            std::fs::metadata(dir.join(ten_file(&hom_nay))).map_or(0, |m| m.len())
+        });
+        let dong = match ghi_gi {
+            GhiGi::Dong => dong,
+            GhiGi::BaoDay => dong_nhat_ky(
+                luc,
+                "nhat_ky_day",
+                &format!("file hom nay da {} MB — bo cac dong con lai den het ngay (UTC)", MOI_NGAY_TOI_DA / 1024 / 1024),
+            ),
+            GhiGi::Bo => continue,
+        };
+        if let Err(e) = ghi_dong(&dir, &hom_nay, &dong) {
             eprintln!("[print-agent] ghi nhật ký lỗi ({}): {}", dir.display(), e);
         }
+    }
+}
+
+/// Việc với một dòng theo trần file ngày.
+#[derive(Debug, PartialEq, Eq)]
+enum GhiGi {
+    Dong,
+    /// Vừa chạm trần: ghi MỘT dòng báo thay cho dòng này.
+    BaoDay,
+    Bo,
+}
+
+/// Đếm dung lượng file ngày trong bộ nhớ (không `stat` mỗi dòng).
+#[derive(Debug, Default)]
+struct TranNgay {
+    ngay: String,
+    da_ghi: u64,
+    da_bao: bool,
+}
+
+impl TranNgay {
+    /// `kich_thuoc_dau` chỉ gọi khi sang ngày mới / lần đầu (file có thể đã có từ lần chạy trước).
+    fn xet(&mut self, ngay: &str, dai: u64, kich_thuoc_dau: impl FnOnce() -> u64) -> GhiGi {
+        if self.ngay != ngay {
+            *self = TranNgay { ngay: ngay.to_string(), da_ghi: kich_thuoc_dau(), da_bao: false };
+        }
+        if self.da_bao {
+            return GhiGi::Bo;
+        }
+        if self.da_ghi + dai <= MOI_NGAY_TOI_DA {
+            self.da_ghi += dai;
+            return GhiGi::Dong;
+        }
+        self.da_bao = true;
+        GhiGi::BaoDay
     }
 }
 
@@ -213,13 +272,15 @@ fn ten_file(ngay: &str) -> String {
 
 /// Mở-ghi-đóng mỗi dòng: không giữ handle qua đêm (sang ngày tự sang file mới,
 /// người dùng xoá/mở file lúc app chạy cũng không sao).
+#[cfg(test)]
 fn ghi_vao(dir: &Path, luc: SystemTime, su_kien: &str, noi_dung: &str) -> std::io::Result<()> {
+    ghi_dong(dir, &thoi_gian::ngay_utc(luc), &dong_nhat_ky(luc, su_kien, noi_dung))
+}
+
+fn ghi_dong(dir: &Path, ngay: &str, dong: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(ten_file(&thoi_gian::ngay_utc(luc))))?;
-    f.write_all(dong_nhat_ky(luc, su_kien, noi_dung).as_bytes())
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(ten_file(ngay)))?;
+    f.write_all(dong.as_bytes())
 }
 
 /// Ngày trong tên file nhật ký của app, `None` nếu không đúng mẫu — chỉ đụng
@@ -233,15 +294,35 @@ fn ngay_cua_file(ten: &str) -> Option<&str> {
     dung_mau.then_some(ngay)
 }
 
-/// Xoá file nhật ký có ngày ≤ (hôm nay − 14): giữ đúng 14 ngày gần nhất.
-/// So chuỗi "YYYY-MM-DD" theo thứ tự từ điển = so ngày.
+/// Xoá file nhật ký có ngày ≤ (hôm nay − 30): giữ đúng 30 ngày gần nhất; rồi
+/// nếu cả thư mục (file của app) vẫn quá `TONG_TOI_DA` thì xoá file CŨ NHẤT
+/// trước — trừ file hôm nay. So chuỗi "YYYY-MM-DD" theo thứ tự từ điển = so ngày.
 fn don_file_cu(dir: &Path, bay_gio: SystemTime) {
+    don_file_cu_voi_tran(dir, bay_gio, TONG_TOI_DA);
+}
+
+fn don_file_cu_voi_tran(dir: &Path, bay_gio: SystemTime, tong_toi_da: u64) {
     let moc = thoi_gian::ngay_utc_truoc(bay_gio, SO_NGAY_GIU);
+    let hom_nay = thoi_gian::ngay_utc(bay_gio);
     let Ok(ds) = std::fs::read_dir(dir) else { return };
+    let mut con: Vec<(String, PathBuf, u64)> = Vec::new();
     for f in ds.flatten() {
         let ten = f.file_name().to_string_lossy().into_owned();
-        if ngay_cua_file(&ten).is_some_and(|ngay| ngay <= moc.as_str()) {
+        let Some(ngay) = ngay_cua_file(&ten).map(str::to_string) else { continue };
+        if ngay <= moc {
             let _ = std::fs::remove_file(f.path());
+        } else {
+            con.push((ngay, f.path(), f.metadata().map_or(0, |m| m.len())));
+        }
+    }
+    con.sort();
+    let mut tong: u64 = con.iter().map(|(_, _, n)| n).sum();
+    for (ngay, duong, n) in con {
+        if tong <= tong_toi_da || ngay >= hom_nay {
+            break;
+        }
+        if std::fs::remove_file(&duong).is_ok() {
+            tong = tong.saturating_sub(n);
         }
     }
 }
@@ -303,21 +384,52 @@ mod tests {
         }
     }
 
+    fn con_lai(dir: &Path) -> Vec<String> {
+        let mut con: Vec<String> =
+            std::fs::read_dir(dir).unwrap().flatten().map(|f| f.file_name().to_string_lossy().into_owned()).collect();
+        con.sort();
+        con
+    }
+
     #[test]
-    fn don_file_cu_giu_14_ngay_va_khong_dung_file_la() {
+    fn don_file_cu_giu_30_ngay_va_khong_dung_file_la() {
         let dir = thu_muc_tam("don");
         std::fs::create_dir_all(&dir).unwrap();
-        for ten in ["print-agent-2026-09-09.log", "print-agent-2026-09-10.log", "print-agent-2026-09-11.log",
-                    "print-agent-2026-09-24.log", "ghi-chu.txt", "print-agent-cu.log"] {
+        for ten in ["print-agent-2026-08-24.log", "print-agent-2026-08-25.txt", "print-agent-2026-08-26.txt",
+                    "print-agent-2026-09-24.txt", "ghi-chu.txt", "print-agent-cu.log"] {
             std::fs::write(dir.join(ten), "x").unwrap();
         }
         don_file_cu(&dir, hom_nay());
-        let mut con: Vec<String> = std::fs::read_dir(&dir).unwrap()
-            .flatten().map(|f| f.file_name().to_string_lossy().into_owned()).collect();
-        con.sort();
-        // 24/09 − 14 = 10/09 ⇒ xoá 09/09 và 10/09; giữ 11/09..24/09 (14 ngày) + file lạ.
-        assert_eq!(con, vec!["ghi-chu.txt", "print-agent-2026-09-11.log", "print-agent-2026-09-24.log", "print-agent-cu.log"]);
+        // 24/09 − 30 = 25/08 ⇒ xoá 24/08 và 25/08; giữ 26/08..24/09 (30 ngày) + file lạ.
+        assert_eq!(con_lai(&dir), vec!["ghi-chu.txt", "print-agent-2026-08-26.txt", "print-agent-2026-09-24.txt", "print-agent-cu.log"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cả thư mục quá trần → xoá file CŨ NHẤT trước, KHÔNG xoá file hôm nay, không đụng file lạ.
+    #[test]
+    fn don_theo_tong_dung_luong_xoa_cu_nhat_truoc() {
+        let dir = thu_muc_tam("tran");
+        std::fs::create_dir_all(&dir).unwrap();
+        for ten in ["print-agent-2026-09-20.txt", "print-agent-2026-09-21.txt", "print-agent-2026-09-22.txt",
+                    "print-agent-2026-09-24.txt", "ghi-chu.txt"] {
+            std::fs::write(dir.join(ten), vec![b'x'; 100]).unwrap();
+        }
+        don_file_cu_voi_tran(&dir, hom_nay(), 250);
+        assert_eq!(con_lai(&dir), vec!["ghi-chu.txt", "print-agent-2026-09-22.txt", "print-agent-2026-09-24.txt"]);
+        don_file_cu_voi_tran(&dir, hom_nay(), 10);
+        assert_eq!(con_lai(&dir), vec!["ghi-chu.txt", "print-agent-2026-09-24.txt"], "file hôm nay giữ dù quá trần");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Trần file ngày: tới trần thì MỘT dòng báo rồi bỏ; sang ngày mới đếm lại
+    /// từ kích thước file có sẵn.
+    #[test]
+    fn tran_file_ngay() {
+        let mut t = TranNgay::default();
+        assert_eq!(t.xet("2026-09-24", 100, || MOI_NGAY_TOI_DA - 150), GhiGi::Dong);
+        assert_eq!(t.xet("2026-09-24", 100, || unreachable!()), GhiGi::BaoDay);
+        assert_eq!(t.xet("2026-09-24", 10, || unreachable!()), GhiGi::Bo, "đã báo: bỏ luôn (kể cả dòng ngắn)");
+        assert_eq!(t.xet("2026-09-25", 100, || 0), GhiGi::Dong, "sang ngày mới");
     }
 
     #[test]

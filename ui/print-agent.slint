@@ -249,6 +249,9 @@ export component MainWindow inherits Window {
     // chiều, và ghi lại khi người dùng bấm (xem src/tu_khoi_dong.rs).
     in-out property <bool> f_tu_khoi_dong: false;
     in property <string> loi_tu_khoi_dong: "";
+    // Giữ máy tính không tự ngủ (0.2.7, src/giu_thuc.rs) + câu giải thích/cảnh báo.
+    in-out property <bool> f_giu_thuc: true;
+    in property <string> chu_giu_thuc: "";
     // Khối HÀNG ĐỢI (0.2.6) — Rust bơm từ hang_doi::KhoiHangDoi mỗi nhịp.
     in property <bool> hd_hien: false;
     in property <string> hd_tieu_de: "";
@@ -280,6 +283,7 @@ export component MainWindow inherits Window {
     callback mo_nhat_ky();
     callback da_hieu();
     callback doi_tu_khoi_dong(bool);
+    callback doi_giu_thuc(bool);
 
     lop_chinh := VerticalLayout {
         padding: 14px;
@@ -492,6 +496,15 @@ export component MainWindow inherits Window {
                 if root.loi_tu_khoi_dong != "": Text {
                     text: root.loi_tu_khoi_dong;
                     color: #C0392B; font-size: 11px; wrap: word-wrap; height: self.preferred-height;
+                }
+                CheckBox {
+                    text: "Không cho máy tính tự ngủ khi app đang chạy";
+                    checked <=> root.f_giu_thuc;
+                    toggled => { root.doi_giu_thuc(self.checked); }
+                }
+                if root.chu_giu_thuc != "": Text {
+                    text: root.chu_giu_thuc;
+                    color: #B45309; font-size: 11px; wrap: word-wrap; height: self.preferred-height;
                 }
                 HorizontalLayout {
                     alignment: end;

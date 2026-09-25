@@ -32,7 +32,7 @@ use crate::theo_doi_tiep::{self, JobTheoDoiTiep, KetLuanTiep, KhoTheoDoiTiep};
 use rust_socketio::client::Client;
 use rust_socketio::{ClientBuilder, Payload, RawClient, TransportType};
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -58,6 +58,24 @@ const NHIP_CANH: Duration = Duration::from_millis(250);
 /// pingTimeout rồi trả `PingTimeout` → callback "error" → nối lại. Polling đã
 /// bị loại (T1) vì chính nó là đường chết lặng không callback.
 const NGUONG_CHET_HAN: Duration = Duration::from_secs(60);
+
+/// Hạn cho MỘT lần dựng kết nối (TCP + TLS + nâng cấp websocket + handshake).
+///
+/// VÌ SAO (0.2.7 — chủ báo "máy sleep thì mất kết nối luôn"; PROD 25/09: máy
+/// HN rớt 07:21 rồi không nối lại): `ClientBuilder::connect()` của rust_socketio
+/// / rust_engineio 0.6 KHÔNG có hạn ở bước TLS + nâng cấp websocket (đọc nguồn:
+/// `connect_async_tls_with_config` trong `block_on`, không timeout). Máy vừa
+/// thức, Wi-Fi đang nối lại / đổi IP: TCP bắt tay xong rồi đường chết — lời đáp
+/// TLS không bao giờ tới, không còn gói nào chờ ACK nên TCP cũng không báo lỗi
+/// (không keepalive) → `connect()` chờ MÃI, vòng nối lại đứng hẳn cho tới khi
+/// tắt mở app. Bình thường nối mất < 2 s; TCP không tới được thì Windows tự
+/// báo lỗi sau ~21 s — 30 s đủ rộng.
+const HAN_NOI: Duration = Duration::from_secs(30);
+
+/// Luồng `connect()` quá hạn bị BỎ LẠI (không huỷ được lời gọi đang chặn) tối
+/// đa — mạng hỏng kiểu đó kéo dài thì không đẻ luồng vô hạn.
+const SO_NOI_TREO_TOI_DA: usize = 4;
+static SO_NOI_TREO: AtomicUsize = AtomicUsize::new(0);
 
 // Luồng poll của rust_socketio được KẾT THÚC bằng `resume_unwind` từ trong
 // callback (`thoat_luong_poll`, R-H/R-I). Với `panic = "abort"` lệnh đó giết
@@ -1160,21 +1178,27 @@ enum LyDoThoat {
     ClientChet,
     /// `da_noi=false` liên tục quá `NGUONG_CHET_HAN` mà không callback nào báo.
     ChetHan,
+    /// Máy tính vừa ngủ dậy (`thuc_day`) — kết nối cũ gần như chắc đã chết
+    /// phía server: nối lại NGAY, không chờ hết hạn ping (0.2.7).
+    ThucDay,
 }
 
 /// Vòng canh MỘT client đang sống: mỗi `NHIP_CANH` xem cờ dừng, chạy
 /// `moi_nhip` (kiểm server bản cũ, R12), xem client đã chết chưa (R-H), đếm
 /// thời gian `da_noi=false` LIÊN TỤC — lưới cho ca không có callback nào.
 /// Tách hàm với đồng hồ/ngủ tiêm được để test.
+#[allow(clippy::too_many_arguments)]
 fn canh_client(
     dung: &AtomicBool,
     da_noi: &dyn Fn() -> bool,
     chet: &dyn Fn() -> bool,
+    lan_thuc_day: &dyn Fn() -> u64,
     moi_nhip: &mut dyn FnMut(),
     ngu: &mut dyn FnMut(Duration),
     bay_gio: &dyn Fn() -> Instant,
 ) -> LyDoThoat {
     let mut mat_tu: Option<Instant> = None;
+    let thuc_luc_dau = lan_thuc_day();
     loop {
         if dung.load(Ordering::SeqCst) {
             return LyDoThoat::Dung;
@@ -1187,6 +1211,9 @@ fn canh_client(
         if chet() {
             return LyDoThoat::ClientChet;
         }
+        if lan_thuc_day() != thuc_luc_dau {
+            return LyDoThoat::ThucDay;
+        }
         if da_noi() {
             mat_tu = None;
             continue;
@@ -1198,13 +1225,94 @@ fn canh_client(
     }
 }
 
-/// Ngủ `tong` nhưng thức dậy sớm khi cờ dừng bật.
-fn ngu_co_the_dung(tong: Duration, dung: &AtomicBool) {
+/// Chờ backoff trước lần nối lại: dừng sớm khi cờ dừng bật HOẶC máy tính vừa
+/// ngủ dậy (`lan_thuc_day` đổi) — trả `true` khi dừng vì thức dậy (0.2.7: sau
+/// một đêm ngủ, backoff đã leo tới 30 s mà mạng đã có lại).
+fn ngu_cho_noi_lai(tong: Duration, dung: &AtomicBool, lan_thuc_day: &dyn Fn() -> u64, ngu: &mut dyn FnMut(Duration)) -> bool {
+    let luc_dau = lan_thuc_day();
     let mut con = tong;
     while !con.is_zero() && !dung.load(Ordering::SeqCst) {
+        if lan_thuc_day() != luc_dau {
+            return true;
+        }
         let buoc = con.min(NHIP_CANH);
-        std::thread::sleep(buoc);
+        ngu(buoc);
         con -= buoc;
+    }
+    lan_thuc_day() != luc_dau
+}
+
+/// Kết quả một lần dựng kết nối có hạn (`noi_co_han`).
+#[derive(Debug)]
+enum KetQuaNoi<T> {
+    Duoc(T),
+    Loi(String),
+    /// Quá `han` — luồng dựng bị bỏ lại; nếu nó nối được về sau thì tự dọn (`bo`).
+    QuaHan,
+    /// Đã có `SO_NOI_TREO_TOI_DA` luồng dựng bị treo — không mở thêm.
+    TreoNhieu,
+    /// Cờ dừng bật (bấm Lưu) lúc đang chờ — bỏ luồng dựng như `QuaHan`.
+    Dung,
+}
+
+/// Dựng kết nối trên LUỒNG RIÊNG, chờ tối đa `han` (xem `HAN_NOI`). Quá hạn:
+/// bỏ luồng lại (không huỷ được lời gọi đang chặn); về sau nó nối được thì
+/// `bo(ket_noi)` dọn ngay (client không ai dùng). Đúng MỘT bên "nhận" kết quả
+/// — `da_xong` quyết, không có khe hở giữa hết hạn và gửi kết quả.
+fn noi_co_han<T: Send + 'static>(
+    noi: impl FnOnce() -> Result<T, String> + Send + 'static,
+    bo: impl FnOnce(T) + Send + 'static,
+    han: Duration,
+    dung: &AtomicBool,
+) -> KetQuaNoi<T> {
+    if SO_NOI_TREO.load(Ordering::SeqCst) >= SO_NOI_TREO_TOI_DA {
+        return KetQuaNoi::TreoNhieu;
+    }
+    let da_xong = Arc::new(AtomicBool::new(false));
+    let (gui, nhan) = mpsc::channel::<Result<T, String>>();
+    let da_xong_luong = da_xong.clone();
+    let da_spawn = std::thread::Builder::new().name("noi-socket".into()).spawn(move || {
+        let kq = std::panic::catch_unwind(std::panic::AssertUnwindSafe(noi))
+            .unwrap_or_else(|_| Err("connect() panic".to_string()));
+        if da_xong_luong.swap(true, Ordering::SeqCst) {
+            // Bên chờ đã bỏ cuộc (quá hạn) — dọn kết nối muộn, trả suất treo.
+            if let Ok(t) = kq {
+                bo(t);
+            }
+            SO_NOI_TREO.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            let _ = gui.send(kq);
+        }
+    });
+    if let Err(e) = da_spawn {
+        return KetQuaNoi::Loi(format!("khong tao duoc luong noi: {}", e));
+    }
+    let doi = |r: Result<T, String>| match r {
+        Ok(t) => KetQuaNoi::Duoc(t),
+        Err(e) => KetQuaNoi::Loi(e),
+    };
+    let bat_dau = Instant::now();
+    loop {
+        // Chờ từng nhịp ngắn: bấm Lưu (cờ dừng) không phải đợi hết hạn.
+        let con = han.saturating_sub(bat_dau.elapsed());
+        match nhan.recv_timeout(con.min(NHIP_CANH)) {
+            Ok(r) => return doi(r),
+            Err(RecvTimeoutError::Disconnected) => return KetQuaNoi::Loi("luong noi dung bat thuong".into()),
+            Err(RecvTimeoutError::Timeout) => {
+                let vi_dung = dung.load(Ordering::SeqCst);
+                if !vi_dung && bat_dau.elapsed() < han {
+                    continue;
+                }
+                // Tăng TRƯỚC khi giành quyền: luồng dựng chỉ giảm sau khi thấy ta đã giành.
+                SO_NOI_TREO.fetch_add(1, Ordering::SeqCst);
+                if da_xong.swap(true, Ordering::SeqCst) {
+                    // Luồng dựng xong đúng lúc hết hạn và đang gửi — nhận kết quả đó.
+                    SO_NOI_TREO.fetch_sub(1, Ordering::SeqCst);
+                    return nhan.recv().map_or_else(|_| KetQuaNoi::Loi("luong noi dung bat thuong".into()), doi);
+                }
+                return if vi_dung { KetQuaNoi::Dung } else { KetQuaNoi::QuaHan };
+            }
+        }
     }
 }
 
@@ -1751,7 +1859,7 @@ fn chay_net(
             }
         };
 
-        let ket_noi = ClientBuilder::new(&cfg.server_url)
+        let dung_client = ClientBuilder::new(&cfg.server_url)
             .namespace(NAMESPACE)
             .auth(auth.clone())
             .transport_type(TRANSPORT)
@@ -1761,20 +1869,35 @@ fn chay_net(
             .on("open", on_open)
             .on("close", on_close)
             .on("cau-hinh", on_cau_hinh)
-            .on("hang-doi", on_hang_doi)
-            .connect();
+            .on("hang-doi", on_hang_doi);
+        // Nối được SAU khi đã bỏ cuộc (quá hạn): client đó không ai dùng — cho nghỉ ngay.
+        let bo_muon = {
+            let (co, the_he, dg) = (co.clone(), the_he.clone(), duong_gui.clone());
+            move |client: Client| {
+                nhat_ky::ghi("noi_muon_bo", "connect() tra ve sau khi da qua han — cho nghi client do");
+                cho_nghi(client, &co, the_he.load(Ordering::SeqCst), &dg);
+            }
+        };
+        let ket_noi = noi_co_han(move || dung_client.connect().map_err(|e| e.to_string()), bo_muon, HAN_NOI, &dung);
 
+        let mut noi_ngay = false;
         match ket_noi {
-            Ok(client) => {
+            KetQuaNoi::Duoc(client) => {
                 let tt = trang_thai.clone();
                 let ly_do = canh_client(
                     &dung,
                     &|| khoa(&tt).da_noi,
                     &|| co.chet.load(Ordering::SeqCst),
+                    &crate::thuc_day::lan_thuc_day,
                     &mut || kiem_server_ban_cu(&duong_gui, &trang_thai),
                     &mut |d| std::thread::sleep(d),
                     &Instant::now,
                 );
+                if ly_do == LyDoThoat::ThucDay {
+                    nhat_ky::ghi("noi_lai_sau_khi_thuc", "may tinh vua ngu day — bo ket noi cu, noi lai ngay");
+                    khoa(&trang_thai).thong_bao_cuoi = Some("máy tính vừa ngủ dậy — đang nối lại...".into());
+                    noi_ngay = true;
+                }
                 if ly_do == LyDoThoat::ChetHan {
                     eprintln!(
                         "[print-agent] mất kết nối >{}s liên tục — coi client chết, nối lại từ đầu...",
@@ -1796,8 +1919,36 @@ fn chay_net(
                     loi_noi_da_ghi = None;
                 }
             }
-            Err(e) => {
-                let chu = e.to_string();
+            // Bấm Lưu lúc đang nối: client dở dang (nếu nối được về sau) thôi làm gì.
+            KetQuaNoi::Dung => co.nghi.store(true, Ordering::SeqCst),
+            KetQuaNoi::QuaHan => {
+                // Callback của client bị bỏ (nếu nó nối được về sau) thôi làm gì.
+                co.nghi.store(true, Ordering::SeqCst);
+                nhat_ky::ghi(
+                    "noi_qua_han",
+                    &format!("connect() khong xong trong {} s (mang vua doi / treo TLS) — bo, noi lai", HAN_NOI.as_secs()),
+                );
+                if !dung.load(Ordering::SeqCst) {
+                    let mut t = khoa(&trang_thai);
+                    t.da_noi = false;
+                    t.thong_bao_cuoi = Some(format!("nối quá {} s không xong — thử lại...", HAN_NOI.as_secs()));
+                }
+            }
+            KetQuaNoi::TreoNhieu => {
+                if loi_noi_da_ghi.as_deref() != Some("treo_nhieu") {
+                    nhat_ky::ghi(
+                        "noi_treo_nhieu",
+                        &format!("{} lan connect() dang treo — cho chung xong truoc khi thu tiep (kiem mang)", SO_NOI_TREO_TOI_DA),
+                    );
+                    loi_noi_da_ghi = Some("treo_nhieu".into());
+                }
+                if !dung.load(Ordering::SeqCst) {
+                    let mut t = khoa(&trang_thai);
+                    t.da_noi = false;
+                    t.thong_bao_cuoi = Some("mạng treo nhiều lần khi nối — kiểm mạng / Wi-Fi của máy tính".into());
+                }
+            }
+            KetQuaNoi::Loi(chu) => {
                 eprintln!("[print-agent] nối thất bại: {}", chu);
                 if !dung.load(Ordering::SeqCst) {
                     let mut t = khoa(&trang_thai);
@@ -1813,8 +1964,18 @@ fn chay_net(
         if dung.load(Ordering::SeqCst) {
             break;
         }
-        ngu_co_the_dung(cho_noi_lai(lan_noi_lai, so_ngau_nhien()), &dung);
-        lan_noi_lai = lan_noi_lai.saturating_add(1);
+        if noi_ngay {
+            lan_noi_lai = 0;
+            continue;
+        }
+        // Máy ngủ dậy giữa lúc chờ → thử ngay với backoff từ đầu.
+        let cho = cho_noi_lai(lan_noi_lai, so_ngau_nhien());
+        if ngu_cho_noi_lai(cho, &dung, &crate::thuc_day::lan_thuc_day, &mut |d| std::thread::sleep(d)) {
+            nhat_ky::ghi("noi_lai_sau_khi_thuc", "may tinh vua ngu day luc dang cho noi lai — thu ngay");
+            lan_noi_lai = 0;
+        } else {
+            lan_noi_lai = lan_noi_lai.saturating_add(1);
+        }
     }
 
     // Dừng hẳn (R7a): luồng theo dõi máy in; luồng theo dõi tiếp + worker tự
@@ -2310,6 +2471,7 @@ mod tests {
             &dung,
             &|| true,
             &|| false,
+            &|| 0,
             &mut || {
                 so_nhip.set(so_nhip.get() + 1);
                 if so_nhip.get() == 3 {
@@ -2328,7 +2490,7 @@ mod tests {
         let t0 = Instant::now();
         let dong_ho = Cell::new(t0);
         let dung = AtomicBool::new(false);
-        let ly_do = canh_client(&dung, &|| false, &|| false, &mut || {}, &mut |d| dong_ho.set(dong_ho.get() + d), &|| dong_ho.get());
+        let ly_do = canh_client(&dung, &|| false, &|| false, &|| 0, &mut || {}, &mut |d| dong_ho.set(dong_ho.get() + d), &|| dong_ho.get());
         assert_eq!(ly_do, LyDoThoat::ChetHan);
         assert!(dong_ho.get() - t0 >= NGUONG_CHET_HAN);
         // Chập chờn (cứ 20 s nối lại một nhịp) → chuỗi mất bị reset, không chết hẳn.
@@ -2337,6 +2499,7 @@ mod tests {
             &dung,
             &|| (dong_ho.get() - t0).as_secs().is_multiple_of(20),
             &|| false,
+            &|| 0,
             &mut || {
                 if dong_ho.get() - t0 > Duration::from_secs(300) {
                     dung.store(true, Ordering::SeqCst);
@@ -2805,6 +2968,88 @@ mod tests {
     /// ĐẦU-CUỐI (chạy tay, ~70 s): server nhận `yeu-cau-huy` mà KHÔNG ack → app hỏi
     /// lại đủ 3 lần rồi kết luận CHƯA RÕ (không bao giờ "Đã huỷ"), luồng không treo.
     /// `HD_URL=http://127.0.0.1:47812 cargo test -- --ignored hang_doi_khong_ack --nocapture`
+    /// ĐẦU-CUỐI (chạy tay, README tests/e2e-hang-doi): `khoi_chay` THẬT qua
+    /// proxy TCP. (1) Lần nối đầu rơi "hố đen" (nhận TCP, không trả lời — TLS
+    /// treo khi máy vừa thức / Wi-Fi đổi): app bỏ sau `HAN_NOI` rồi nối được —
+    /// 0.2.6 đứng MÃI ở đây. (2) "Máy vừa ngủ dậy": bỏ kết nối cũ, nối lại NGAY.
+    #[test]
+    #[ignore]
+    fn noi_lai_dau_cuoi_connect_treo_va_thuc_day() {
+        use std::net::{TcpListener, TcpStream};
+        let url = std::env::var("HD_URL").expect("HD_URL");
+        let dich = url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let nghe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cong = nghe.local_addr().unwrap().port();
+        let so_tcp = Arc::new(AtomicUsize::new(0));
+        let ho_den: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+        {
+            let (so_tcp, ho_den) = (so_tcp.clone(), ho_den.clone());
+            std::thread::spawn(move || {
+                for s in nghe.incoming().flatten() {
+                    if so_tcp.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ho_den.lock().unwrap().push(s); // giữ, không bao giờ trả lời
+                        continue;
+                    }
+                    let Ok(d) = TcpStream::connect(&dich) else { continue };
+                    let (mut a1, mut b1) = (s.try_clone().unwrap(), d.try_clone().unwrap());
+                    let (mut a2, mut b2) = (s, d);
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut a1, &mut b1);
+                        let _ = b1.shutdown(std::net::Shutdown::Both);
+                    });
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut b2, &mut a2);
+                        let _ = a2.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            });
+        }
+        let cfg = Config {
+            server_url: format!("http://127.0.0.1:{}", cong),
+            token: "tok-e2e".into(),
+            printer_name: "HP".into(),
+            tray: "tray-1".into(),
+            paper_size: "A5".into(),
+        };
+        let tt = Arc::new(Mutex::new(TrangThaiChung::default()));
+        let bat_dau = Instant::now();
+        let dk = khoi_chay(Arc::new(cfg), tt.clone(), Arc::new(DuongGui::default()), None);
+        let cho_noi = |han: Duration| {
+            let t = Instant::now();
+            while t.elapsed() < han {
+                if khoa(&tt).da_noi {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        };
+        assert!(cho_noi(HAN_NOI + Duration::from_secs(20)), "phải nối được sau lần nối treo");
+        let mat = bat_dau.elapsed();
+        eprintln!("noi duoc sau {:?} (han noi {:?}), tcp={}", mat, HAN_NOI, so_tcp.load(Ordering::SeqCst));
+        assert!(mat >= HAN_NOI - Duration::from_secs(1), "lần đầu phải là lần treo: {:?}", mat);
+        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 1, "luồng nối treo bị bỏ lại đúng một");
+        let tcp_truoc = so_tcp.load(Ordering::SeqCst);
+
+        crate::thuc_day::gia_lap_thuc_day();
+        let t = Instant::now();
+        while so_tcp.load(Ordering::SeqCst) == tcp_truoc && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(so_tcp.load(Ordering::SeqCst) > tcp_truoc, "thức dậy → nối lại ngay");
+        assert!(cho_noi(Duration::from_secs(10)), "nối lại được sau khi thức");
+        eprintln!("noi lai sau thuc day {:?}", t.elapsed());
+
+        // Hố đen đóng → luồng nối treo trả lỗi, trả suất.
+        ho_den.lock().unwrap().clear();
+        let t = Instant::now();
+        while SO_NOI_TREO.load(Ordering::SeqCst) != 0 && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 0);
+        dk.dung.store(true, Ordering::SeqCst);
+    }
+
     #[test]
     #[ignore]
     fn hang_doi_khong_ack_la_chua_ro() {
@@ -2892,6 +3137,135 @@ mod tests {
         assert_ne!(so_ngau_nhien(), so_ngau_nhien(), "jitter phải thật sự ngẫu nhiên");
     }
 
+    /// 0.2.7: máy tính ngủ dậy → vòng canh thoát NGAY (kể cả đang "đã nối" —
+    /// kết nối cũ gần như chắc đã chết phía server), nối lại không chờ ping.
+    #[test]
+    fn thuc_day_thi_vong_canh_thoat_ngay_du_dang_noi() {
+        let dung = AtomicBool::new(false);
+        let so_nhip = Cell::new(0);
+        let ly_do = canh_client(
+            &dung,
+            &|| true,
+            &|| false,
+            &|| if so_nhip.get() >= 3 { 1 } else { 0 },
+            &mut || so_nhip.set(so_nhip.get() + 1),
+            &mut |_| {},
+            &Instant::now,
+        );
+        assert_eq!(ly_do, LyDoThoat::ThucDay);
+        assert_eq!(so_nhip.get(), 3);
+    }
+
+    /// 0.2.7: chờ backoff dừng sớm khi máy ngủ dậy; không thì chờ đủ.
+    #[test]
+    fn cho_noi_lai_dung_som_khi_thuc_day() {
+        let dung = AtomicBool::new(false);
+        let da_ngu = Cell::new(Duration::ZERO);
+        let lan = Cell::new(0u64);
+        let thuc = ngu_cho_noi_lai(Duration::from_secs(30), &dung, &|| lan.get(), &mut |d| {
+            da_ngu.set(da_ngu.get() + d);
+            if da_ngu.get() >= Duration::from_secs(2) {
+                lan.set(1);
+            }
+        });
+        assert!(thuc);
+        assert!(da_ngu.get() < Duration::from_secs(3), "{:?}", da_ngu.get());
+        let da_ngu = Cell::new(Duration::ZERO);
+        assert!(!ngu_cho_noi_lai(Duration::from_secs(4), &dung, &|| 7, &mut |d| da_ngu.set(da_ngu.get() + d)));
+        assert_eq!(da_ngu.get(), Duration::from_secs(4));
+    }
+
+    /// 0.2.7: `connect()` treo quá hạn → trả `QuaHan` (vòng nối lại KHÔNG đứng
+    /// mãi); về sau nó nối được thì kết nối muộn bị dọn (`bo`), suất treo trả lại.
+    /// Nối nhanh / lỗi nhanh → trả đúng kết quả. Test dùng chung bộ đếm toàn
+    /// cục `SO_NOI_TREO` — chỉ test này đụng nó.
+    #[test]
+    fn noi_co_han_khong_de_vong_noi_lai_treo_mai() {
+        let kq = noi_co_han(|| Ok::<u32, String>(7), |_| panic!("không được dọn"), Duration::from_secs(5), &AtomicBool::new(false));
+        assert!(matches!(kq, KetQuaNoi::Duoc(7)), "{:?}", kq);
+        let kq = noi_co_han(|| Err::<u32, String>("EngineIO Error".into()), |_| {}, Duration::from_secs(5), &AtomicBool::new(false));
+        assert!(matches!(kq, KetQuaNoi::Loi(ref e) if e == "EngineIO Error"), "{:?}", kq);
+        let kq = noi_co_han(|| -> Result<u32, String> { panic!("hỏng") }, |_| {}, Duration::from_secs(5), &AtomicBool::new(false));
+        assert!(matches!(kq, KetQuaNoi::Loi(_)), "panic trong connect không làm chết vòng nối: {:?}", kq);
+
+        let (tha, cho_tha) = mpsc::channel::<()>();
+        let (da_bo, thay_bo) = mpsc::channel::<u32>();
+        let kq = noi_co_han(
+            move || {
+                let _ = cho_tha.recv();
+                Ok::<u32, String>(9)
+            },
+            move |t| {
+                let _ = da_bo.send(t);
+            },
+            Duration::from_millis(100),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(kq, KetQuaNoi::QuaHan), "{:?}", kq);
+        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 1);
+        tha.send(()).unwrap();
+        assert_eq!(thay_bo.recv_timeout(Duration::from_secs(5)), Ok(9), "kết nối muộn bị dọn");
+        for _ in 0..50 {
+            if SO_NOI_TREO.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 0, "trả suất treo");
+
+        // Đủ trần luồng treo → không mở thêm.
+        let mut tha_het = Vec::new();
+        for _ in 0..SO_NOI_TREO_TOI_DA {
+            let (tha, cho) = mpsc::channel::<()>();
+            tha_het.push(tha);
+            let kq = noi_co_han(
+                move || {
+                    let _ = cho.recv();
+                    Err::<u32, String>("x".into())
+                },
+                |_| {},
+                Duration::from_millis(20),
+                &AtomicBool::new(false),
+            );
+            assert!(matches!(kq, KetQuaNoi::QuaHan));
+        }
+        assert!(matches!(
+            noi_co_han(|| Ok::<u32, String>(1), |_| {}, Duration::from_secs(1), &AtomicBool::new(false)),
+            KetQuaNoi::TreoNhieu
+        ));
+        drop(tha_het);
+        for _ in 0..100 {
+            if SO_NOI_TREO.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 0);
+
+        // Bấm Lưu (cờ dừng) lúc đang nối treo → trả NGAY, không chờ hết hạn 30 s.
+        let (tha, cho) = mpsc::channel::<()>();
+        let bat_dau = Instant::now();
+        let kq = noi_co_han(
+            move || {
+                let _ = cho.recv();
+                Ok::<u32, String>(1)
+            },
+            |_| {},
+            Duration::from_secs(30),
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(kq, KetQuaNoi::Dung), "{:?}", kq);
+        assert!(bat_dau.elapsed() < Duration::from_secs(2));
+        drop(tha);
+        for _ in 0..100 {
+            if SO_NOI_TREO.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 0);
+    }
+
     /// R-H: callback báo client chết → vòng canh thoát NGAY (không chờ 60 s).
     #[test]
     fn r_h_client_chet_thi_vong_canh_thoat_ngay() {
@@ -2901,6 +3275,7 @@ mod tests {
             &dung,
             &|| false,
             &|| so_nhip.get() >= 2,
+            &|| 0,
             &mut || so_nhip.set(so_nhip.get() + 1),
             &mut |_| {},
             &Instant::now,

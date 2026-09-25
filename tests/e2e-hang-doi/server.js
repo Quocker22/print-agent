@@ -10,7 +10,7 @@ const muc = (id, trangThai, tamGiu) => ({
   huy: trangThai === 'cho_in' ? 'chac_chan' : 'khong',
 });
 let jobs = [muc('a1', 'cho_in', true), muc('a2', 'cho_in', true), muc('d1', 'dang_gui', false), muc('k1', 'khong_ro', false)];
-const dem = { lay: 0, huy: 0, bo: 0 };
+const dem = { lay: 0, huy: 0, bo: 0, noi: 0 };
 const anh = () => ({
   choIn: jobs.filter((j) => j.nhom === 'cho_in'),
   chuaXacNhan: jobs.filter((j) => j.nhom === 'chua_xac_nhan'),
@@ -19,6 +19,7 @@ const anh = () => ({
 const boc = (x) => (Array.isArray(x) ? x[0] : x) || {};
 io.of('/print-agent').on('connection', (s) => {
   if (s.handshake.auth?.token !== 'tok-e2e') { s.disconnect(true); return; }
+  dem.noi++;
   s.emit('cau-hinh', { hoTro: ['khong_ro', 'su_co', 'trang_thai_may_in', 'nhat_ky_app', 'hang_doi'] });
   s.emit('hang-doi', anh());
   s.on('lay-hang-doi', () => { dem.lay++; s.emit('hang-doi', anh()); });

@@ -12,6 +12,7 @@
 
 mod bao_cao;
 mod config;
+mod giu_thuc;
 mod hang_doi;
 mod hop_thu_di;
 mod job;
@@ -25,6 +26,7 @@ mod state;
 mod su_co;
 mod theo_doi_tiep;
 mod thoi_gian;
+mod thuc_day;
 mod ui;
 mod taskbar_win;
 mod tu_khoi_dong;
@@ -94,6 +96,21 @@ fn main() -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let trang_thai = Arc::new(Mutex::new(TrangThaiChung::default()));
+
+    // Máy tính không tự ngủ khi app chạy (0.2.7, mặc định bật) + nhận ra lúc máy
+    // ngủ dậy để nối lại ngay — chủ báo "máy sleep thì mất kết nối luôn".
+    giu_thuc::khoi_dong();
+    {
+        let tt = trang_thai.clone();
+        thuc_day::khoi_dong(move |ngu| {
+            nhat_ky::ghi("may_thuc_day", &format!("ngu_khoang={}s — noi lai ngay", ngu.as_secs()));
+            if let Ok(mut t) = tt.lock() {
+                t.thong_bao_cuoi = Some(format!("máy tính vừa ngủ dậy (ngủ ~{} phút) — đang nối lại...", ngu.as_secs().div_ceil(60)));
+            }
+        });
+    }
+    // Dọn PDF tạm mồ côi (app bị tắt ngang lúc đang in) — không để %TEMP% phình.
+    printing::don_pdf_tam_mo_coi();
     // Đường gửi lên backend dùng chung cho mọi lần chạy thread net (R4/R7):
     // kết quả job in dở lúc bấm Lưu vẫn đi qua kết nối mới.
     let duong_gui = Arc::new(hop_thu_di::DuongGui::default());

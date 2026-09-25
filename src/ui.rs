@@ -437,6 +437,9 @@ fn bom_view_model(w: &MainWindow, cfg: &Config, t: &TrangThaiChung, hd: &VecMode
     let k = t.hang_doi.khoi(t.da_noi, ma_may_in, &t.trong_may_in, Instant::now(), &|iso| {
         crate::thoi_gian::gio_may_tu_iso(iso, lech, bay_gio_he)
     });
+    w.set_chu_giu_thuc(
+        crate::giu_thuc::chu_giai_thich(w.get_f_giu_thuc(), crate::giu_thuc::tinh_trang(), crate::giu_thuc::co_loi()).into(),
+    );
     w.set_hd_hien(k.hien);
     w.set_hd_tieu_de(k.tieu_de.into());
     w.set_hd_ghi_chu(k.ghi_chu.into());
@@ -536,6 +539,7 @@ pub fn chay_ui(
     // hiển thị sai làm người dùng tưởng chưa bật rồi bấm tắt mất (xem
     // tu_khoi_dong::dang_bat, nó còn đối chiếu đúng đường dẫn exe đang chạy).
     window.set_f_tu_khoi_dong(crate::tu_khoi_dong::dang_bat());
+    window.set_f_giu_thuc(crate::giu_thuc::dang_bat());
     // Mutex hỏng (một luồng panic lúc giữ khoá) vẫn đọc tiếp được dữ liệu —
     // giao diện KHÔNG được chết theo (R11e).
     // Danh sách hàng đợi: MỘT model sống suốt đời cửa sổ (xem `cap_nhat_theo_id`).
@@ -587,6 +591,20 @@ pub fn chay_ui(
                     w.set_f_tu_khoi_dong(crate::tu_khoi_dong::dang_bat());
                 }
             }
+        });
+    }
+
+    // Giữ máy tính không tự ngủ (0.2.7) — áp dụng NGAY như ô trên. Câu dưới ô
+    // (tắt / Windows từ chối / Modern Standby) cập nhật mỗi nhịp ở bom_view_model.
+    {
+        let w_weak = window.as_weak();
+        window.on_doi_giu_thuc(move |bat| {
+            let Some(w) = w_weak.upgrade() else { return };
+            if let Err(e) = crate::giu_thuc::dat(bat) {
+                eprintln!("[print-agent] đặt giữ máy thức thất bại: {:#}", e);
+                crate::nhat_ky::ghi("giu_may_thuc_loi", &format!("{:#}", e));
+            }
+            w.set_f_giu_thuc(crate::giu_thuc::dang_bat());
         });
     }
 

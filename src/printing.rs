@@ -14,7 +14,7 @@ use crate::spooler::QuanSat;
 use crate::su_co::{MaSuCo, TapMa};
 use anyhow::Context;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
@@ -420,6 +420,50 @@ pub fn pdf_in_thu() -> Vec<u8> {
     pdf
 }
 
+/// PDF tạm của app còn trong %TEMP% quá chừng này thì là MỒ CÔI (app bị tắt
+/// ngang lúc đang in — bình thường file bị xoá ngay sau Sumatra) → xoá.
+const PDF_TAM_GIU_TOI_DA: Duration = Duration::from_secs(24 * 3600);
+
+/// Tên file có phải PDF tạm do CHÍNH app đặt không (`ten_file_in`) — chỉ đụng
+/// file của mình: `print-agent-<id>.pdf`, hoặc `AI-…-<jobId>.pdf` với jobId
+/// backend kết thúc bằng mốc 13 chữ số ms.
+fn la_pdf_tam_cua_app(ten: &str) -> bool {
+    let Some(than) = ten.strip_suffix(".pdf") else { return false };
+    if let Some(con) = than.strip_prefix("print-agent-") {
+        return !con.is_empty();
+    }
+    than.starts_with("AI-")
+        && than.rsplit('-').next().is_some_and(|s| s.len() == 13 && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Dọn PDF tạm mồ côi trong %TEMP% lúc khởi động (0.2.7 — chủ: "dọn dẹp tránh
+/// tăng bộ nhớ"). PDF hoá đơn chứa tên khách — cũng không nên nằm lại máy.
+pub fn don_pdf_tam_mo_coi() {
+    let n = don_pdf_tam_trong(&std::env::temp_dir(), SystemTime::now());
+    if n > 0 {
+        crate::nhat_ky::ghi("don_pdf_tam", &format!("xoa {} PDF tam mo coi (> 24 gio)", n));
+    }
+}
+
+fn don_pdf_tam_trong(dir: &Path, bay_gio: SystemTime) -> usize {
+    let Ok(ds) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for f in ds.flatten() {
+        let ten = f.file_name().to_string_lossy().into_owned();
+        if !la_pdf_tam_cua_app(&ten) {
+            continue;
+        }
+        let cu = f
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| bay_gio.duration_since(t).is_ok_and(|d| d >= PDF_TAM_GIU_TOI_DA));
+        if cu && std::fs::remove_file(f.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Id ngắn duy nhất cho tên file (không cần crypto, chỉ tránh trùng).
 fn now_id() -> String {
     use std::time::UNIX_EPOCH;
@@ -482,6 +526,29 @@ mod tests {
         assert_eq!(doc, pdf);
         std::env::remove_var("AGENT_DRY_RUN");
         std::env::remove_var("AGENT_DRY_RUN_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.2.7: chỉ nhận đúng PDF tạm của app, và chỉ xoá file quá 24 giờ.
+    #[test]
+    fn don_pdf_tam_mo_coi_chi_file_cua_app_va_cu() {
+        assert!(la_pdf_tam_cua_app("print-agent-job1-18a2b3c4d5.pdf"));
+        assert!(la_pdf_tam_cua_app("AI-INV_2026_030045-Anh_Loc-c1b2d3e4-5f6a-4b7c-8d9e-0a1b2c3d4e5f-1790251200000.pdf"));
+        for ten in ["AI-INV_2026_030045.pdf", "AI-bao-cao-2026.pdf", "hoa-don-1790251200000.pdf", "print-agent-.pdf",
+                    "print-agent-2026-09-24.txt", "AI-INV_1-x-1790251200000.PDF.txt"] {
+            assert!(!la_pdf_tam_cua_app(ten), "{}", ten);
+        }
+        let dir = std::env::temp_dir().join(format!("pa-test-don-pdf-{}", now_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cua_app = "AI-INV_1-Khach-p1-1790251200000.pdf";
+        for ten in [cua_app, "AI-bao-cao.pdf"] {
+            std::fs::write(dir.join(ten), b"%PDF").unwrap();
+        }
+        let bay_gio = SystemTime::now();
+        assert_eq!(don_pdf_tam_trong(&dir, bay_gio), 0, "file mới (đang in) không xoá");
+        assert_eq!(don_pdf_tam_trong(&dir, bay_gio + PDF_TAM_GIU_TOI_DA + std::time::Duration::from_secs(60)), 1);
+        assert!(!dir.join(cua_app).exists());
+        assert!(dir.join("AI-bao-cao.pdf").exists(), "file lạ không đụng");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
