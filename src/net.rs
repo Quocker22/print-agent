@@ -641,6 +641,14 @@ pub fn chu_mat_dau(so_hoa_don: &str) -> String {
     )
 }
 
+/// Như `chu_mat_dau` cho hoá đơn đã xuống máy in USB mà máy không in (U3).
+pub fn chu_mat_usb(so_hoa_don: &str) -> String {
+    format!(
+        "Hoá đơn {} đã gửi xuống máy in USB nhưng app không thấy máy in nó (máy bị tắt / lệnh bị huỷ trên máy?) — kiểm khay giấy, in lại nếu chưa có",
+        so_hoa_don
+    )
+}
+
 /// `chiTiet` khi job rời hàng đợi (đã có bằng chứng in) đúng lúc máy in báo
 /// sự cố `ma` — có thể nằm trong bộ nhớ máy in, tự ra khi khắc phục. KHÔNG bảo
 /// in lại ngay: in lại lúc này là hai tờ khi NV nạp giấy.
@@ -709,6 +717,7 @@ fn xu_ly_ket_luan_tiep(
         KetLuanTiep::Mat(ly_do) => {
             let kq = bao_mat(match co_the_trong_may_in {
                 Some(ma) => chu_co_the_trong_may_in(&j.so_hoa_don, ma),
+                None if j.la_qua_usb() => chu_mat_usb(&j.so_hoa_don),
                 None => chu_mat_dau(&j.so_hoa_don),
             });
             nhat_ky::ghi(

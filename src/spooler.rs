@@ -71,10 +71,10 @@ pub const SO_LAN_DOC_MAY_IN_SAU_KHI_ROI: usize = 4;
 /// gian một job vẫn phải dưới 90 s backend chờ (hợp đồng §3.1).
 pub const SO_LAN_USB_TOI_DA: usize = 60;
 
-/// Máy USB đọc được mà CHƯA từng thấy BUSY (in xong trước lần đọc đầu, hoặc máy
-/// không có trường STATUS): chừng này lần đọc liên tiếp không lỗi (6 s) là xong.
-/// Dài hơn 4 lần của máy mạng vì máy USB báo lỗi lúc KÉO GIẤY, sau khi nhận
-/// xong dữ liệu vài giây.
+/// Máy USB KHÔNG có trường STATUS (không thấy được BUSY/IDLE): chừng này lần
+/// đọc liên tiếp không lỗi (6 s) là xong. Dài hơn 4 lần của máy mạng vì máy
+/// USB báo lỗi lúc KÉO GIẤY, sau khi nhận xong dữ liệu vài giây. Máy CÓ STATUS
+/// thì không dùng số này — phải thấy BUSY → IDLE.
 pub const SO_LAN_USB_KHONG_THAY_IN: usize = 12;
 
 /// Trần THỜI GIAN THẬT của bước sau khi rời hàng đợi trên máy USB — ngoài số
@@ -923,8 +923,9 @@ pub enum SauKhiRoi {
 /// Máy KHÔNG đọc được USB: luật cũ R5c — `SO_LAN_DOC_MAY_IN_SAU_KHI_ROI` lần
 /// sạch là xong. Máy USB (U2): phải thấy máy IN XONG — đã thấy BUSY rồi về
 /// IDLE, không lỗi — mới là `Sach`; lỗi USB bất cứ lúc nào → hoá đơn nằm
-/// trong bộ nhớ máy. Chưa từng thấy BUSY: `SO_LAN_USB_KHONG_THAY_IN` lần sạch
-/// liên tiếp (máy in rất nhanh / không có trường STATUS).
+/// trong bộ nhớ máy; hết trần mà chưa thấy in xong → `UsbChuaXong` (theo dõi
+/// tiếp). Chỉ máy KHÔNG có trường STATUS mới được `Sach` sau
+/// `SO_LAN_USB_KHONG_THAY_IN` lần "không lỗi" liên tiếp.
 ///
 /// `KhongLoi` (không lỗi, STATUS lạ/thiếu) KHÔNG phải "in xong" với máy đã
 /// từng báo STATUS: một lần hỏi chuỗi 1284 trục trặc giữa BUSY và lúc kéo giấy
@@ -958,30 +959,31 @@ impl BoSauKhiRoi {
         if !self.da_thay_usb {
             return (self.so_lan >= SO_LAN_DOC_MAY_IN_SAU_KHI_ROI).then_some(SauKhiRoi::Sach);
         }
-        let sach = match usb {
+        match usb {
             Some(TinhTrangUsb::DangIn) => {
                 self.co_status = true;
                 self.da_thay_dang_in = true;
                 self.sach_chua_thay_in = 0;
-                false
             }
+            // Máy CÓ STATUS: "đã in" CHỈ khi đã thấy BUSY rồi về IDLE (giám sát
+            // vòng 2, 25/09). Máy laser in một tờ mất ≥ 5 s, lần đọc 500 ms không
+            // thể lỡ; IDLE mà chưa từng BUSY = máy CHƯA in (đang "chuẩn bị"? bỏ
+            // lệnh?) — chờ tới trần rồi giao theo dõi tiếp, không bao giờ `da_in`.
             Some(TinhTrangUsb::Ranh) => {
                 self.co_status = true;
-                true
+                if self.da_thay_dang_in {
+                    return Some(SauKhiRoi::Sach);
+                }
             }
-            // STATUS lạ/thiếu: chỉ tính là sạch với máy chưa từng báo STATUS.
-            Some(TinhTrangUsb::KhongLoi) => !self.co_status,
-            // Lần này không đọc được USB (hàng đợi có job khác, thiết bị bận…) — chờ tiếp.
-            Some(TinhTrangUsb::Loi(_)) | None => false,
-        };
-        if sach {
-            if self.da_thay_dang_in {
-                return Some(SauKhiRoi::Sach);
+            // Máy KHÔNG BAO GIỜ báo STATUS: chỉ biết "không lỗi" — đủ số lần sạch là xong.
+            Some(TinhTrangUsb::KhongLoi) if !self.co_status => {
+                self.sach_chua_thay_in += 1;
+                if self.sach_chua_thay_in >= SO_LAN_USB_KHONG_THAY_IN {
+                    return Some(SauKhiRoi::Sach);
+                }
             }
-            self.sach_chua_thay_in += 1;
-            if self.sach_chua_thay_in >= SO_LAN_USB_KHONG_THAY_IN {
-                return Some(SauKhiRoi::Sach);
-            }
+            // STATUS thiếu ở máy có STATUS / không đọc được lần này — chờ tiếp.
+            _ => {}
         }
         if self.so_lan >= SO_LAN_USB_TOI_DA {
             return Some(self.het_gio());
@@ -3170,17 +3172,28 @@ mod tests {
         assert_eq!(trong_may_in_usb(&bao), None);
     }
 
-    /// Máy USB mà lần nào cũng IDLE (in xong trước lần đọc đầu): đủ
-    /// `SO_LAN_USB_KHONG_THAY_IN` lần sạch mới `da_in` — lỗi kéo giấy có thời gian hiện ra.
+    /// Giám sát vòng 2: máy CÓ STATUS mà lần nào cũng IDLE (chưa từng BUSY) —
+    /// máy CHƯA in (đang "chuẩn bị"? bỏ lệnh?). Không bao giờ `da_in`: hết trần
+    /// → `khong_ro` + theo dõi tiếp qua USB. (0.2.1: 12 lần IDLE là `da_in`.)
     #[test]
-    fn u2_usb_khong_thay_busy_can_du_so_lan_sach() {
+    fn u2_usb_idle_ma_chua_tung_busy_khong_bao_gio_da_in() {
         let mut sp = SpoolerGia {
             vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)]), vong_usb(USB_RANH)],
             ..Default::default()
         };
+        let (kq, bao) = chay_su_co_moi(&mut sp, 30);
+        assert!(matches!(kq, KetQuaIn::KhongRo(ref l) if l.loai == Some(MaSuCo::KhongXacNhan)), "{:?}", kq);
+        assert_eq!(trong_may_in_usb(&bao), Some(false));
+        assert_eq!(sp.so_vong_da_doc, 1 + SO_LAN_VANG_LA_XONG + SO_LAN_USB_TOI_DA);
+        // Chuẩn bị lâu (IDLE 20 lần) rồi mới in → vẫn chờ đúng tới IDLE sau BUSY.
+        let mut vongs = vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)])];
+        vongs.extend(std::iter::repeat_n(vong_usb(USB_RANH), 2 + 20));
+        vongs.extend(std::iter::repeat_n(vong_usb(USB_DANG_IN), 8));
+        vongs.push(vong_usb(USB_RANH));
+        let mut sp = SpoolerGia { vong: vongs, ..Default::default() };
         let (kq, _) = chay_su_co_moi(&mut sp, 30);
         assert_eq!(kq, KetQuaIn::DaIn);
-        assert_eq!(sp.so_vong_da_doc, 1 + SO_LAN_VANG_LA_XONG + SO_LAN_USB_KHONG_THAY_IN);
+        assert_eq!(sp.so_vong_da_doc, 1 + 2 + 20 + 8 + 1);
     }
 
     /// Máy USB BUSY mãi (không lỗi): hết `SO_LAN_USB_TOI_DA` lần → `khong_ro
