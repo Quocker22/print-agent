@@ -959,6 +959,10 @@ pub struct BoSauKhiRoi {
     so_lan: usize,
     /// Máy in nằm trên cổng USB cục bộ (dù lần này đọc được thiết bị hay không).
     pub la_may_usb: bool,
+    /// ĐÃ BIẾT loại máy (đọc được thông tin máy in ít nhất một lần, trong bước
+    /// này hoặc bước theo dõi trước — review Codex vòng 6). Chưa biết thì KHÔNG
+    /// được coi là máy mạng: không có "4 lần sạch là xong".
+    pub biet_loai_may: bool,
     da_thay_usb: bool,
     /// Máy đã từng báo STATUS đo được (IDLE/BUSY).
     co_status: bool,
@@ -982,9 +986,10 @@ impl BoSauKhiRoi {
             return Some(if self.da_thay_usb { SauKhiRoi::TrongMayInUsb(ma) } else { SauKhiRoi::SuCo(ma) });
         }
         if !self.da_thay_usb {
-            // Máy USB chưa đọc được thiết bị lần nào: KHÔNG có bằng chứng — chờ
-            // tới trần (`het_gio` → `UsbKhongDoc`), không bao giờ `Sach`.
-            if self.la_may_usb {
+            // Máy USB chưa đọc được thiết bị lần nào — hoặc CHƯA BIẾT loại máy:
+            // KHÔNG có bằng chứng — chờ tới trần (`het_gio` → `UsbKhongDoc`),
+            // không bao giờ `Sach`.
+            if self.la_may_usb || !self.biet_loai_may {
                 return (self.so_lan >= SO_LAN_USB_TOI_DA).then(|| self.het_gio());
             }
             return (self.so_lan >= SO_LAN_DOC_MAY_IN_SAU_KHI_ROI).then_some(SauKhiRoi::Sach);
@@ -1032,7 +1037,7 @@ impl BoSauKhiRoi {
     pub fn het_gio(&self) -> SauKhiRoi {
         if self.da_thay_usb {
             SauKhiRoi::UsbChuaXong
-        } else if self.la_may_usb {
+        } else if self.la_may_usb || !self.biet_loai_may {
             SauKhiRoi::UsbKhongDoc
         } else {
             SauKhiRoi::Sach
@@ -1047,15 +1052,18 @@ impl BoSauKhiRoi {
 
 /// Sau khi job rời hàng đợi sạch: đọc máy in tiếp tới khi `BoSauKhiRoi` kết
 /// luận (R5c; máy USB: U2). Mọi lần đọc vẫn báo trạng thái/sự cố ra ngoài NGAY.
+#[allow(clippy::too_many_arguments)]
 fn kiem_may_in_sau_khi_roi(
     sp: &mut dyn Spooler,
     nen: TapMa,
     job_id: &str,
     vet: &mut VetJob,
     canh: &mut crate::thuc_day::CanhGianDoan,
+    usb: UsbCuaJob,
     bao: &dyn Fn(QuanSat),
 ) -> (SauKhiRoi, bool) {
-    let mut bo = BoSauKhiRoi::default();
+    // Mang nhận diện loại máy của bước theo dõi chính sang (review Codex vòng 6).
+    let mut bo = BoSauKhiRoi { la_may_usb: usb.la_may_usb, biet_loai_may: usb.biet_loai_may, ..BoSauKhiRoi::default() };
     let bat_dau = std::time::Instant::now();
     loop {
         sp.cho(POLL_INTERVAL);
@@ -1066,6 +1074,7 @@ fn kiem_may_in_sau_khi_roi(
         vet.ghi("sau_roi", &vong, job_id);
         let chan_moi = bao_may_in(&vong, nen, bao).chan_moi;
         bo.la_may_usb |= vong.la_may_usb;
+        bo.biet_loai_may |= vong.co_may_in.is_some() || vong.la_may_usb;
         if let Some(kl) = bo.them(chan_moi, vong.usb.as_ref().map(DocUsb::tinh_trang)) {
             return (kl, bo.da_thay_dang_in());
         }
@@ -1167,6 +1176,7 @@ pub fn theo_doi_job_voi(
         }
         vet.ghi("theo_doi", &vong, job_id);
         usb.la_may_usb |= vong.la_may_usb;
+        usb.biet_loai_may |= vong.co_may_in.is_some() || vong.la_may_usb;
         if let Some(d) = &vong.usb {
             usb.loi_cuoi = d.ma_su_co();
         }
@@ -1249,6 +1259,8 @@ pub fn theo_doi_job_voi(
 #[derive(Debug, Clone, Copy, Default)]
 struct UsbCuaJob {
     la_may_usb: bool,
+    /// Đã đọc được thông tin máy in ít nhất một lần (biết là USB hay không).
+    biet_loai_may: bool,
     /// Lỗi USB ở lần ĐỌC ĐƯỢC USB gần nhất (`None` = không lỗi / chưa đọc được).
     loi_cuoi: Option<MaSuCo>,
 }
@@ -1288,10 +1300,13 @@ fn ket_thuc(
     match kl {
         // PRINTED trên máy USB chỉ nghĩa là byte cuối đã vào BỘ NHỚ máy in —
         // máy hết giấy vẫn giữ đó (giám sát 25/09): máy USB cũng phải qua U2.
-        KetLuan::DaIn { qua_vang: false } if !usb.la_may_usb => KetQuaIn::DaIn,
+        // CHỈ khi đã biết chắc là máy KHÔNG phải USB: lần đọc đầu có PRINTED mà
+        // chưa đọc được thông tin máy thì vẫn qua bước kiểm sau khi rời (review
+        // Codex vòng 6 — giấy có thể chưa ra).
+        KetLuan::DaIn { qua_vang: false } if !usb.la_may_usb && usb.biet_loai_may => KetQuaIn::DaIn,
         KetLuan::DaIn { .. } => {
             bao(QuanSat::DaRoiHangDoi);
-            let sau_khi_roi = kiem_may_in_sau_khi_roi(sp, bo_suy.nen, job_id, vet, canh, bao);
+            let sau_khi_roi = kiem_may_in_sau_khi_roi(sp, bo_suy.nen, job_id, vet, canh, usb, bao);
             let gian_doan = canh.co;
             match sau_khi_roi {
                 // Máy tính ngủ / app bị treo GIỮA lúc theo dõi (0.2.7, review
@@ -1314,7 +1329,7 @@ fn ket_thuc(
                     KetQuaIn::KhongRo(LyDo::co_loai(chu_trong_may_in_usb(ma), ma))
                 }
                 (SauKhiRoi::UsbKhongDoc, _) => KetQuaIn::KhongRo(LyDo::co_loai(
-                    "khong doc duoc may in USB sau khi job roi hang doi — khong co bang chung da in, kiem to",
+                    "khong doc duoc may in (USB / thong tin may) sau khi job roi hang doi — khong co bang chung da in, kiem to",
                     MaSuCo::KhongXacNhan,
                 )),
                 (SauKhiRoi::UsbChuaXong, da_thay_in) => {
@@ -3528,7 +3543,8 @@ mod tests {
         let mut bo = BoSauKhiRoi::default();
         assert_eq!(bo.them(None, Some(TinhTrangUsb::Ranh)), None);
         assert_eq!(bo.het_gio(), SauKhiRoi::UsbChuaXong);
-        assert_eq!(BoSauKhiRoi::default().het_gio(), SauKhiRoi::Sach, "máy không USB: như cũ");
+        assert_eq!(BoSauKhiRoi { biet_loai_may: true, ..Default::default() }.het_gio(), SauKhiRoi::Sach, "máy mạng: như cũ");
+        assert_eq!(BoSauKhiRoi::default().het_gio(), SauKhiRoi::UsbKhongDoc, "chưa biết loại máy: không Sach");
     }
 
     /// HCM 25/09: khay trống (mức giấy 0) → KHÔNG gửi hoá đơn xuống máy in, trả
@@ -3572,11 +3588,33 @@ mod tests {
         assert_eq!(bo.them(None, None), Some(SauKhiRoi::UsbKhongDoc));
         assert_eq!(bo.het_gio(), SauKhiRoi::UsbKhongDoc);
         // Máy không USB: luật cũ giữ nguyên.
-        let mut bo = BoSauKhiRoi::default();
+        let mut bo = BoSauKhiRoi { biet_loai_may: true, ..Default::default() };
         for _ in 0..SO_LAN_DOC_MAY_IN_SAU_KHI_ROI - 1 {
             assert_eq!(bo.them(None, None), None);
         }
         assert_eq!(bo.them(None, None), Some(SauKhiRoi::Sach));
+    }
+
+    /// Review Codex vòng 6 — qua `theo_doi_job_voi` THẬT: (A) lần đọc đầu có
+    /// PRINTED mà chưa đọc được thông tin máy; (B) đã thấy USB, rời hàng đợi rồi
+    /// nhiều vòng mất thông tin máy/USB. Cả hai KHÔNG được `da_in`.
+    #[test]
+    fn chua_ro_loai_may_hoac_mat_thong_tin_usb_khong_da_in() {
+        let khong_ro = |jobs: Vec<JobHangDoi>| VongDoc { hang_doi: Some(jobs), ..VongDoc::default() };
+        // A
+        let mut sp = SpoolerGia { vong: vec![khong_ro(vec![job(7, JOB_STATUS_PRINTED)]), khong_ro(vec![])], ..Default::default() };
+        let (kq, _) = chay_su_co_moi(&mut sp, 60);
+        assert!(matches!(kq, KetQuaIn::KhongRo(ref l) if l.loai == Some(MaSuCo::KhongXacNhan)), "A: {:?}", kq);
+        // Đối chứng: máy mạng đọc được thông tin → da_in ngay như cũ.
+        let mut sp = SpoolerGia { vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTED)])], ..Default::default() };
+        assert_eq!(chay_su_co_moi(&mut sp, 60).0, KetQuaIn::DaIn);
+        // B
+        let mut sp = SpoolerGia {
+            vong: vec![vong_may_usb(vec![job(7, JOB_STATUS_PRINTING)]), khong_ro(vec![])],
+            ..Default::default()
+        };
+        let (kq, _) = chay_su_co_moi(&mut sp, 60);
+        assert!(matches!(kq, KetQuaIn::KhongRo(ref l) if l.loai == Some(MaSuCo::KhongXacNhan)), "B: {:?}", kq);
     }
 
     /// 0.2.7: RETAINED lúc còn PRINTING/SPOOLING chưa phải "đã gửi xong".
