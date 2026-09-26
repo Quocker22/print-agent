@@ -2882,6 +2882,22 @@ mod tests {
         assert_eq!(e.lock().unwrap()[0].0, "su-co");
     }
 
+    /// Giám sát 0.2.7: bước in chính trả `khong_ro` vì máy tính NGỦ giữa lúc theo
+    /// dõi máy USB (`CHU_GIAN_DOAN`) → giao diện dòng + dải "đối chiếu số".
+    #[test]
+    fn gian_doan_o_buoc_in_chinh_hien_doi_chieu_so() {
+        let tt = Mutex::new(TrangThaiChung::default());
+        let (e, gui) = gui_gia(du_ho_tro());
+        let in_gian_doan = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, _b: &dyn Fn(QuanSat)| {
+            KetQuaIn::KhongRo(LyDo::co_loai(spooler::CHU_GIAN_DOAN, MaSuCo::KhongXacNhan))
+        };
+        xu_ly_viec_co_bao_cao(&payload_co_name("p5-1790251200000"), &cfg(), &in_gian_doan, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
+        assert_eq!(e.lock().unwrap()[0].1["trangThai"], "khong_ro");
+        let t = khoa(&tt);
+        assert_eq!(t.dai_moi_nhat().map(|d| d.loai_dai), Some(crate::state::LoaiDai::DoiChieu));
+        assert!(t.jobs[0].sau_khac_phuc && t.jobs[0].trang_thai == "khong_ro");
+    }
+
     /// Giám sát 0.2.7: hoá đơn KẸT DO LỖI mà máy không in (rảnh 60 s / mất thiết
     /// bị) → cùng việc cần làm như lúc ra tờ: `su-co` "đối chiếu số" + dải
     /// `DoiChieu` — không phải "in lại nếu chưa có" (máy HP từng in lặp/bỏ sót).

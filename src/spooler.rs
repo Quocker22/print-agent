@@ -3341,6 +3341,11 @@ mod tests {
             _ => None,
         });
         assert_eq!(tm, Some((false, true)), "bỏ bằng chứng cũ + mang cờ gián đoạn");
+        let may_usb = bao.iter().find_map(|q| match q {
+            QuanSat::TrongMayInUsb { bang_chung, .. } => Some(bang_chung.may_usb),
+            _ => None,
+        });
+        assert_eq!(may_usb, Some(true), "nhận diện USB đi theo bằng chứng bàn giao");
         // Còn trong hàng đợi Windows lúc hết giờ → bàn giao QUA HÀNG ĐỢI cũng mang cờ (review Codex vòng 4).
         let (kq, bao) = bao_ra(&mut SpoolerGia { vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)])], ..Default::default() });
         assert!(matches!(kq, KetQuaIn::KhongRo(_)), "{:?}", kq);
