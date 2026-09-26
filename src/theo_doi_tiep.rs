@@ -173,7 +173,7 @@ impl JobTheoDoiTiep {
             nghi_ngo: false,
             gian_doan: bang_chung.gian_doan,
             im_lang: false,
-            may_usb: false,
+            may_usb: bang_chung.may_usb,
         }
     }
 
@@ -457,6 +457,9 @@ fn xet_mot_job(
             // Máy USB: PRINTED chỉ nghĩa byte cuối đã vào BỘ NHỚ máy in (như
             // `spooler::ket_thuc`) — theo dõi tiếp qua USB, không `da_in` (0.2.7).
             if !usb.la_may_usb {
+                // CHƯA biết loại máy (đọc cờ máy in hỏng, chưa từng thấy là USB):
+                // không được coi là máy mạng — chờ vòng đọc được (review Codex vòng 5).
+                tap_may_in?;
                 return Some(KetLuanTiep::DaIn);
             }
             job.bang_chung.da_thay_in = true;
@@ -494,6 +497,10 @@ fn xet_mot_job(
     // hỏng rồi `Mat` (kiểm tờ) — không bao giờ `da_in` đoán (0.2.7).
     if usb.la_may_usb && !job.bang_chung.da_thay_huy {
         return chuyen_sang_usb(job, usb);
+    }
+    // Chưa biết loại máy ở vòng này (cờ máy in không đọc được) → chưa kết luận.
+    if tap_may_in.is_none() && !job.bang_chung.da_thay_huy {
+        return None;
     }
     Some(if job.bang_chung.da_thay_huy {
         KetLuanTiep::Mat(spooler::CHU_BI_HUY.into())
@@ -652,6 +659,12 @@ impl KhoTheoDoiTiep {
 
     pub fn danh_dau_im_lang(&self, dau: &[(String, Instant)]) {
         self.khoa().ds.danh_dau_im_lang(dau)
+    }
+
+    /// Test: job `job_id` có trong kho không, và đã "im lặng" chưa.
+    #[cfg(test)]
+    pub fn im_lang_cua(&self, job_id: &str) -> Option<bool> {
+        self.khoa().ds.ds.iter().find(|j| j.job_id == job_id).map(|j| j.im_lang)
     }
 
     pub fn so_job(&self) -> usize {
@@ -828,6 +841,7 @@ pub fn nhan_lai_khi_khoi_dong(
             nen,
             // App KHÔNG chạy từ lúc gửi tới giờ — quan sát đã gián đoạn (0.2.7).
             gian_doan: true,
+            may_usb: vong.la_may_usb,
         };
         let bat_dau = bay_gio.checked_sub(tuoi).unwrap_or(bay_gio);
         nhan.them(JobTheoDoiTiep::moi(job_id, so, spooler::ma_su_co_job(j), bang_chung, bat_dau).tren_may_in(may_in));
@@ -916,21 +930,22 @@ mod tests {
     fn kiem_cuoi_job_con_ket_ngay_truoc_khi_bien_mat_thi_da_in_kem_ghi_chu() {
         // Job kẹt rồi biến mất, không lần đọc nào thấy in sạch: nạp giấy in nốt
         // rất nhanh HOẶC bị xoá tay — da_in (không báo động giả) + ghi chú kiểm lại.
+        // Máy MẠNG, cờ máy in đọc được (`Some(TapMa)`) — chưa đọc được thì chờ (0.2.7).
         let t0 = Instant::now();
         let mut j = moi(da_in(), t0);
         let ket = job(7, JOB_STATUS_PRINTING | JOB_STATUS_PAPEROUT);
-        assert_eq!(xet_mot_job(&mut j, Some(std::slice::from_ref(&ket)), None, UsbVong::default(), t0), None);
+        assert_eq!(xet_mot_job(&mut j, Some(std::slice::from_ref(&ket)), Some(TapMa::default()), UsbVong::default(), t0), None);
         for _ in 0..SO_LAN_VANG_LA_XONG - 1 {
-            assert_eq!(xet_mot_job(&mut j, Some(&[]), None, UsbVong::default(), t0), None);
+            assert_eq!(xet_mot_job(&mut j, Some(&[]), Some(TapMa::default()), UsbVong::default(), t0), None);
         }
-        assert_eq!(xet_mot_job(&mut j, Some(&[]), None, UsbVong::default(), t0), Some(KetLuanTiep::DaIn));
+        assert_eq!(xet_mot_job(&mut j, Some(&[]), Some(TapMa::default()), UsbVong::default(), t0), Some(KetLuanTiep::DaIn));
         assert!(j.ghi_chu_da_in().is_some_and(|c| c.contains("xoá tay") && c.contains("Hết giấy")), "{:?}", j.ghi_chu_da_in());
         // Đối chứng: thấy in SẠCH trước khi vắng → không ghi chú.
         let mut j = moi(da_in(), t0);
-        xet_mot_job(&mut j, Some(std::slice::from_ref(&ket)), None, UsbVong::default(), t0);
-        xet_mot_job(&mut j, Some(&[job(7, JOB_STATUS_PRINTING)]), None, UsbVong::default(), t0);
+        xet_mot_job(&mut j, Some(std::slice::from_ref(&ket)), Some(TapMa::default()), UsbVong::default(), t0);
+        xet_mot_job(&mut j, Some(&[job(7, JOB_STATUS_PRINTING)]), Some(TapMa::default()), UsbVong::default(), t0);
         for _ in 0..SO_LAN_VANG_LA_XONG {
-            xet_mot_job(&mut j, Some(&[]), None, UsbVong::default(), t0);
+            xet_mot_job(&mut j, Some(&[]), Some(TapMa::default()), UsbVong::default(), t0);
         }
         assert_eq!(j.ghi_chu_da_in(), None);
     }
@@ -1484,6 +1499,27 @@ mod tests {
         let hong = vong(0, vec![job(7, JOB_STATUS_PRINTED)]);
         assert!(!hong.la_may_usb);
         assert_ne!(buoc(&mut j, &hong, t0), Some(KetLuanTiep::DaIn));
+    }
+
+    /// Review Codex vòng 5: nhận diện "máy USB" đi qua BÀN GIAO — lần đọc ĐẦU của
+    /// theo dõi tiếp mà cờ máy in hỏng (EnumJobs vẫn được, job PRINTED) không
+    /// được ra `DaIn`; chưa biết loại máy thì chờ, biết là máy mạng mới `DaIn`.
+    #[test]
+    fn may_usb_qua_ban_giao_va_chua_ro_loai_may() {
+        let t0 = Instant::now();
+        let co_may_in_hong = VongDoc { hang_doi: Some(vec![job(7, JOB_STATUS_PRINTED)]), ..VongDoc::default() };
+        assert!(co_may_in_hong.co_may_in.is_none() && !co_may_in_hong.la_may_usb);
+        let mut j = moi(BangChungJob { may_usb: true, ..da_in() }, t0);
+        assert_ne!(buoc(&mut j, &co_may_in_hong, t0), Some(KetLuanTiep::DaIn), "đã biết là USB từ bước in chính");
+        let mut j = moi(da_in(), t0);
+        assert_eq!(buoc(&mut j, &co_may_in_hong, t0), None, "chưa biết loại máy: chờ");
+        assert_eq!(buoc(&mut j, &vong(1, vec![job(7, JOB_STATUS_PRINTED)]), t0), Some(KetLuanTiep::DaIn), "máy mạng");
+        // Vắng khỏi hàng đợi đủ số lần mà chưa biết loại máy: chưa kết luận.
+        let mut j = moi(da_in(), t0);
+        let vang = VongDoc { hang_doi: Some(vec![]), ..VongDoc::default() };
+        for _ in 0..SO_LAN_VANG_LA_XONG + 2 {
+            assert_eq!(buoc(&mut j, &vang, t0), None);
+        }
     }
 
     /// Review Codex vòng 4: dấu "Thôi theo dõi" chuyển lên JOB — hết hạn trong

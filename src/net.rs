@@ -528,6 +528,9 @@ fn xu_ly_viec_co_bao_cao(
     chuyen_may_in: &dyn Fn(MaSuCo, Option<String>),
 ) -> KetThucViec {
     let job_id = job_id_tho(val);
+    // Mốc bắt đầu THẬT của lần gửi — theo dõi tiếp dùng nó để xét "Thôi theo dõi"
+    // bấm trong lúc worker còn đang xử lý (review Codex vòng 5).
+    let bat_dau_gui = Instant::now();
     let name = val.get("job").and_then(|j| j.get("name")).and_then(|v| v.as_str());
     let (so_hoa_don, _) = job::nhan_hien_thi(&job_id, name);
     let bao_cao = BaoCaoTrongLuc {
@@ -589,7 +592,7 @@ fn xu_ly_viec_co_bao_cao(
     // thiếu bản thì không — bản còn lại đã gỡ khỏi hàng đợi).
     let theo_doi_tiep = match (kq.trang_thai.as_str(), kq.con_trong_hang_doi, bao_cao.con_trong_hang_doi.get()) {
         (job::KHONG_RO, Some(true), Some(bc)) => {
-            let j = JobTheoDoiTiep::moi(job_id.clone(), so_hoa_don.clone(), kq.loai, bc, Instant::now())
+            let j = JobTheoDoiTiep::moi(job_id.clone(), so_hoa_don.clone(), kq.loai, bc, bat_dau_gui)
                 .tren_may_in(&cfg.printer_name)
                 .nghi_ngo_sau_hoi_phuc(da_nghi.get());
             Some(match bao_cao.trong_may_in_usb.get() {
@@ -1424,6 +1427,11 @@ pub struct DieuKhienNet {
 }
 
 impl DieuKhienNet {
+    /// Kho theo dõi tiếp dùng chung (sống qua lần bấm Lưu).
+    pub fn kho(&self) -> Arc<KhoTheoDoiTiep> {
+        self.theo_doi.clone()
+    }
+
     /// Bật cờ dừng, chờ tối đa `cho` cho luồng cũ dọn xong. `true` = đã dừng.
     fn dung_va_cho(self, cho: Duration) -> bool {
         self.dung.store(true, Ordering::SeqCst);
@@ -1595,6 +1603,7 @@ pub fn khoi_chay_yeu_cau_hang_doi(
     trang_thai: Arc<Mutex<TrangThaiChung>>,
     loai: hang_doi::LoaiViec,
     muc: Vec<bao_cao::MucHangDoi>,
+    kho: Option<Arc<KhoTheoDoiTiep>>,
 ) {
     if muc.is_empty() {
         return;
@@ -1625,15 +1634,25 @@ pub fn khoi_chay_yeu_cau_hang_doi(
                 &Instant::now,
             );
             nhat_ky::ghi(su_kien_kq, &kc.dong_nhat_ky(m));
-            let mut t = khoa(&tt);
-            t.hang_doi.ket_thuc(&m.id, loai, &kc, Instant::now());
-            if loai == hang_doi::LoaiViec::Huy && matches!(kc, hang_doi::KetCuc::Duoc { .. }) {
-                t.ghi_da_huy(&m.id, &m.so_hoa_don, m.ten_khach.clone(), gio_hien_tai());
+            let luc = Instant::now();
+            let thoi = loai == hang_doi::LoaiViec::BoTheoDoi && matches!(kc, hang_doi::KetCuc::Duoc { .. });
+            {
+                let mut t = khoa(&tt);
+                t.hang_doi.ket_thuc(&m.id, loai, &kc, luc);
+                if loai == hang_doi::LoaiViec::Huy && matches!(kc, hang_doi::KetCuc::Duoc { .. }) {
+                    t.ghi_da_huy(&m.id, &m.so_hoa_don, m.ten_khach.clone(), gio_hien_tai());
+                }
+                // "Thôi theo dõi" xong: theo dõi tiếp (nếu còn) chỉ ghi quan sát, không
+                // gửi "đã in" ngược với `bo_qua` của server (0.2.7). Dấu cho lần gửi
+                // CHƯA vào kho (worker còn xử lý)…
+                if thoi {
+                    t.ghi_thoi_theo_doi(&m.id, luc);
+                }
             }
-            // "Thôi theo dõi" xong: theo dõi tiếp (nếu còn) chỉ ghi quan sát, không
-            // gửi "đã in" ngược với `bo_qua` của server (0.2.7).
-            if loai == hang_doi::LoaiViec::BoTheoDoi && matches!(kc, hang_doi::KetCuc::Duoc { .. }) {
-                t.ghi_thoi_theo_doi(&m.id, Instant::now());
+            // …và cờ lên NGAY các job đang có trong kho (nhả khoá trạng thái trước
+            // khi khoá kho) — không phụ thuộc vòng đọc máy in (review Codex vòng 5).
+            if let (true, Some(k)) = (thoi, &kho) {
+                k.danh_dau_im_lang(&[(m.id.clone(), luc)]);
             }
         }
         let _ = dg.gui_ngay("lay-hang-doi", serde_json::json!({}), CanHoTro::HangDoi);
@@ -2294,8 +2313,16 @@ mod tests {
         let tt = Mutex::new(TrangThaiChung::default());
         let (_e, gui) = gui_gia(du_ho_tro());
         let id = "1790251200000-7";
-        let xong = xu_ly_viec_co_bao_cao(&payload_co_name(id), &cfg(), &in_gia_khong_ro_con_trong_hang_doi, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
+        let luc_in = Cell::new(None);
+        let in_ghi_luc = |p: &[u8], pr: &str, pa: &str, t: &str, c: u32, j: &str, n: Option<&str>, nen: Option<TapMa>, b: &dyn Fn(QuanSat)| {
+            luc_in.set(Some(Instant::now()));
+            std::thread::sleep(Duration::from_millis(20));
+            in_gia_khong_ro_con_trong_hang_doi(p, pr, pa, t, c, j, n, nen, b)
+        };
+        let xong = xu_ly_viec_co_bao_cao(&payload_co_name(id), &cfg(), &in_ghi_luc, &kiem_in, &khong_nghi(), &tt, &gui, &|_, _| {});
         let j = xong.theo_doi_tiep.expect("phải theo dõi tiếp");
+        // Mốc bắt đầu = lúc bắt đầu GỬI (trước khi in xong), không phải lúc bàn giao (review Codex vòng 5).
+        assert!(j.bat_dau <= luc_in.get().unwrap(), "{:?} > {:?}", j.bat_dau, luc_in.get());
         assert_eq!(j.job_id, id);
         assert_eq!(j.so_hoa_don, "INV_2026_030045");
         assert_eq!(j.loai, Some(MaSuCo::KetGiay));
@@ -2995,7 +3022,7 @@ mod tests {
             assert!(t.hang_doi.bam_huy("a1", true, t0));
             t.hang_doi.bat_dau("a1", LoaiViec::Huy, true, t0 + hang_doi::CHONG_BAM_DUP).expect("xác nhận")
         };
-        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, vec![m]);
+        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, vec![m], None);
         cho("Đã huỷ a1", &|t| khoi(t).dong.iter().any(|d| d.id == "a1" && d.che_do == hang_doi::CheDo::DaHuy));
         cho("server bỏ a1 khỏi ảnh chụp", &|t| khoi(t).tieu_de == "HÀNG ĐỢI (2) · 1 chưa xác nhận");
         assert_eq!(khoa(&tt).jobs[0].trang_thai, job::DA_HUY, "In gần đây ghi Đã huỷ");
@@ -3013,8 +3040,12 @@ mod tests {
             assert!(t.hang_doi.bam_bo("k1", true, t0));
             t.hang_doi.bat_dau("k1", LoaiViec::BoTheoDoi, true, t0 + hang_doi::CHONG_BAM_DUP).expect("xác nhận bỏ")
         };
-        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::BoTheoDoi, vec![m]);
+        // Lần gửi của k1 đang được THEO DÕI TIẾP: ack xong là cờ im lặng lên job NGAY (review Codex vòng 5).
+        let kho = Arc::new(KhoTheoDoiTiep::default());
+        kho.them(JobTheoDoiTiep::moi("k1-1790251200000".into(), "INV/2026/k1".into(), None, BangChungJob::default(), Instant::now()));
+        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::BoTheoDoi, vec![m], Some(kho.clone()));
         cho("Đã bỏ k1", &|t| khoi(t).dong.iter().any(|d| d.id == "k1" && d.che_do == hang_doi::CheDo::DaBo));
+        assert_eq!(kho.im_lang_cua("k1-1790251200000"), Some(true), "cờ im lặng lên job trong kho");
         cho("server bỏ k1", &|t| khoi(t).tieu_de == "HÀNG ĐỢI (2)");
 
         // 5. Huỷ cả loạt còn lại (a2) qua "Huỷ cả N".
@@ -3026,7 +3057,7 @@ mod tests {
             t.hang_doi.bat_dau_loat(true, t0 + hang_doi::CHONG_BAM_DUP)
         };
         assert_eq!(ds.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a2"]);
-        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, ds);
+        khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), LoaiViec::Huy, ds, None);
         cho("tổng kết loạt", &|t| khoi(t).loat_chu == "Đã huỷ 1/1 lệnh in");
 
         // 6. Server có nhận `lay-hang-doi` (luồng hỏi lại + sau mỗi yêu cầu).

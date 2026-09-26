@@ -155,6 +155,10 @@ pub struct BangChungJob {
     /// Codex): đi theo lần gửi qua mọi đường bàn giao (hàng đợi Windows hay bộ
     /// nhớ máy USB) — kết luận "đã in" dựa vào USB về sau chỉ là "đối chiếu số".
     pub gian_doan: bool,
+    /// Máy in của lần gửi ĐÃ được nhận ra là máy USB cục bộ (0.2.7, review Codex
+    /// vòng 5): đi qua bàn giao — theo dõi tiếp không được coi là máy mạng chỉ vì
+    /// lần đọc cờ máy in đầu tiên của nó hỏng (PRINTED trên máy USB ≠ đã in).
+    pub may_usb: bool,
 }
 
 /// Điều quan sát được trong lúc theo dõi một job — báo ra ngoài NGAY.
@@ -351,7 +355,7 @@ impl BoSuy {
     }
 
     fn bang_chung(&self) -> BangChungJob {
-        BangChungJob { da_thay_in: self.da_thay_in, da_thay_huy: self.da_thay_huy, nen: self.nen, gian_doan: false }
+        BangChungJob { da_thay_in: self.da_thay_in, da_thay_huy: self.da_thay_huy, nen: self.nen, ..Default::default() }
     }
 }
 
@@ -1279,7 +1283,8 @@ fn ket_thuc(
 ) -> KetQuaIn {
     // Bằng chứng giao cho theo dõi tiếp mang cờ gián đoạn (đọc LÚC giao — kiểm
     // máy in sau khi rời hàng đợi còn có thể bật nó).
-    let bang_chung = |canh: &crate::thuc_day::CanhGianDoan| BangChungJob { gian_doan: canh.co, ..bo_suy.bang_chung() };
+    let bang_chung =
+        |canh: &crate::thuc_day::CanhGianDoan| BangChungJob { gian_doan: canh.co, may_usb: usb.la_may_usb, ..bo_suy.bang_chung() };
     match kl {
         // PRINTED trên máy USB chỉ nghĩa là byte cuối đã vào BỘ NHỚ máy in —
         // máy hết giấy vẫn giữ đó (giám sát 25/09): máy USB cũng phải qua U2.

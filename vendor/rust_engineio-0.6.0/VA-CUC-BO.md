@@ -15,6 +15,8 @@ trong `Cargo.toml`), chép nguyên văn từ `~/.cargo/registry`, dùng qua `[pa
   không có hạn: bên kia ngừng đọc (bộ đệm TCP đầy) → luồng gửi giữ khoá sender MÃI, luồng poll kẹt theo khi
   trả Pong (review Codex 26/09). Quá hạn thì đặt cờ `hong`: mọi `emit`/`poll` sau đó lỗi NGAY (gói ghi dở
   đã làm hỏng khung websocket — không dùng tiếp) → luồng poll báo lỗi → app nối lại.
+- Cùng hai file, đường LỖI của bước dựng: `runtime.shutdown_background()` thay vì để `Runtime::drop` chờ tác vụ
+  blocking (phân giải DNS của hệ điều hành chạy bằng `spawn_blocking`, timeout không huỷ được nó).
 - `src/lib.rs`: hằng `HAN_DUNG_KET_NOI`, `HAN_GUI` + hàm lỗi.
 - `Cargo.toml`: bỏ `[[bench]]` + `[dev-dependencies]` (máy build .207 offline, không cần).
 

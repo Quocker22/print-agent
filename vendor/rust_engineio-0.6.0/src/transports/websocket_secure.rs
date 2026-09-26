@@ -42,7 +42,16 @@ impl WebsocketSecureTransport {
             )
             .await
             .map_err(|_| crate::loi_qua_han_ket_noi())?
-        })?;
+        });
+        // Đường lỗi: KHÔNG để `Runtime::drop` chờ tác vụ blocking còn sống (phân
+        // giải DNS của hệ điều hành bị treo) — review Codex vòng 5.
+        let inner = match inner {
+            Ok(i) => i,
+            Err(e) => {
+                runtime.shutdown_background();
+                return Err(e);
+            }
+        };
 
         Ok(WebsocketSecureTransport {
             runtime: Arc::new(runtime),

@@ -747,8 +747,14 @@ pub fn chay_ui(
         type ViecCanGui = Option<(LoaiViec, Vec<MucHangDoi>)>;
         type ThaoTacHd = Box<dyn Fn(&mut TrangThaiChung, &str) -> ViecCanGui>;
         let gan = |f: ThaoTacHd| {
-            let (w_weak, cfg, tt, hd, dg) =
-                (window.as_weak(), cfg_dang_dung.clone(), trang_thai.clone(), hd_model.clone(), duong_gui.clone());
+            let (w_weak, cfg, tt, hd, dg, nd) = (
+                window.as_weak(),
+                cfg_dang_dung.clone(),
+                trang_thai.clone(),
+                hd_model.clone(),
+                duong_gui.clone(),
+                net_dang_chay.clone(),
+            );
             move |id: slint::SharedString| {
                 let Some(w) = w_weak.upgrade() else { return };
                 let viec = {
@@ -758,7 +764,8 @@ pub fn chay_ui(
                     viec
                 };
                 if let Some((loai, muc)) = viec {
-                    net::khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), loai, muc);
+                    let kho = nd.borrow().as_ref().map(DieuKhienNet::kho);
+                    net::khoi_chay_yeu_cau_hang_doi(dg.clone(), tt.clone(), loai, muc, kho);
                 }
             }
         };
