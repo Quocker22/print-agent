@@ -94,13 +94,12 @@ version = "0.21.0"
 [dependencies.url]
 version = "2.4.1"
 
-["async_tokio"]
-
-[dev-dependencies.tokio]
-version = "1.36.0"
-features = ["macros"]
-
 [features]
 async = ["async-callbacks"]
 async-callbacks = []
 default = ["async"]
+
+# print-agent: crate vendor — không in cảnh báo của mã gốc (cfg tarpaulin, lifetime…).
+[lints.rust]
+unexpected_cfgs = "allow"
+mismatched_lifetime_syntaxes = "allow"

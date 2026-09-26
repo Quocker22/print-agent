@@ -15,6 +15,9 @@ use url::Url;
 #[derive(Clone)]
 pub struct WebsocketTransport {
     runtime: Arc<Runtime>,
+    /// print-agent (VA-CUC-BO.md): một lần gửi quá hạn = socket hỏng — mọi lần
+    /// gửi/đọc sau đó lỗi NGAY để luồng poll báo lỗi và app nối lại.
+    hong: Arc<std::sync::atomic::AtomicBool>,
     inner: Arc<AsyncWebsocketTransport>,
 }
 
@@ -37,6 +40,7 @@ impl WebsocketTransport {
 
         Ok(WebsocketTransport {
             runtime: Arc::new(runtime),
+            hong: Arc::default(),
             inner: Arc::new(inner),
         })
     }
@@ -50,11 +54,22 @@ impl WebsocketTransport {
 
 impl Transport for WebsocketTransport {
     fn emit(&self, data: Bytes, is_binary_att: bool) -> Result<()> {
-        self.runtime
-            .block_on(async { self.inner.emit(data, is_binary_att).await })
+        // print-agent (VA-CUC-BO.md): gửi CÓ HẠN — bên kia ngừng đọc thì
+        // `sender.send` chờ mãi, giữ khoá sender, luồng poll cũng kẹt khi trả Pong.
+        crate::kiem_hong(&self.hong)?;
+        self.runtime.block_on(async {
+            match tokio::time::timeout(crate::HAN_GUI, self.inner.emit(data, is_binary_att)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    self.hong.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err(crate::loi_qua_han_gui())
+                }
+            }
+        })
     }
 
     fn poll(&self, timeout: Duration) -> Result<Bytes> {
+        crate::kiem_hong(&self.hong)?;
         self.runtime.block_on(async {
             let r = match tokio::time::timeout(timeout, self.inner.poll_next()).await {
                 Ok(r) => r,

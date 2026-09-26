@@ -120,7 +120,7 @@ const GIU_BINH_THUONG_TOI_DA: Duration = Duration::from_secs(3 * 60);
 
 /// `loiCuoi` của hoá đơn gửi ngay sau khi máy hồi phục có hoá đơn kẹt (0.2.7).
 const CHU_NGHI_NGO_SAU_HOI_PHUC: &str = "may in vua hoi phuc sau loi (co hoa don ket trong bo nho may) — HP 108a tung in \
-     trung to ket va lam mat hoa don gui ngay sau (25/09, 030134/030136): KIEM TO hoa don nay";
+     trung to ket va lam mat hoa don gui ngay sau (25/09, 030134/030136): KIEM TO — doi chieu so hoa don tren cac to";
 
 /// Worker in một job quá chừng này (Sumatra treo, spooler treo…) thì luồng
 /// theo dõi máy in vẫn đọc máy in như lúc rảnh (R8) — không để giao diện và
@@ -394,13 +394,15 @@ fn nen_giu_binh_thuong(
 
 /// Đưa một job vào danh sách theo dõi tiếp (dùng chung qua lần bấm Lưu) + ghi
 /// nhật ký; job CŨ NHẤT bị bỏ vì vượt trần cũng được ghi (không mất lặng).
-fn dua_vao_theo_doi_tiep(kho: &KhoTheoDoiTiep, trang_thai: &Mutex<TrangThaiChung>, j: JobTheoDoiTiep) {
-    if j.ket_do_loi() {
-        if let Some(pid) = crate::state::print_job_id(&j.job_id) {
-            let mut t = khoa(trang_thai);
-            if !t.trong_may_in.iter().any(|x| x == pid) {
-                t.trong_may_in.push(pid.to_string());
-            }
+fn dua_vao_theo_doi_tiep(kho: &KhoTheoDoiTiep, trang_thai: &Mutex<TrangThaiChung>, mut j: JobTheoDoiTiep) {
+    if let Some(pid) = crate::state::print_job_id(&j.job_id) {
+        let mut t = khoa(trang_thai);
+        if j.ket_do_loi() && !t.trong_may_in.iter().any(|x| x == pid) {
+            t.trong_may_in.push(pid.to_string());
+        }
+        // Bấm "Thôi theo dõi" lúc hoá đơn còn đang in (chưa vào kho): cờ lên job ngay.
+        if t.da_thoi_theo_doi(pid, j.bat_dau) {
+            j = j.danh_dau_im_lang();
         }
     }
     nhat_ky::ghi(
@@ -458,8 +460,8 @@ struct BaoCaoTrongLuc<'a> {
     may_in_da_chuyen: Cell<Option<MaSuCo>>,
     da_thay_su_co: Cell<bool>,
     con_trong_hang_doi: Cell<Option<BangChungJob>>,
-    /// `Some((da_thay_loi, da_thay_in, gian_doan))` = job nằm trong BỘ NHỚ máy in USB (U2) — theo dõi tiếp qua USB.
-    trong_may_in_usb: Cell<Option<(bool, bool, bool)>>,
+    /// `Some((da_thay_loi, da_thay_in))` = job nằm trong BỘ NHỚ máy in USB (U2) — theo dõi tiếp qua USB.
+    trong_may_in_usb: Cell<Option<(bool, bool)>>,
 }
 
 impl BaoCaoTrongLuc<'_> {
@@ -488,9 +490,9 @@ impl BaoCaoTrongLuc<'_> {
             QuanSat::ConTrongHangDoi(bc) => self.con_trong_hang_doi.set(Some(bc)),
             // Không còn trong hàng đợi Windows nhưng CÒN chờ trong máy in — với
             // backend nghĩa y hệt (`conTrongHangDoi:true`: tự in, KHÔNG in lại).
-            QuanSat::TrongMayInUsb { bang_chung, da_thay_loi, da_thay_in, gian_doan } => {
+            QuanSat::TrongMayInUsb { bang_chung, da_thay_loi, da_thay_in } => {
                 self.con_trong_hang_doi.set(Some(bang_chung));
-                self.trong_may_in_usb.set(Some((da_thay_loi, da_thay_in, gian_doan)));
+                self.trong_may_in_usb.set(Some((da_thay_loi, da_thay_in)));
             }
             QuanSat::DaRoiHangDoi => khoa(self.trang_thai).doi_trang_thai_job(self.job_id, job::CHO_MAY_IN),
         }
@@ -543,6 +545,9 @@ fn xu_ly_viec_co_bao_cao(
     };
     let bao = |qs: QuanSat| bao_cao.nhan(qs);
     let da_nghi = Cell::new(false);
+    // Máy CHẠY xong mà không xác nhận được là hoá đơn này (nghi sau hồi phục / máy
+    // tính ngủ giữa lúc theo dõi) → giao diện "đối chiếu số" (giám sát 0.2.7).
+    let doi_chieu = Cell::new(false);
     let in_fn = |pdf: &[u8], printer: &str, paper: &str, tray: &str, copies: u32, id: &str, ten: Option<&str>| {
         match kiem_truoc() {
             KiemTruoc::TuChoi { ly_do, su_kien } => {
@@ -561,8 +566,12 @@ fn xu_ly_viec_co_bao_cao(
                     (nghi_ngo.da_gui_byte)();
                     da_nghi.set(true);
                 }
+                if matches!(&kq, job::KetQuaIn::KhongRo(l) if l.chu == spooler::CHU_GIAN_DOAN) {
+                    doi_chieu.set(true);
+                }
                 match kq {
                     job::KetQuaIn::DaIn if nghi => {
+                        doi_chieu.set(true);
                         nhat_ky::ghi("nghi_ngo_sau_hoi_phuc", &format!("job={} — khong bao da_in, bao khong_ro kiem to", job::rut_gon_job_id(id)));
                         job::KetQuaIn::KhongRo(job::LyDo::co_loai(CHU_NGHI_NGO_SAU_HOI_PHUC, MaSuCo::KhongXacNhan))
                     }
@@ -573,6 +582,9 @@ fn xu_ly_viec_co_bao_cao(
     };
     let con_trong = || bao_cao.con_trong_hang_doi.get().is_some();
     let (kq, _) = xu_ly_mot_viec(val, cfg, &in_fn, trang_thai, gui, &con_trong);
+    if doi_chieu.get() && kq.trang_thai == job::KHONG_RO {
+        khoa(trang_thai).ra_to_can_doi_chieu(&job_id, &so_hoa_don);
+    }
     // Theo dõi tiếp ĐÚNG khi đã báo backend `conTrongHangDoi:true` (T9: in
     // thiếu bản thì không — bản còn lại đã gỡ khỏi hàng đợi).
     let theo_doi_tiep = match (kq.trang_thai.as_str(), kq.con_trong_hang_doi, bao_cao.con_trong_hang_doi.get()) {
@@ -581,7 +593,7 @@ fn xu_ly_viec_co_bao_cao(
                 .tren_may_in(&cfg.printer_name)
                 .nghi_ngo_sau_hoi_phuc(da_nghi.get());
             Some(match bao_cao.trong_may_in_usb.get() {
-                Some((da_thay_loi, da_thay_in, gian_doan)) => j.qua_usb(da_thay_loi, da_thay_in).gian_doan(gian_doan),
+                Some((da_thay_loi, da_thay_in)) => j.qua_usb(da_thay_loi, da_thay_in),
                 None => j,
             })
         }
@@ -862,11 +874,13 @@ pub fn chu_co_the_trong_may_in(so_hoa_don: &str, ma: MaSuCo) -> String {
     )
 }
 
-/// `chiTiet` của `su-co khong_xac_nhan` khi máy in ra tờ SAU lỗi cho một hoá
-/// đơn kẹt (0.2.7) — không bảo in lại: tờ có thể đã ra, chỉ không biết là số nào.
+/// `chiTiet` của `su-co khong_xac_nhan` cho hoá đơn KHÔNG xác nhận được bằng
+/// USB sau sự cố (kẹt do lỗi / gửi lúc máy vừa hồi phục / máy tính ngủ giữa lúc
+/// theo dõi) — dù máy đã chạy lại hay không thấy in (0.2.7). Không bảo in lại:
+/// tờ có thể đã ra, chỉ không biết là số nào.
 pub fn chu_doi_chieu_so(so_hoa_don: &str) -> String {
     format!(
-        "Máy in đã chạy lại nhưng CHƯA xác nhận hoá đơn {} đã in (máy từng in lặp / bỏ sót hoá đơn sau khi hết giấy; hoặc máy tính ngủ giữa lúc theo dõi): ĐỐI CHIẾU SỐ hoá đơn trên các tờ vừa ra, thiếu số nào mới in lại số đó",
+        "CHƯA xác nhận được hoá đơn {} đã in (máy in từng in lặp / bỏ sót hoá đơn sau sự cố; máy in bị tắt; hoặc máy tính ngủ giữa lúc theo dõi): ĐỐI CHIẾU SỐ hoá đơn trên các tờ vừa ra, thiếu số nào mới in lại số đó",
         so_hoa_don
     )
 }
@@ -918,7 +932,7 @@ fn xu_ly_ket_luan_tiep(
         if j.ket_do_loi() {
             t.hoi_phuc_co_hoa_don_ket = Some((may_in.to_string(), Instant::now()));
         }
-        pid.as_deref().is_some_and(|p| t.da_thoi_theo_doi(p, j.bat_dau))
+        j.im_lang() || pid.as_deref().is_some_and(|p| t.da_thoi_theo_doi(p, j.bat_dau))
     };
     // Người dùng đã "Thôi theo dõi": server không còn chờ — chỉ ghi quan sát,
     // không gửi "đã in"/sự cố (DB `bo_qua` không bị nhật ký nói ngược).
@@ -979,6 +993,25 @@ fn xu_ly_ket_luan_tiep(
                 &format!("job={} hoa_don={} loai_truoc={} gui_server={}", id_ngan, j.so_hoa_don, loai, kq.chu()),
             );
         }
+        // Hoá đơn kẹt do lỗi / nghi / gián đoạn mà máy không in (hay mất thiết bị):
+        // cùng việc cần làm với lúc máy ra tờ — đối chiếu số (giám sát 0.2.7).
+        KetLuanTiep::Mat(ly_do) if j.khong_bao_da_in() => {
+            let v = bao_cao::su_co(&j.job_id, MaSuCo::KhongXacNhan, Some(&chu_doi_chieu_so(&j.so_hoa_don)), may_in, SystemTime::now());
+            let kq = gui("su-co", v, CanHoTro::SuCo);
+            khoa(trang_thai).ra_to_can_doi_chieu(&j.job_id, &j.so_hoa_don);
+            nhat_ky::ghi(
+                "theo_doi_tiep_mat",
+                &format!(
+                    "job={} hoa_don={} loai_truoc={} {} gui_server={} {} — doi chieu so",
+                    id_ngan,
+                    j.so_hoa_don,
+                    loai,
+                    j.ly_do_khong_bao_da_in(),
+                    kq.chu(),
+                    ly_do
+                ),
+            );
+        }
         KetLuanTiep::Mat(ly_do) => {
             let kq = bao_mat(match co_the_trong_may_in {
                 Some(ma) => chu_co_the_trong_may_in(&j.so_hoa_don, ma),
@@ -1020,11 +1053,19 @@ fn chay_theo_doi_tiep(
             // Job chuyển sang theo dõi qua USB giữa chừng (U3) cũng phải hiện
             // "trong máy in" trên giao diện.
             let ds = kho.id_trong_may_in(&may_in);
-            let mut t = khoa(&trang_thai);
-            for p in ds {
-                if !t.trong_may_in.contains(&p) {
-                    t.trong_may_in.push(p);
+            let dau = {
+                let mut t = khoa(&trang_thai);
+                for p in ds {
+                    if !t.trong_may_in.contains(&p) {
+                        t.trong_may_in.push(p);
+                    }
                 }
+                t.thoi_theo_doi.clone()
+            };
+            // Dấu "Thôi theo dõi" lên job trong kho (nhả khoá trạng thái TRƯỚC khi
+            // khoá kho — không lồng khoá): cờ trên job không hết hạn theo danh sách dấu.
+            if !dau.is_empty() {
+                kho.danh_dau_im_lang(&dau);
             }
             vong
         },
@@ -1879,6 +1920,8 @@ fn chay_net(
                 cho_nghi(client, &co, the_he.load(Ordering::SeqCst), &dg);
             }
         };
+        // Máy thức dậy TRONG LÚC đang nối (tới 30 s): không để lần thức đó bị nuốt.
+        let thuc_truoc_khi_noi = crate::thuc_day::lan_thuc_day();
         let ket_noi = noi_co_han(move || dung_client.connect().map_err(|e| e.to_string()), bo_muon, HAN_NOI, &dung);
 
         let mut noi_ngay = false;
@@ -1964,6 +2007,10 @@ fn chay_net(
         }
         if dung.load(Ordering::SeqCst) {
             break;
+        }
+        if !noi_ngay && crate::thuc_day::lan_thuc_day() != thuc_truoc_khi_noi {
+            nhat_ky::ghi("noi_lai_sau_khi_thuc", "may tinh vua ngu day trong luc dang noi — thu lai ngay");
+            noi_ngay = true;
         }
         if noi_ngay {
             lan_noi_lai = 0;
@@ -2745,7 +2792,6 @@ mod tests {
                 bang_chung: BangChungJob { da_thay_in: true, ..Default::default() },
                 da_thay_loi: true,
                 da_thay_in: false,
-                gian_doan: false,
             });
             KetQuaIn::KhongRo(LyDo::co_loai("may in bao loi qua USB", MaSuCo::CanXuLy))
         };
@@ -2807,6 +2853,29 @@ mod tests {
         let j = JobTheoDoiTiep::moi(id.into(), "INV_136".into(), None, BangChungJob::default(), Instant::now()).nghi_ngo_sau_hoi_phuc(true);
         xu_ly_ket_luan_tiep(j, KetLuanTiep::DaIn, "HP", &tt, &gui);
         assert_eq!(e.lock().unwrap()[0].0, "su-co");
+    }
+
+    /// Giám sát 0.2.7: hoá đơn KẸT DO LỖI mà máy không in (rảnh 60 s / mất thiết
+    /// bị) → cùng việc cần làm như lúc ra tờ: `su-co` "đối chiếu số" + dải
+    /// `DoiChieu` — không phải "in lại nếu chưa có" (máy HP từng in lặp/bỏ sót).
+    #[test]
+    fn hoa_don_ket_do_loi_bi_mat_cung_doi_chieu_so() {
+        let tt = Mutex::new(TrangThaiChung::default());
+        let (e, gui) = gui_gia(du_ho_tro());
+        let j = JobTheoDoiTiep::moi("p136-1790251200000".into(), "INV_136".into(), Some(MaSuCo::HetGiay), BangChungJob::default(), Instant::now())
+            .qua_usb(true, false);
+        xu_ly_ket_luan_tiep(j, KetLuanTiep::Mat("may in USB ranh lau".into()), "HP", &tt, &gui);
+        let da = e.lock().unwrap().clone();
+        assert_eq!(da[0].0, "su-co");
+        let ct = da[0].1["chiTiet"].as_str().unwrap().to_string();
+        assert!(ct.contains("ĐỐI CHIẾU SỐ") && !ct.contains("in lại nếu chưa có"), "{}", ct);
+        assert_eq!(khoa(&tt).dai_moi_nhat().map(|d| d.loai_dai), Some(crate::state::LoaiDai::DoiChieu));
+        // Hoá đơn thường (không kẹt do lỗi) giữ câu cũ.
+        let (e, gui) = gui_gia(du_ho_tro());
+        let j = JobTheoDoiTiep::moi("p9-1790251200000".into(), "INV_9".into(), None, BangChungJob::default(), Instant::now())
+            .qua_usb(false, false);
+        xu_ly_ket_luan_tiep(j, KetLuanTiep::Mat("x".into()), "HP", &tt, &gui);
+        assert!(e.lock().unwrap()[0].1["chiTiet"].as_str().unwrap().contains("in lại nếu chưa có"));
     }
 
     /// "Thôi theo dõi" theo LẦN GỬI: kết luận của lần gửi trước lúc bấm chỉ ghi
@@ -3051,6 +3120,89 @@ mod tests {
         dk.dung.store(true, Ordering::SeqCst);
     }
 
+    /// ĐẦU-CUỐI (chạy tay, cần HD_URL): nối THẬT qua proxy; sau khi nối, proxy
+    /// NGỪNG ĐỌC từ app (bên kia treo, bộ đệm TCP đầy). Gửi gói lớn liên tục:
+    /// một lần gửi phải TRẢ LỖI trong `HAN_GUI` (bản gốc chờ mãi, giữ khoá
+    /// sender), các lần sau lỗi NGAY, và luồng poll phải báo "error" (để app nối
+    /// lại) khi server ping tới — review Codex vòng 4.
+    #[test]
+    #[ignore]
+    fn gui_ket_do_ben_kia_ngung_doc_thi_bao_loi() {
+        use std::net::{TcpListener, TcpStream};
+        let url = std::env::var("HD_URL").expect("HD_URL");
+        let dich = url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let nghe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cong = nghe.local_addr().unwrap().port();
+        let ngung_doc = Arc::new(AtomicBool::new(false));
+        {
+            let ngung_doc = ngung_doc.clone();
+            std::thread::spawn(move || {
+                for s in nghe.incoming().flatten() {
+                    let Ok(d) = TcpStream::connect(&dich) else { continue };
+                    let (mut a1, mut b1) = (s.try_clone().unwrap(), d.try_clone().unwrap());
+                    let (mut a2, mut b2) = (s, d);
+                    let ngung_doc = ngung_doc.clone();
+                    std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        let mut buf = [0u8; 16 * 1024];
+                        loop {
+                            if ngung_doc.load(Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(200));
+                                continue;
+                            }
+                            match a1.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if b1.write_all(&buf[..n]).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut b2, &mut a2);
+                    });
+                }
+            });
+        }
+        let (bao_loi, co_loi) = mpsc::channel::<String>();
+        let (bao_mo, da_mo) = mpsc::channel::<()>();
+        let client = ClientBuilder::new(format!("http://127.0.0.1:{}", cong))
+            .namespace(NAMESPACE)
+            .auth(serde_json::json!({ "token": "tok-e2e" }))
+            .transport_type(TRANSPORT)
+            .reconnect(false)
+            .on("open", move |_p: Payload, _c: RawClient| {
+                let _ = bao_mo.send(());
+            })
+            .on("error", move |p: Payload, _c: RawClient| {
+                let _ = bao_loi.send(chu_payload(&p));
+            })
+            .connect()
+            .expect("nối được qua proxy");
+        da_mo.recv_timeout(Duration::from_secs(10)).expect("open");
+        ngung_doc.store(true, Ordering::SeqCst);
+        let goi = "x".repeat(200 * 1024);
+        let bat_dau = Instant::now();
+        let mut lan_loi = None;
+        for i in 0..400 {
+            let t = Instant::now();
+            if let Err(e) = client.emit("nhat-ky-rac", serde_json::json!({ "i": i, "rac": goi })) {
+                eprintln!("emit lan {} loi sau {:?} (tong {:?}): {}", i, t.elapsed(), bat_dau.elapsed(), e);
+                lan_loi = Some(t.elapsed());
+                break;
+            }
+        }
+        let lan_loi = lan_loi.expect("phải có một lần gửi trả lỗi (bộ đệm đầy)");
+        assert!(lan_loi <= rust_engineio::HAN_GUI + Duration::from_secs(3), "{:?}", lan_loi);
+        let t = Instant::now();
+        assert!(client.emit("x", serde_json::json!({})).is_err(), "sau khi hỏng: lỗi NGAY");
+        assert!(t.elapsed() < Duration::from_secs(1));
+        let loi = co_loi.recv_timeout(Duration::from_secs(60)).expect("luồng poll phải báo error để app nối lại");
+        eprintln!("callback error: {}", loi);
+    }
+
     /// (chạy tay, không cần server): `connect()` THẬT của rust_socketio tới một
     /// máy nhận TCP rồi im lặng phải TRẢ LỖI trong `HAN_DUNG_KET_NOI` — đo 26/09
     /// bản gốc 0.6.0 sau 180 s vẫn chưa trả (nguyên nhân "sleep là mất kết nối luôn").
@@ -3203,7 +3355,8 @@ mod tests {
     /// 0.2.7: `connect()` treo quá hạn → trả `QuaHan` (vòng nối lại KHÔNG đứng
     /// mãi); về sau nó nối được thì kết nối muộn bị dọn (`bo`), suất treo trả lại.
     /// Nối nhanh / lỗi nhanh → trả đúng kết quả. Test dùng chung bộ đếm toàn
-    /// cục `SO_NOI_TREO` — chỉ test này đụng nó.
+    /// cục `SO_NOI_TREO` — chỉ test này (và các test đầu-cuối `#[ignore]`, chạy
+    /// riêng từng cái) đụng nó.
     #[test]
     fn noi_co_han_khong_de_vong_noi_lai_treo_mai() {
         let kq = noi_co_han(|| Ok::<u32, String>(7), |_| panic!("không được dọn"), Duration::from_secs(5), &AtomicBool::new(false));
@@ -3370,6 +3523,8 @@ mod tests {
         assert!(v["loiCuoi"].as_str().unwrap_or_default().contains("KIEM TO"), "{v}");
         assert_eq!(v["loai"], "khong_xac_nhan");
         assert_eq!(so_lan_tieu.get(), 1, "đã gửi byte → mốc lấy đi");
+        // Giao diện: dòng CHƯA xác nhận + dải "đối chiếu số" (không phải dải chung "5 phút…").
+        assert_eq!(khoa(&tt).dai_moi_nhat().map(|d| d.loai_dai), Some(crate::state::LoaiDai::DoiChieu));
         // Bị từ chối trước khi gửi (`Loi` — backend gửi lại) → mốc CÒN (review Codex).
         let (_, gui) = gui_gia(du_ho_tro());
         let in_loi = |_p: &[u8], _pr: &str, _pa: &str, _t: &str, _c: u32, _j: &str, _n: Option<&str>, _nen: Option<TapMa>, _b: &dyn Fn(QuanSat)| {

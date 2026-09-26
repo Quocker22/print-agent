@@ -151,6 +151,10 @@ pub struct BangChungJob {
     /// tính chống lại job, kể cả khi theo dõi tiếp. Lần đọc đầu không đọc được
     /// máy in thì nền rỗng (thận trọng: mọi mã đều tính).
     pub nen: TapMa,
+    /// Máy tính ngủ / app bị treo trong lúc theo dõi LẦN GỬI này (0.2.7, review
+    /// Codex): đi theo lần gửi qua mọi đường bàn giao (hàng đợi Windows hay bộ
+    /// nhớ máy USB) — kết luận "đã in" dựa vào USB về sau chỉ là "đối chiếu số".
+    pub gian_doan: bool,
 }
 
 /// Điều quan sát được trong lúc theo dõi một job — báo ra ngoài NGAY.
@@ -169,9 +173,8 @@ pub enum QuanSat {
     /// dõi tiếp QUA USB, báo backend `conTrongHangDoi:true` (tự in, KHÔNG in lại).
     /// `da_thay_in`: máy USB đã BUSY trong bước sau khi rời hàng đợi (giao vì
     /// bận quá hạn) — theo dõi tiếp chỉ cần thấy về IDLE.
-    /// `gian_doan`: máy tính ngủ / app bị treo giữa lúc theo dõi (0.2.7) — kết
-    /// luận "đã in" về sau cũng chỉ là "đối chiếu số" (`khong_bao_da_in`).
-    TrongMayInUsb { bang_chung: BangChungJob, da_thay_loi: bool, da_thay_in: bool, gian_doan: bool },
+    /// Gián đoạn quan sát (0.2.7) đi trong `bang_chung.gian_doan`.
+    TrongMayInUsb { bang_chung: BangChungJob, da_thay_loi: bool, da_thay_in: bool },
     /// Job vừa RỜI hàng đợi Windows (byte đã xuống máy in) — app hiện "Đã gửi
     /// xuống máy in — đang chờ in ra…" trong lúc đọc máy in (0.2.5).
     DaRoiHangDoi,
@@ -348,7 +351,7 @@ impl BoSuy {
     }
 
     fn bang_chung(&self) -> BangChungJob {
-        BangChungJob { da_thay_in: self.da_thay_in, da_thay_huy: self.da_thay_huy, nen: self.nen }
+        BangChungJob { da_thay_in: self.da_thay_in, da_thay_huy: self.da_thay_huy, nen: self.nen, gian_doan: false }
     }
 }
 
@@ -1274,6 +1277,9 @@ fn ket_thuc(
     canh: &mut crate::thuc_day::CanhGianDoan,
     bao: &dyn Fn(QuanSat),
 ) -> KetQuaIn {
+    // Bằng chứng giao cho theo dõi tiếp mang cờ gián đoạn (đọc LÚC giao — kiểm
+    // máy in sau khi rời hàng đợi còn có thể bật nó).
+    let bang_chung = |canh: &crate::thuc_day::CanhGianDoan| BangChungJob { gian_doan: canh.co, ..bo_suy.bang_chung() };
     match kl {
         // PRINTED trên máy USB chỉ nghĩa là byte cuối đã vào BỘ NHỚ máy in —
         // máy hết giấy vẫn giữ đó (giám sát 25/09): máy USB cũng phải qua U2.
@@ -1299,7 +1305,7 @@ fn ket_thuc(
                     ma,
                 )),
                 (SauKhiRoi::TrongMayInUsb(ma), _) => {
-                    bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: true, da_thay_in: false, gian_doan });
+                    bao(QuanSat::TrongMayInUsb { bang_chung: bang_chung(canh), da_thay_loi: true, da_thay_in: false });
                     KetQuaIn::KhongRo(LyDo::co_loai(chu_trong_may_in_usb(ma), ma))
                 }
                 (SauKhiRoi::UsbKhongDoc, _) => KetQuaIn::KhongRo(LyDo::co_loai(
@@ -1309,7 +1315,7 @@ fn ket_thuc(
                 (SauKhiRoi::UsbChuaXong, da_thay_in) => {
                     // Bằng chứng "đã thấy chạy" trước gián đoạn không còn dùng được.
                     let da_thay_in = da_thay_in && !gian_doan;
-                    bao(QuanSat::TrongMayInUsb { bang_chung: bo_suy.bang_chung(), da_thay_loi: false, da_thay_in, gian_doan });
+                    bao(QuanSat::TrongMayInUsb { bang_chung: bang_chung(canh), da_thay_loi: false, da_thay_in });
                     KetQuaIn::KhongRo(LyDo::co_loai(
                         "may in USB chua in xong sau 30 giay — app theo doi tiep va bao khi in xong",
                         MaSuCo::KhongXacNhan,
@@ -1319,7 +1325,7 @@ fn ket_thuc(
         }
         KetLuan::KhongRo(ly_do) => {
             if con_trong_hang_doi {
-                bao(QuanSat::ConTrongHangDoi(bo_suy.bang_chung()));
+                bao(QuanSat::ConTrongHangDoi(bang_chung(canh)));
                 return bo_sung_loai(KetQuaIn::KhongRo(ly_do), su_co_da_thay);
             }
             // U2 (giám sát 25/09): job ĐÃ vào hàng đợi rồi rời đi (không bị xoá)
@@ -1329,12 +1335,7 @@ fn ket_thuc(
             // backend "tự in, KHÔNG in lại". Job chưa từng thấy trong hàng đợi:
             // không biết đã tới máy chưa → giữ nguyên.
             if let Some(ma_usb) = usb.loi_cuoi.filter(|_| bo_suy.da_thay_job && !bo_suy.da_thay_huy) {
-                bao(QuanSat::TrongMayInUsb {
-                    bang_chung: bo_suy.bang_chung(),
-                    da_thay_loi: true,
-                    da_thay_in: false,
-                    gian_doan: canh.co,
-                });
+                bao(QuanSat::TrongMayInUsb { bang_chung: bang_chung(canh), da_thay_loi: true, da_thay_in: false });
                 let ma = match ly_do.loai {
                     Some(m) if m.la_su_co_may_in() => su_co::uu_tien_hon(m, ma_usb),
                     _ => ma_usb,
@@ -1344,7 +1345,7 @@ fn ket_thuc(
             bo_sung_loai(KetQuaIn::KhongRo(ly_do), su_co_da_thay)
         }
         KetLuan::UngVienXoa(ly_do) => {
-            let bc = bo_suy.bang_chung();
+            let bc = bang_chung(canh);
             let go = go_job_khoi_hang_doi(sp, job_id, bc.da_thay_in || bc.da_thay_huy);
             let con = go.job_con_trong_hang_doi();
             let kq = quyet_loi_truoc_khi_in(ly_do, || go);
@@ -3310,10 +3311,18 @@ mod tests {
         });
         assert!(matches!(kq, KetQuaIn::KhongRo(_)));
         let tm = bao.iter().find_map(|q| match q {
-            QuanSat::TrongMayInUsb { da_thay_in, gian_doan, .. } => Some((*da_thay_in, *gian_doan)),
+            QuanSat::TrongMayInUsb { da_thay_in, bang_chung, .. } => Some((*da_thay_in, bang_chung.gian_doan)),
             _ => None,
         });
         assert_eq!(tm, Some((false, true)), "bỏ bằng chứng cũ + mang cờ gián đoạn");
+        // Còn trong hàng đợi Windows lúc hết giờ → bàn giao QUA HÀNG ĐỢI cũng mang cờ (review Codex vòng 4).
+        let (kq, bao) = bao_ra(&mut SpoolerGia { vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTING)])], ..Default::default() });
+        assert!(matches!(kq, KetQuaIn::KhongRo(_)), "{:?}", kq);
+        let bc = bao.iter().find_map(|q| match q {
+            QuanSat::ConTrongHangDoi(bc) => Some(*bc),
+            _ => None,
+        });
+        assert_eq!(bc.map(|b| b.gian_doan), Some(true));
         // Máy MẠNG: PRINTED trong hàng đợi là bằng chứng của spooler — không đổi.
         let (kq, _) = bao_ra(&mut SpoolerGia { vong: vec![vong(0, vec![job(7, JOB_STATUS_PRINTED)])], ..Default::default() });
         assert_eq!(kq, KetQuaIn::DaIn);

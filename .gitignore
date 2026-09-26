@@ -2,3 +2,6 @@
 config.ini
 dry-run-output/
 *.pdb
+
+# test đầu-cuối: cài bằng `npm i socket.io@4` (README tests/e2e-hang-doi)
+tests/e2e-hang-doi/node_modules/

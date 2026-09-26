@@ -262,9 +262,9 @@ fn dai_cua_job(d: &DaiJob) -> CanhBao {
 pub fn dai_doi_chieu(so_hoa_don: &str) -> CanhBao {
     CanhBao {
         ma: Some(MaSuCo::KhongXacNhan),
-        tieu_de: format!("Máy in đã chạy lại — CHƯA xác nhận hoá đơn {} đã in", so_hoa_don),
-        chi_tiet: "Máy từng in lặp / bỏ sót hoá đơn sau khi hết giấy: ĐỐI CHIẾU SỐ hoá đơn trên các tờ vừa ra — \
-                   thiếu số nào mới in lại số đó."
+        tieu_de: format!("CHƯA xác nhận hoá đơn {} đã in — đối chiếu số trên tờ", so_hoa_don),
+        chi_tiet: "Sau sự cố (hết giấy, tắt máy in, máy tính ngủ) máy in có thể in lặp / bỏ sót hoá đơn: ĐỐI CHIẾU \
+                   SỐ hoá đơn trên các tờ vừa ra — thiếu số nào mới in lại số đó."
             .to_string(),
         loi: true,
     }

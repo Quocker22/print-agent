@@ -19,6 +19,11 @@ const anh = () => ({
 const boc = (x) => (Array.isArray(x) ? x[0] : x) || {};
 io.of('/print-agent').on('connection', (s) => {
   if (s.handshake.auth?.token !== 'tok-e2e') { s.disconnect(true); return; }
+  // Kết nối DUY NHẤT (lần chạy test mới) → trạng thái ban đầu: chạy lại test không đỏ vì dữ liệu cũ.
+  if (io.of('/print-agent').sockets.size === 1) {
+    jobs = [muc('a1', 'cho_in', true), muc('a2', 'cho_in', true), muc('d1', 'dang_gui', false), muc('k1', 'khong_ro', false)];
+    Object.assign(dem, { lay: 0, huy: 0, bo: 0, noi: 0 });
+  }
   dem.noi++;
   s.emit('cau-hinh', { hoTro: ['khong_ro', 'su_co', 'trang_thai_may_in', 'nhat_ky_app', 'hang_doi'] });
   s.emit('hang-doi', anh());

@@ -96,9 +96,18 @@ pub struct JobTheoDoiTiep {
     /// Gửi đi lúc máy vừa hồi phục có hoá đơn kẹt (0.2.7) — kết luận "đã in"
     /// của nó cũng không được báo server (không biết tờ ra là hoá đơn nào).
     nghi_ngo: bool,
-    /// Máy tính ngủ / app bị treo trong lúc theo dõi job này qua USB (0.2.7,
-    /// review Codex): "đã thấy chạy" trước và "rảnh" sau không nối tiếp.
+    /// Máy tính ngủ / app bị treo trong lúc theo dõi LẦN GỬI này (0.2.7, review
+    /// Codex) — từ bước in chính (`bang_chung.gian_doan`) hoặc từ vòng theo dõi
+    /// tiếp. Chỉ chặn `da_in` khi kết luận dựa vào USB (máy mạng: PRINTED do
+    /// spooler ghi sau khi thức là bằng chứng thật).
     gian_doan: bool,
+    /// Người dùng đã "Thôi theo dõi" lần gửi này (0.2.7): kết luận chỉ ghi nhật
+    /// ký quan sát, không gửi server — cờ nằm TRÊN job, không phụ thuộc danh
+    /// sách dấu có thể hết hạn (review Codex vòng 4).
+    im_lang: bool,
+    /// Đã từng thấy máy in của job là máy USB cục bộ (DÍNH — giám sát 0.2.7): một
+    /// vòng đọc `GetPrinterW` hỏng không được làm job rơi về luật máy mạng.
+    may_usb: bool,
 }
 
 /// Theo dõi một hoá đơn nằm trong bộ nhớ máy in USB (U3). Máy HP Laser 107 ở
@@ -162,12 +171,18 @@ impl JobTheoDoiTiep {
             usb: None,
             lan_cho_usb: 0,
             nghi_ngo: false,
-            gian_doan: false,
+            gian_doan: bang_chung.gian_doan,
+            im_lang: false,
+            may_usb: false,
         }
     }
 
-    pub fn gian_doan(mut self, gian_doan: bool) -> Self {
-        self.gian_doan = gian_doan;
+    pub fn im_lang(&self) -> bool {
+        self.im_lang
+    }
+
+    pub fn danh_dau_im_lang(mut self) -> Self {
+        self.im_lang = true;
         self
     }
 
@@ -181,7 +196,7 @@ impl JobTheoDoiTiep {
     /// hoá đơn kẹt do lỗi (máy từng in lặp/bỏ sót sau khi hết giấy) hoặc gửi
     /// ngay lúc máy vừa hồi phục. `da_in` còn đóng cầu dao backend tức thì.
     pub fn khong_bao_da_in(&self) -> bool {
-        self.ket_do_loi() || self.nghi_ngo || self.gian_doan
+        self.ket_do_loi() || self.nghi_ngo || (self.gian_doan && self.usb.is_some())
     }
 
     /// Lý do `khong_bao_da_in` — cho nhật ký.
@@ -363,15 +378,25 @@ impl DanhSachTheoDoiTiep {
         xong
     }
 
-    /// Máy tính ngủ / app bị treo giữa hai vòng đọc: mọi job ĐANG theo dõi qua
-    /// USB mất tính nối tiếp của bằng chứng (0.2.7). Trả số job bị đánh dấu.
+    /// Máy tính ngủ / app bị treo giữa hai vòng đọc: MỌI job đang theo dõi mất
+    /// tính nối tiếp của bằng chứng (0.2.7) — kể cả job còn theo hàng đợi của
+    /// máy USB (sẽ chuyển sang USB sau). Trả số job bị đánh dấu.
     pub fn danh_dau_gian_doan(&mut self) -> usize {
-        let mut n = 0;
-        for job in self.ds.iter_mut().filter(|j| j.usb.is_some()) {
+        for job in self.ds.iter_mut() {
             job.gian_doan = true;
-            n += 1;
         }
-        n
+        self.ds.len()
+    }
+
+    /// Chuyển dấu "Thôi theo dõi" `(print_jobs.id, lúc bấm)` lên các job khớp
+    /// (lần gửi bắt đầu TRƯỚC lúc bấm).
+    pub fn danh_dau_im_lang(&mut self, dau: &[(String, Instant)]) {
+        for job in self.ds.iter_mut() {
+            let Some(pid) = crate::state::print_job_id(&job.job_id) else { continue };
+            if dau.iter().any(|(p, luc)| p == pid && job.bat_dau <= *luc) {
+                job.im_lang = true;
+            }
+        }
     }
 
     /// Các máy in cần đọc ở vòng này (mỗi máy một lần).
@@ -415,6 +440,8 @@ fn xet_mot_job(
     if let Some(u) = job.usb.as_mut() {
         return xet_qua_usb(u, usb);
     }
+    job.may_usb |= usb.la_may_usb;
+    let usb = UsbVong { la_may_usb: job.may_usb, ..usb };
     // Không đọc được hàng đợi (R5b) — không biết gì mới; ngắt chuỗi vắng. Mã
     // kẹt lần trước GIỮ NGUYÊN (R-A dựa vào nó đúng lúc hàng đợi không đọc được).
     let Some(hang_doi) = hang_doi else {
@@ -463,8 +490,8 @@ fn xet_mot_job(
     // bị xoá thì byte đã vào BỘ NHỚ máy in: hàng đợi rỗng không còn nói gì,
     // chuyển sang theo dõi qua USB. Luật cũ bên dưới ra `da_in` (đúng sự cố
     // HCM) hoặc `Mat` (quản lý in lại → hai tờ khi nạp giấy).
-    // Chỉ khi ĐANG đọc được USB: không đọc được (máy tắt, không quyền…) mà vẫn
-    // chuyển thì job treo 12 giờ rồi bị nhắc "in lại" (giám sát vòng 2).
+    // Chưa đọc được thiết bị thì `chuyen_sang_usb` chờ `SO_LAN_CHO_USB` lần hỏi
+    // hỏng rồi `Mat` (kiểm tờ) — không bao giờ `da_in` đoán (0.2.7).
     if usb.la_may_usb && !job.bang_chung.da_thay_huy {
         return chuyen_sang_usb(job, usb);
     }
@@ -623,6 +650,10 @@ impl KhoTheoDoiTiep {
         self.khoa().ds.danh_dau_gian_doan()
     }
 
+    pub fn danh_dau_im_lang(&self, dau: &[(String, Instant)]) {
+        self.khoa().ds.danh_dau_im_lang(dau)
+    }
+
     pub fn so_job(&self) -> usize {
         self.khoa().ds.ds.len()
     }
@@ -684,22 +715,42 @@ pub fn chay_vong_lap(
     bay_gio: &dyn Fn() -> Instant,
     xu_ly: &mut dyn FnMut(JobTheoDoiTiep, KetLuanTiep),
 ) {
-    let toi = kho.nhan_chu();
     let mut canh = crate::thuc_day::CanhGianDoan::moi();
-    loop {
-        if dung.load(Ordering::SeqCst) {
-            return;
-        }
-        // TRƯỚC khi xử lý mẫu đầu tiên sau khi máy tính thức (review Codex).
-        if canh.buoc(CHU_KY.max(CHO_KHI_RANH)) {
+    chay_vong_lap_voi(kho, may_in_mac_dinh, dung, doc, ngu, bay_gio, &mut || canh.buoc(CHU_KY.max(CHO_KHI_RANH)), xu_ly)
+}
+
+/// Như `chay_vong_lap`; `gian_doan()` = "vừa có gián đoạn quan sát từ lần hỏi
+/// trước" (thật: `thuc_day::CanhGianDoan`), hỏi ở đầu mỗi vòng VÀ ngay sau MỖI
+/// lần đọc, TRƯỚC khi xử lý mẫu (review Codex vòng 4: máy tính ngủ ngay trong
+/// lúc đọc thì mẫu đầu sau khi thức không được dùng để xác nhận).
+#[allow(clippy::too_many_arguments)]
+pub fn chay_vong_lap_voi(
+    kho: &KhoTheoDoiTiep,
+    may_in_mac_dinh: &str,
+    dung: &AtomicBool,
+    doc: &mut dyn FnMut(&str) -> VongDoc,
+    ngu: &mut dyn FnMut(Duration),
+    bay_gio: &dyn Fn() -> Instant,
+    gian_doan: &mut dyn FnMut() -> bool,
+    xu_ly: &mut dyn FnMut(JobTheoDoiTiep, KetLuanTiep),
+) {
+    let toi = kho.nhan_chu();
+    let mut kiem = |kho: &KhoTheoDoiTiep| {
+        if gian_doan() {
             let n = kho.danh_dau_gian_doan();
             if n > 0 {
                 crate::nhat_ky::ghi(
                     "gian_doan_quan_sat",
-                    &format!("{} hoa don dang theo doi qua USB — may tinh ngu/bi treo; ket luan da in se chi la doi chieu so", n),
+                    &format!("{} hoa don dang theo doi — may tinh ngu/bi treo; ket luan da in qua USB se chi la doi chieu so", n),
                 );
             }
         }
+    };
+    loop {
+        if dung.load(Ordering::SeqCst) {
+            return;
+        }
+        kiem(kho);
         let Some(cac_may) = kho.cac_may_in(toi, may_in_mac_dinh) else { return };
         if cac_may.is_empty() {
             ngu(CHO_KHI_RANH);
@@ -707,6 +758,7 @@ pub fn chay_vong_lap(
         }
         for may in &cac_may {
             let vong = doc(may);
+            kiem(kho);
             let Some(xong) = kho.mot_vong_neu_chu(toi, may, may_in_mac_dinh, &vong, bay_gio()) else { return };
             for (job, kl) in xong {
                 xu_ly(job, kl);
@@ -774,6 +826,8 @@ pub fn nhan_lai_khi_khoi_dong(
             da_thay_in: spooler::da_bat_dau_in(j),
             da_thay_huy: j.status & co::JOB_STATUS_RESTART != 0,
             nen,
+            // App KHÔNG chạy từ lúc gửi tới giờ — quan sát đã gián đoạn (0.2.7).
+            gian_doan: true,
         };
         let bat_dau = bay_gio.checked_sub(tuoi).unwrap_or(bay_gio);
         nhan.them(JobTheoDoiTiep::moi(job_id, so, spooler::ma_su_co_job(j), bang_chung, bat_dau).tren_may_in(may_in));
@@ -1361,10 +1415,92 @@ mod tests {
         assert_eq!(xong[0].1, KetLuanTiep::DaIn);
         assert!(xong[0].0.khong_bao_da_in());
         assert_eq!(xong[0].0.ly_do_khong_bao_da_in(), "gian_doan_quan_sat");
-        // Job theo dõi QUA HÀNG ĐỢI (chưa sang USB) không bị đánh dấu.
+        // Job máy USB còn theo HÀNG ĐỢI lúc gián đoạn: vẫn bị đánh dấu, sang USB
+        // rồi 04 → 01 cũng không `da_in` chắc chắn (review Codex vòng 4).
         let mut ds = DanhSachTheoDoiTiep::default();
         ds.them(moi(da_in(), t0));
-        assert_eq!(ds.danh_dau_gian_doan(), 0);
+        assert_eq!(ds.danh_dau_gian_doan(), 1);
+        let mut v = vong_usb(USB_DANG_IN);
+        v.hang_doi = Some(vec![job(7, JOB_STATUS_PRINTED)]);
+        assert!(ds.mot_vong(&v, t0).is_empty());
+        let xong = ds.mot_vong(&vong_usb(USB_RANH), t0);
+        assert!(xong.len() == 1 && xong[0].1 == KetLuanTiep::DaIn && xong[0].0.khong_bao_da_in(), "{:?}", xong);
+        // Máy MẠNG: PRINTED sau khi thức là bằng chứng của spooler → da_in bình thường.
+        let mut ds = DanhSachTheoDoiTiep::default();
+        ds.them(moi(da_in(), t0));
+        ds.danh_dau_gian_doan();
+        let xong = ds.mot_vong(&vong(1, vec![job(7, JOB_STATUS_PRINTED)]), t0);
+        assert!(xong.len() == 1 && xong[0].1 == KetLuanTiep::DaIn && !xong[0].0.khong_bao_da_in());
+        // Cờ từ bước in chính đi theo bằng chứng.
+        let j = moi(BangChungJob { gian_doan: true, ..da_in() }, t0).qua_usb(false, false);
+        assert!(j.khong_bao_da_in());
+    }
+
+    /// Review Codex vòng 4: máy tính ngủ NGAY TRONG lúc đọc — mẫu đầu sau khi
+    /// thức (máy rảnh) không được xác nhận hoá đơn đã thấy chạy trước đó.
+    #[test]
+    fn gian_doan_trong_luc_doc_danh_dau_truoc_khi_xu_ly() {
+        let t0 = Instant::now();
+        let kho = KhoTheoDoiTiep::default();
+        kho.them(moi(da_in(), t0).qua_usb(false, false));
+        let dung = AtomicBool::new(false);
+        let mut lan = 0;
+        let ngu_trong_doc = std::cell::Cell::new(false);
+        let mut ket = Vec::new();
+        chay_vong_lap_voi(
+            &kho,
+            "HP",
+            &dung,
+            &mut |_| {
+                lan += 1;
+                if lan == 2 {
+                    ngu_trong_doc.set(true); // máy tính ngủ giữa lúc đọc lần 2
+                }
+                if lan >= 3 {
+                    dung.store(true, Ordering::SeqCst);
+                }
+                if lan == 1 { vong_usb(USB_DANG_IN) } else { vong_usb(USB_RANH) }
+            },
+            &mut |_| {},
+            &|| t0,
+            &mut || ngu_trong_doc.replace(false),
+            &mut |j, kl| {
+                ket.push((j, kl));
+                dung.store(true, Ordering::SeqCst); // kho rỗng thì vòng không đọc nữa
+            },
+        );
+        assert_eq!(ket.len(), 1);
+        assert_eq!(ket[0].1, KetLuanTiep::DaIn);
+        assert!(ket[0].0.khong_bao_da_in(), "mẫu đầu sau khi thức không xác nhận chắc chắn");
+    }
+
+    /// Giám sát 0.2.7: đã thấy là máy USB thì một vòng đọc cờ máy in hỏng
+    /// (`la_may_usb=false`) không làm job rơi về luật máy mạng (PRINTED → da_in).
+    #[test]
+    fn may_usb_dinh_theo_job() {
+        let t0 = Instant::now();
+        let mut j = moi(da_in(), t0);
+        assert_eq!(buoc(&mut j, &vong_may_usb(vec![job(7, JOB_STATUS_PRINTING)]), t0), None);
+        let hong = vong(0, vec![job(7, JOB_STATUS_PRINTED)]);
+        assert!(!hong.la_may_usb);
+        assert_ne!(buoc(&mut j, &hong, t0), Some(KetLuanTiep::DaIn));
+    }
+
+    /// Review Codex vòng 4: dấu "Thôi theo dõi" chuyển lên JOB — hết hạn trong
+    /// danh sách dấu cũng không làm mất; lần gửi SAU lúc bấm không bị ảnh hưởng.
+    #[test]
+    fn im_lang_nam_tren_job() {
+        let t0 = Instant::now();
+        let mut ds = DanhSachTheoDoiTiep::default();
+        let mut a = moi(da_in(), t0);
+        a.job_id = "p7-1790251200000".into();
+        let mut b = moi(da_in(), t0 + Duration::from_secs(10));
+        b.job_id = "p7-1790251200001".into();
+        ds.them(a);
+        ds.them(b);
+        ds.danh_dau_im_lang(&[("p7".into(), t0 + Duration::from_secs(5))]);
+        let co: Vec<bool> = ds.ds.iter().map(|j| j.im_lang()).collect();
+        assert_eq!(co, vec![true, false]);
     }
 
     /// chạy → rảnh chỉ xác nhận MỘT hoá đơn (cũ nhất) — 0.2.7; 0.2.6 cho cả ba

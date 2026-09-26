@@ -151,6 +151,28 @@ pub(crate) mod test {
 /// chừng (máy vừa ngủ dậy, Wi-Fi đổi) làm `connect()` chờ MÃI.
 pub const HAN_DUNG_KET_NOI: std::time::Duration = std::time::Duration::from_secs(25);
 
+/// print-agent (vá cục bộ, xem VA-CUC-BO.md): hạn cho MỘT lần gửi gói
+/// (chờ khoá sender + ghi + flush). Bản gốc không có hạn → bên kia ngừng đọc
+/// (bộ đệm TCP đầy) là luồng gửi và luồng poll (trả Pong) cùng kẹt mãi.
+pub const HAN_GUI: std::time::Duration = std::time::Duration::from_secs(20);
+
+pub(crate) fn loi_qua_han_gui() -> Error {
+    Error::IncompleteIo(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "gui goi websocket qua han (ben kia khong doc) — ket noi coi nhu hong",
+    ))
+}
+
+pub(crate) fn kiem_hong(hong: &std::sync::atomic::AtomicBool) -> error::Result<()> {
+    if hong.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(Error::IncompleteIo(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "ket noi websocket da hong (lan gui truoc qua han)",
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn loi_qua_han_ket_noi() -> Error {
     Error::IncompleteIo(std::io::Error::new(
         std::io::ErrorKind::TimedOut,

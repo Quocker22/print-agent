@@ -11,7 +11,11 @@ trong `Cargo.toml`), chép nguyên văn từ `~/.cargo/registry`, dùng qua `[pa
   máy nhận TCP rồi im lặng (như mạng chết giữa chừng khi PC vừa ngủ dậy / Wi-Fi đổi) sau 180 s vẫn chưa
   trả về — vòng nối lại của app đứng hẳn ("máy sleep thì mất kết nối luôn"). Quá hạn thì future bị huỷ,
   socket bị đóng, trả `Error::IncompleteIo(TimedOut)`.
-- `src/lib.rs`: hằng `HAN_DUNG_KET_NOI` + hàm lỗi.
+- Cùng hai file: `emit` (chờ khoá sender + ghi + flush) bọc `tokio::time::timeout(HAN_GUI)` (20 s). Bản gốc
+  không có hạn: bên kia ngừng đọc (bộ đệm TCP đầy) → luồng gửi giữ khoá sender MÃI, luồng poll kẹt theo khi
+  trả Pong (review Codex 26/09). Quá hạn thì đặt cờ `hong`: mọi `emit`/`poll` sau đó lỗi NGAY (gói ghi dở
+  đã làm hỏng khung websocket — không dùng tiếp) → luồng poll báo lỗi → app nối lại.
+- `src/lib.rs`: hằng `HAN_DUNG_KET_NOI`, `HAN_GUI` + hàm lỗi.
 - `Cargo.toml`: bỏ `[[bench]]` + `[dev-dependencies]` (máy build .207 offline, không cần).
 
 Không đổi gì khác. Nâng rust_socketio/rust_engineio thì bỏ thư mục này + mục `[patch.crates-io]`,
