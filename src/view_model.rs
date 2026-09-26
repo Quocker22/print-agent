@@ -99,6 +99,8 @@ pub fn nhan_job_co_hang_doi(trang_thai: &str, loai: Option<MaSuCo>, sau_khac_phu
         // Hoá đơn kẹt trong máy: app chỉ thấy MÁY chạy một chu kỳ sau khi nạp
         // giấy, không thấy tờ nào (máy HP 108a từng in trùng/bỏ tờ — 25/09).
         job::DA_IN if sau_khac_phuc => return "Máy đã in sau khi khắc phục — kiểm tờ".into(),
+        // Máy đã chạy lại và ra tờ nhưng không biết là hoá đơn nào (0.2.7).
+        job::KHONG_RO if sau_khac_phuc => return "Máy đã chạy lại — CHƯA xác nhận hoá đơn này: đối chiếu số trên tờ".into(),
         job::DA_IN => return "Đã in".into(),
         job::DANG_GUI => return "Đang gửi xuống máy in…".into(),
         job::CHO_MAY_IN => return "Đã gửi xuống máy in — đang chờ in ra…".into(),
@@ -251,6 +253,20 @@ fn dai_cua_job(d: &DaiJob) -> CanhBao {
         (LoaiDai::KhongRo, Some((k, n))) => dai_thieu_ban(d.ma, &d.so_hoa_don, k, n),
         (LoaiDai::Loi, _) => dai_loi(d.ma, &d.so_hoa_don),
         (LoaiDai::KhongRo | LoaiDai::DangTheoDoi, _) => dai_khong_ro_theo(d.ma, &d.so_hoa_don, d.ngoai_hang_doi),
+        (LoaiDai::DoiChieu, _) => dai_doi_chieu(&d.so_hoa_don),
+    }
+}
+
+/// Dải "đối chiếu số" (0.2.7): máy in đã chạy lại và ra tờ nhưng app KHÔNG
+/// biết tờ đó là hoá đơn nào — không bảo in lại (có thể đã ra), không bảo "đã in".
+pub fn dai_doi_chieu(so_hoa_don: &str) -> CanhBao {
+    CanhBao {
+        ma: Some(MaSuCo::KhongXacNhan),
+        tieu_de: format!("Máy in đã chạy lại — CHƯA xác nhận hoá đơn {} đã in", so_hoa_don),
+        chi_tiet: "Máy từng in lặp / bỏ sót hoá đơn sau khi hết giấy: ĐỐI CHIẾU SỐ hoá đơn trên các tờ vừa ra — \
+                   thiếu số nào mới in lại số đó."
+            .to_string(),
+        loi: true,
     }
 }
 

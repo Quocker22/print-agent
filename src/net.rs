@@ -458,8 +458,8 @@ struct BaoCaoTrongLuc<'a> {
     may_in_da_chuyen: Cell<Option<MaSuCo>>,
     da_thay_su_co: Cell<bool>,
     con_trong_hang_doi: Cell<Option<BangChungJob>>,
-    /// `Some((da_thay_loi, da_thay_in))` = job nằm trong BỘ NHỚ máy in USB (U2) — theo dõi tiếp qua USB.
-    trong_may_in_usb: Cell<Option<(bool, bool)>>,
+    /// `Some((da_thay_loi, da_thay_in, gian_doan))` = job nằm trong BỘ NHỚ máy in USB (U2) — theo dõi tiếp qua USB.
+    trong_may_in_usb: Cell<Option<(bool, bool, bool)>>,
 }
 
 impl BaoCaoTrongLuc<'_> {
@@ -488,9 +488,9 @@ impl BaoCaoTrongLuc<'_> {
             QuanSat::ConTrongHangDoi(bc) => self.con_trong_hang_doi.set(Some(bc)),
             // Không còn trong hàng đợi Windows nhưng CÒN chờ trong máy in — với
             // backend nghĩa y hệt (`conTrongHangDoi:true`: tự in, KHÔNG in lại).
-            QuanSat::TrongMayInUsb { bang_chung, da_thay_loi, da_thay_in } => {
+            QuanSat::TrongMayInUsb { bang_chung, da_thay_loi, da_thay_in, gian_doan } => {
                 self.con_trong_hang_doi.set(Some(bang_chung));
-                self.trong_may_in_usb.set(Some((da_thay_loi, da_thay_in)));
+                self.trong_may_in_usb.set(Some((da_thay_loi, da_thay_in, gian_doan)));
             }
             QuanSat::DaRoiHangDoi => khoa(self.trang_thai).doi_trang_thai_job(self.job_id, job::CHO_MAY_IN),
         }
@@ -581,7 +581,7 @@ fn xu_ly_viec_co_bao_cao(
                 .tren_may_in(&cfg.printer_name)
                 .nghi_ngo_sau_hoi_phuc(da_nghi.get());
             Some(match bao_cao.trong_may_in_usb.get() {
-                Some((da_thay_loi, da_thay_in)) => j.qua_usb(da_thay_loi, da_thay_in),
+                Some((da_thay_loi, da_thay_in, gian_doan)) => j.qua_usb(da_thay_loi, da_thay_in).gian_doan(gian_doan),
                 None => j,
             })
         }
@@ -866,7 +866,7 @@ pub fn chu_co_the_trong_may_in(so_hoa_don: &str, ma: MaSuCo) -> String {
 /// đơn kẹt (0.2.7) — không bảo in lại: tờ có thể đã ra, chỉ không biết là số nào.
 pub fn chu_doi_chieu_so(so_hoa_don: &str) -> String {
     format!(
-        "Máy in đã chạy lại sau lỗi và ra tờ cho hoá đơn {} — máy từng in lặp / bỏ sót hoá đơn sau khi hết giấy: ĐỐI CHIẾU SỐ hoá đơn trên tờ, thiếu số nào mới in lại số đó",
+        "Máy in đã chạy lại nhưng CHƯA xác nhận hoá đơn {} đã in (máy từng in lặp / bỏ sót hoá đơn sau khi hết giấy; hoặc máy tính ngủ giữa lúc theo dõi): ĐỐI CHIẾU SỐ hoá đơn trên các tờ vừa ra, thiếu số nào mới in lại số đó",
         so_hoa_don
     )
 }
@@ -923,7 +923,7 @@ fn xu_ly_ket_luan_tiep(
     // Người dùng đã "Thôi theo dõi": server không còn chờ — chỉ ghi quan sát,
     // không gửi "đã in"/sự cố (DB `bo_qua` không bị nhật ký nói ngược).
     if da_thoi_theo_doi {
-        if matches!(kl, KetLuanTiep::DaIn) {
+        if matches!(kl, KetLuanTiep::DaIn) && !j.khong_bao_da_in() {
             khoa(trang_thai).xac_nhan_in_sau(&j.job_id);
         }
         nhat_ky::ghi(
@@ -952,7 +952,8 @@ fn xu_ly_ket_luan_tiep(
                 SystemTime::now(),
             );
             let kq = gui("su-co", v, CanHoTro::SuCo);
-            khoa(trang_thai).xac_nhan_in_sau(&j.job_id);
+            // Giao diện: CHƯA xác nhận (không "đã in") + dải "đối chiếu số" (review Codex).
+            khoa(trang_thai).ra_to_can_doi_chieu(&j.job_id, &j.so_hoa_don);
             nhat_ky::ghi(
                 "theo_doi_tiep_ra_to_khong_bao_da_in",
                 &format!(
@@ -960,7 +961,7 @@ fn xu_ly_ket_luan_tiep(
                     id_ngan,
                     j.so_hoa_don,
                     loai,
-                    if j.ket_do_loi() { "ket_do_loi" } else { "nghi_ngo_sau_hoi_phuc" },
+                    j.ly_do_khong_bao_da_in(),
                     kq.chu()
                 ),
             );
@@ -2744,6 +2745,7 @@ mod tests {
                 bang_chung: BangChungJob { da_thay_in: true, ..Default::default() },
                 da_thay_loi: true,
                 da_thay_in: false,
+                gian_doan: false,
             });
             KetQuaIn::KhongRo(LyDo::co_loai("may in bao loi qua USB", MaSuCo::CanXuLy))
         };
@@ -2788,7 +2790,8 @@ mod tests {
         assert_eq!(da[0].1["loai"], "khong_xac_nhan");
         assert!(da[0].1["chiTiet"].as_str().unwrap().contains("ĐỐI CHIẾU SỐ"), "{}", da[0].1);
         let t = tt.lock().unwrap();
-        assert!(t.jobs[0].sau_khac_phuc, "giao diện: đã in sau khắc phục — kiểm tờ");
+        assert!(t.jobs[0].sau_khac_phuc && t.jobs[0].trang_thai == "khong_ro", "giao diện: CHƯA xác nhận, đối chiếu số");
+        assert_eq!(t.dai_moi_nhat().map(|d| d.loai_dai), Some(crate::state::LoaiDai::DoiChieu), "dải đối chiếu bật");
         assert!(t.trong_may_in.is_empty());
         assert_eq!(t.hoi_phuc_co_hoa_don_ket.as_ref().map(|(m, _)| m.as_str()), Some("HP 108a"), "mốc theo TÊN máy của job");
         drop(t);
@@ -2970,8 +2973,9 @@ mod tests {
     /// `HD_URL=http://127.0.0.1:47812 cargo test -- --ignored hang_doi_khong_ack --nocapture`
     /// ĐẦU-CUỐI (chạy tay, README tests/e2e-hang-doi): `khoi_chay` THẬT qua
     /// proxy TCP. (1) Lần nối đầu rơi "hố đen" (nhận TCP, không trả lời — TLS
-    /// treo khi máy vừa thức / Wi-Fi đổi): app bỏ sau `HAN_NOI` rồi nối được —
-    /// 0.2.6 đứng MÃI ở đây. (2) "Máy vừa ngủ dậy": bỏ kết nối cũ, nối lại NGAY.
+    /// treo khi máy vừa thức / Wi-Fi đổi): rust_engineio VÁ CỤC BỘ trả lỗi sau
+    /// `HAN_DUNG_KET_NOI` (socket đóng thật, KHÔNG còn luồng treo) rồi app nối
+    /// được — 0.2.6 đứng MÃI ở đây. (2) "Máy vừa ngủ dậy": nối lại NGAY.
     #[test]
     #[ignore]
     fn noi_lai_dau_cuoi_connect_treo_va_thuc_day() {
@@ -3026,9 +3030,11 @@ mod tests {
         };
         assert!(cho_noi(HAN_NOI + Duration::from_secs(20)), "phải nối được sau lần nối treo");
         let mat = bat_dau.elapsed();
-        eprintln!("noi duoc sau {:?} (han noi {:?}), tcp={}", mat, HAN_NOI, so_tcp.load(Ordering::SeqCst));
-        assert!(mat >= HAN_NOI - Duration::from_secs(1), "lần đầu phải là lần treo: {:?}", mat);
-        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 1, "luồng nối treo bị bỏ lại đúng một");
+        let han_thu_vien = rust_engineio::HAN_DUNG_KET_NOI;
+        eprintln!("noi duoc sau {:?} (han thu vien {:?}), tcp={}", mat, han_thu_vien, so_tcp.load(Ordering::SeqCst));
+        assert!(mat >= han_thu_vien - Duration::from_secs(1), "lần đầu phải là lần treo: {:?}", mat);
+        assert!(mat < HAN_NOI + Duration::from_secs(5), "thư viện tự bỏ trước hạn của app: {:?}", mat);
+        assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 0, "không còn luồng nối treo (socket đã đóng thật)");
         let tcp_truoc = so_tcp.load(Ordering::SeqCst);
 
         crate::thuc_day::gia_lap_thuc_day();
@@ -3040,14 +3046,33 @@ mod tests {
         assert!(cho_noi(Duration::from_secs(10)), "nối lại được sau khi thức");
         eprintln!("noi lai sau thuc day {:?}", t.elapsed());
 
-        // Hố đen đóng → luồng nối treo trả lỗi, trả suất.
-        ho_den.lock().unwrap().clear();
-        let t = Instant::now();
-        while SO_NOI_TREO.load(Ordering::SeqCst) != 0 && t.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
         assert_eq!(SO_NOI_TREO.load(Ordering::SeqCst), 0);
+        drop(ho_den);
         dk.dung.store(true, Ordering::SeqCst);
+    }
+
+    /// (chạy tay, không cần server): `connect()` THẬT của rust_socketio tới một
+    /// máy nhận TCP rồi im lặng phải TRẢ LỖI trong `HAN_DUNG_KET_NOI` — đo 26/09
+    /// bản gốc 0.6.0 sau 180 s vẫn chưa trả (nguyên nhân "sleep là mất kết nối luôn").
+    #[test]
+    #[ignore]
+    fn connect_ho_den_tra_loi_trong_han() {
+        let nghe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cong = nghe.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut giu = Vec::new();
+            for s in nghe.incoming().flatten() {
+                giu.push(s);
+            }
+        });
+        for url in [format!("http://127.0.0.1:{}", cong), format!("https://127.0.0.1:{}", cong)] {
+            let bat_dau = Instant::now();
+            let kq = ClientBuilder::new(url.clone()).namespace(NAMESPACE).transport_type(TRANSPORT).reconnect(false).connect();
+            let mat = bat_dau.elapsed();
+            eprintln!("{} → {:?} sau {:?}", url, kq.as_ref().err().map(|e| e.to_string()), mat);
+            assert!(kq.is_err());
+            assert!(mat < rust_engineio::HAN_DUNG_KET_NOI + Duration::from_secs(3), "{:?}", mat);
+        }
     }
 
     #[test]

@@ -43,6 +43,10 @@ pub enum LoaiDai {
     Loi,
     /// Kết quả `khong_ro`.
     KhongRo,
+    /// Máy in chạy lại sau lỗi / sau khi máy tính ngủ và ra tờ, nhưng KHÔNG
+    /// biết tờ đó là hoá đơn nào (0.2.7): NV đối chiếu SỐ hoá đơn trên tờ. Giữ
+    /// tới khi NV bấm "Đã hiểu" — hoá đơn khác in xong không tắt nó.
+    DoiChieu,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +124,10 @@ pub struct TrangThaiChung {
     /// `(print_jobs.id, lúc bấm)` người dùng đã "Thôi theo dõi": kết luận sau
     /// đó của theo dõi tiếp cho lần gửi BẮT ĐẦU TRƯỚC lúc bấm chỉ ghi nhật ký
     /// quan sát, không gửi "đã in" (0.2.7). Không xoá khi có kết luận (nhiều lần
-    /// gửi cùng hoá đơn), trần `SO_THOI_THEO_DOI_TOI_DA` (= trần kho theo dõi).
+    /// gửi cùng hoá đơn); bỏ khi quá `theo_doi_tiep::GIU_TOI_DA` (mọi lần gửi
+    /// trước lúc bấm đã hết hạn theo dõi — review Codex: trần theo SỐ LƯỢNG làm
+    /// rơi dấu của hoá đơn theo dõi lâu), trần `SO_THOI_THEO_DOI_TOI_DA` chỉ để
+    /// chặn bộ nhớ.
     pub thoi_theo_doi: Vec<(String, std::time::Instant)>,
     /// `(máy in, lúc)` một hoá đơn KẸT DO LỖI trong bộ nhớ máy in vừa có kết
     /// luận (máy vừa hồi phục). Hoá đơn kế tiếp GỬI ĐI trên máy đó không được
@@ -131,9 +138,9 @@ pub struct TrangThaiChung {
     pub dang_giu_binh_thuong: bool,
 }
 
-/// Trần danh sách "Thôi theo dõi" — bằng trần kho theo dõi tiếp (review Codex:
-/// 50 < 200 thì bỏ theo dõi hàng loạt làm mất dấu mục đầu).
-pub const SO_THOI_THEO_DOI_TOI_DA: usize = crate::theo_doi_tiep::SO_JOB_TOI_DA;
+/// Trần danh sách "Thôi theo dõi" — CHỈ chặn bộ nhớ (mục tự hết hạn sau
+/// `theo_doi_tiep::GIU_TOI_DA`); 12 giờ không ai bấm tới 5.000 lần.
+pub const SO_THOI_THEO_DOI_TOI_DA: usize = 5_000;
 
 /// `print_jobs.id` của một job id backend gửi (`<id>-<13 chữ số ms>`, 25/09).
 /// Id kiểu khác (backend cũ nhét token) → `None`.
@@ -347,7 +354,8 @@ impl TrangThaiChung {
     /// Ghi "Thôi theo dõi" hoá đơn `pid` lúc `luc` — một mục mỗi hoá đơn (bấm
     /// lại thì dời mốc), giữ `SO_THOI_THEO_DOI_TOI_DA` mục mới nhất.
     pub fn ghi_thoi_theo_doi(&mut self, pid: &str, luc: std::time::Instant) {
-        self.thoi_theo_doi.retain(|(p, _)| p != pid);
+        self.thoi_theo_doi
+            .retain(|(p, l)| p != pid && luc.saturating_duration_since(*l) < crate::theo_doi_tiep::GIU_TOI_DA);
         self.thoi_theo_doi.push((pid.to_string(), luc));
         let du = self.thoi_theo_doi.len().saturating_sub(SO_THOI_THEO_DOI_TOI_DA);
         self.thoi_theo_doi.drain(..du);
@@ -367,6 +375,26 @@ impl TrangThaiChung {
             j.sau_khac_phuc = true;
         }
         self.dai_jobs.retain(|d| d.job_id != job_id);
+    }
+
+    /// Máy in chạy lại và ra tờ nhưng KHÔNG xác nhận được là hoá đơn này (hoá
+    /// đơn kẹt do lỗi / gửi lúc máy vừa hồi phục / máy tính ngủ giữa lúc theo
+    /// dõi — 0.2.7, review Codex): dòng vẫn là CHƯA xác nhận (không "đã in"),
+    /// dải "đối chiếu số" bật lại dù NV đã tắt dải cũ.
+    pub fn ra_to_can_doi_chieu(&mut self, job_id: &str, so_hoa_don: &str) {
+        for j in self.jobs.iter_mut().filter(|j| j.job_id == job_id) {
+            j.trang_thai = job::KHONG_RO.into();
+            j.loai = Some(MaSuCo::KhongXacNhan);
+            j.sau_khac_phuc = true;
+        }
+        self.dat_dai(DaiJob {
+            loai_dai: LoaiDai::DoiChieu,
+            ma: Some(MaSuCo::KhongXacNhan),
+            so_hoa_don: so_hoa_don.to_string(),
+            job_id: job_id.to_string(),
+            ngoai_hang_doi: false,
+            ban_da_in: None,
+        });
     }
 
     /// Luồng theo dõi tiếp mất dấu job (biến mất không đủ bằng chứng in, hoặc
@@ -712,12 +740,21 @@ mod tests {
         assert!(!t.da_thoi_theo_doi("p2", t0));
         t.ghi_thoi_theo_doi("p1", sau);
         assert_eq!(t.thoi_theo_doi.len(), 1, "không trùng");
-        for i in 0..SO_THOI_THEO_DOI_TOI_DA + 10 {
+        // Review Codex: 300 hoá đơn khác bị "thôi theo dõi" (và đã kết luận) trong lúc
+        // p1 còn theo dõi → dấu của p1 KHÔNG được rơi.
+        for i in 0..300 {
             t.ghi_thoi_theo_doi(&format!("q{}", i), sau);
         }
+        assert!(t.da_thoi_theo_doi("p1", t0), "dấu còn khi hoá đơn còn có thể đang theo dõi");
+        // Quá đời tối đa của một lần theo dõi → dấu cũ hết tác dụng, được dọn.
+        let rat_lau = sau + crate::theo_doi_tiep::GIU_TOI_DA;
+        t.ghi_thoi_theo_doi("moi", rat_lau);
+        assert_eq!(t.thoi_theo_doi.len(), 1);
+        // Trần bộ nhớ.
+        for i in 0..SO_THOI_THEO_DOI_TOI_DA + 10 {
+            t.ghi_thoi_theo_doi(&format!("r{}", i), rat_lau);
+        }
         assert_eq!(t.thoi_theo_doi.len(), SO_THOI_THEO_DOI_TOI_DA);
-        assert!(!t.da_thoi_theo_doi("p1", t0), "cũ nhất bị bỏ");
-        assert!(t.da_thoi_theo_doi(&format!("q{}", SO_THOI_THEO_DOI_TOI_DA + 9), t0));
     }
 
     #[test]

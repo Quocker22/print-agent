@@ -96,6 +96,9 @@ pub struct JobTheoDoiTiep {
     /// Gửi đi lúc máy vừa hồi phục có hoá đơn kẹt (0.2.7) — kết luận "đã in"
     /// của nó cũng không được báo server (không biết tờ ra là hoá đơn nào).
     nghi_ngo: bool,
+    /// Máy tính ngủ / app bị treo trong lúc theo dõi job này qua USB (0.2.7,
+    /// review Codex): "đã thấy chạy" trước và "rảnh" sau không nối tiếp.
+    gian_doan: bool,
 }
 
 /// Theo dõi một hoá đơn nằm trong bộ nhớ máy in USB (U3). Máy HP Laser 107 ở
@@ -159,7 +162,13 @@ impl JobTheoDoiTiep {
             usb: None,
             lan_cho_usb: 0,
             nghi_ngo: false,
+            gian_doan: false,
         }
+    }
+
+    pub fn gian_doan(mut self, gian_doan: bool) -> Self {
+        self.gian_doan = gian_doan;
+        self
     }
 
     pub fn nghi_ngo_sau_hoi_phuc(mut self, nghi: bool) -> Self {
@@ -172,7 +181,18 @@ impl JobTheoDoiTiep {
     /// hoá đơn kẹt do lỗi (máy từng in lặp/bỏ sót sau khi hết giấy) hoặc gửi
     /// ngay lúc máy vừa hồi phục. `da_in` còn đóng cầu dao backend tức thì.
     pub fn khong_bao_da_in(&self) -> bool {
-        self.ket_do_loi() || self.nghi_ngo
+        self.ket_do_loi() || self.nghi_ngo || self.gian_doan
+    }
+
+    /// Lý do `khong_bao_da_in` — cho nhật ký.
+    pub fn ly_do_khong_bao_da_in(&self) -> &'static str {
+        if self.ket_do_loi() {
+            "ket_do_loi"
+        } else if self.nghi_ngo {
+            "nghi_ngo_sau_hoi_phuc"
+        } else {
+            "gian_doan_quan_sat"
+        }
     }
 
     /// Job nằm trong bộ nhớ máy in USB (U3) — `da_thay_loi`: máy đang báo lỗi
@@ -327,8 +347,31 @@ impl DanhSachTheoDoiTiep {
                 None => con.push_back(job),
             }
         }
+        // Chu kỳ vừa dùng cho MỘT hoá đơn: MỌI hoá đơn USB khác của máy này (kể
+        // cả job đã duyệt trước trong vòng, bộ đếm lệch nhau) phải đếm lại từ đầu
+        // — review Codex: máy không STATUS, A đếm 11 B đếm 10, A xác nhận thì B
+        // không được xác nhận ở vòng sau chỉ nhờ thêm một mẫu.
+        if da_xac_nhan_qua_usb {
+            for job in con.iter_mut().filter(|j| cua(j)) {
+                if let Some(u) = job.usb.as_mut() {
+                    u.da_thay_in = false;
+                    u.sach_chua_thay_in = 0;
+                }
+            }
+        }
         self.ds = con;
         xong
+    }
+
+    /// Máy tính ngủ / app bị treo giữa hai vòng đọc: mọi job ĐANG theo dõi qua
+    /// USB mất tính nối tiếp của bằng chứng (0.2.7). Trả số job bị đánh dấu.
+    pub fn danh_dau_gian_doan(&mut self) -> usize {
+        let mut n = 0;
+        for job in self.ds.iter_mut().filter(|j| j.usb.is_some()) {
+            job.gian_doan = true;
+            n += 1;
+        }
+        n
     }
 
     /// Các máy in cần đọc ở vòng này (mỗi máy một lần).
@@ -576,6 +619,10 @@ impl KhoTheoDoiTiep {
         self.khoa().ds.job_dang_ket(may_in, may_in, bay_gio)
     }
 
+    pub fn danh_dau_gian_doan(&self) -> usize {
+        self.khoa().ds.danh_dau_gian_doan()
+    }
+
     pub fn so_job(&self) -> usize {
         self.khoa().ds.ds.len()
     }
@@ -638,9 +685,20 @@ pub fn chay_vong_lap(
     xu_ly: &mut dyn FnMut(JobTheoDoiTiep, KetLuanTiep),
 ) {
     let toi = kho.nhan_chu();
+    let mut canh = crate::thuc_day::CanhGianDoan::moi();
     loop {
         if dung.load(Ordering::SeqCst) {
             return;
+        }
+        // TRƯỚC khi xử lý mẫu đầu tiên sau khi máy tính thức (review Codex).
+        if canh.buoc(CHU_KY.max(CHO_KHI_RANH)) {
+            let n = kho.danh_dau_gian_doan();
+            if n > 0 {
+                crate::nhat_ky::ghi(
+                    "gian_doan_quan_sat",
+                    &format!("{} hoa don dang theo doi qua USB — may tinh ngu/bi treo; ket luan da in se chi la doi chieu so", n),
+                );
+            }
         }
         let Some(cac_may) = kho.cac_may_in(toi, may_in_mac_dinh) else { return };
         if cac_may.is_empty() {
@@ -1246,6 +1304,69 @@ mod tests {
     }
 
     /// Nhiều hoá đơn cùng nằm trong máy (3 lần gửi lúc hết giấy): MỖI chu kỳ
+    /// Review Codex (vòng 3): máy KHÔNG STATUS, bộ đếm hai hoá đơn LỆCH nhau
+    /// (A vào trước B một vòng). A được xác nhận → B phải đếm lại ĐỦ từ đầu,
+    /// không được xác nhận ở vòng ngay sau nhờ một mẫu "không lỗi".
+    #[test]
+    fn may_khong_status_bo_dem_lech_nhau_dem_lai_tu_dau() {
+        let t0 = Instant::now();
+        let khong_status = VongDoc {
+            la_may_usb: true,
+            usb: Some(crate::usb_may_in::DocUsb { byte: 0x18, status: None, ..Default::default() }),
+            ..vong(0, vec![])
+        };
+        let mut ds = DanhSachTheoDoiTiep::default();
+        let job_ = |i: u32| {
+            let mut j = moi(BangChungJob::default(), t0).qua_usb(false, false);
+            j.job_id = format!("{}-{}", ID, i);
+            j
+        };
+        ds.them(job_(1));
+        assert!(ds.mot_vong(&khong_status, t0).is_empty());
+        ds.them(job_(2));
+        let mut vong_a = 1;
+        loop {
+            let xong = ds.mot_vong(&khong_status, t0);
+            vong_a += 1;
+            if let Some((j, kl)) = xong.first() {
+                assert_eq!((j.job_id.clone(), kl.clone()), (format!("{}-1", ID), KetLuanTiep::DaIn));
+                break;
+            }
+            assert!(vong_a < 100);
+        }
+        assert_eq!(vong_a, spooler::SO_LAN_USB_KHONG_THAY_IN);
+        let mut vong_b = 0;
+        loop {
+            vong_b += 1;
+            if !ds.mot_vong(&khong_status, t0).is_empty() {
+                break;
+            }
+            assert!(vong_b < 100);
+        }
+        assert_eq!(vong_b, spooler::SO_LAN_USB_KHONG_THAY_IN, "B đếm lại đủ, không phải 1 vòng");
+    }
+
+    /// Review Codex (vòng 3): đã thấy máy chạy (04) → máy tính NGỦ → thức, máy
+    /// rảnh (01): không được coi là "đã in" chắc chắn (máy in có thể đã bị tắt/
+    /// bật lúc máy tính ngủ). Kết luận vẫn ra, nhưng `khong_bao_da_in`.
+    #[test]
+    fn gian_doan_quan_sat_thi_khong_bao_da_in() {
+        let t0 = Instant::now();
+        let mut ds = DanhSachTheoDoiTiep::default();
+        ds.them(moi(da_in(), t0).qua_usb(false, false));
+        assert!(ds.mot_vong(&vong_usb(USB_DANG_IN), t0).is_empty());
+        assert_eq!(ds.danh_dau_gian_doan(), 1);
+        let xong = ds.mot_vong(&vong_usb(USB_RANH), t0);
+        assert_eq!(xong.len(), 1);
+        assert_eq!(xong[0].1, KetLuanTiep::DaIn);
+        assert!(xong[0].0.khong_bao_da_in());
+        assert_eq!(xong[0].0.ly_do_khong_bao_da_in(), "gian_doan_quan_sat");
+        // Job theo dõi QUA HÀNG ĐỢI (chưa sang USB) không bị đánh dấu.
+        let mut ds = DanhSachTheoDoiTiep::default();
+        ds.them(moi(da_in(), t0));
+        assert_eq!(ds.danh_dau_gian_doan(), 0);
+    }
+
     /// chạy → rảnh chỉ xác nhận MỘT hoá đơn (cũ nhất) — 0.2.7; 0.2.6 cho cả ba
     /// cùng `da_in` từ một cặp mẫu (review Codex 25/09).
     #[test]

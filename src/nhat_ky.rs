@@ -295,13 +295,16 @@ fn ngay_cua_file(ten: &str) -> Option<&str> {
 }
 
 /// Xoá file nhật ký có ngày ≤ (hôm nay − 30): giữ đúng 30 ngày gần nhất; rồi
-/// nếu cả thư mục (file của app) vẫn quá `TONG_TOI_DA` thì xoá file CŨ NHẤT
-/// trước — trừ file hôm nay. So chuỗi "YYYY-MM-DD" theo thứ tự từ điển = so ngày.
+/// giữ các file NGÀY CŨ trong `TONG_TOI_DA − MOI_NGAY_TOI_DA` (xoá cũ nhất
+/// trước) — file hôm nay tự chặn ở `MOI_NGAY_TOI_DA`, nên cả thư mục KHÔNG BAO
+/// GIỜ vượt `TONG_TOI_DA` (review Codex: trần cũ chỉ kiểm lúc đầu ngày, cuối
+/// ngày có thể tới 220 MB). So chuỗi "YYYY-MM-DD" theo từ điển = so ngày.
 fn don_file_cu(dir: &Path, bay_gio: SystemTime) {
-    don_file_cu_voi_tran(dir, bay_gio, TONG_TOI_DA);
+    don_file_cu_voi_tran(dir, bay_gio, TONG_TOI_DA.saturating_sub(MOI_NGAY_TOI_DA));
 }
 
-fn don_file_cu_voi_tran(dir: &Path, bay_gio: SystemTime, tong_toi_da: u64) {
+/// `tran_ngay_cu` = trần cho các file TRƯỚC hôm nay.
+fn don_file_cu_voi_tran(dir: &Path, bay_gio: SystemTime, tran_ngay_cu: u64) {
     let moc = thoi_gian::ngay_utc_truoc(bay_gio, SO_NGAY_GIU);
     let hom_nay = thoi_gian::ngay_utc(bay_gio);
     let Ok(ds) = std::fs::read_dir(dir) else { return };
@@ -315,10 +318,11 @@ fn don_file_cu_voi_tran(dir: &Path, bay_gio: SystemTime, tong_toi_da: u64) {
             con.push((ngay, f.path(), f.metadata().map_or(0, |m| m.len())));
         }
     }
+    con.retain(|(ngay, _, _)| *ngay < hom_nay);
     con.sort();
     let mut tong: u64 = con.iter().map(|(_, _, n)| n).sum();
-    for (ngay, duong, n) in con {
-        if tong <= tong_toi_da || ngay >= hom_nay {
+    for (_, duong, n) in con {
+        if tong <= tran_ngay_cu {
             break;
         }
         if std::fs::remove_file(&duong).is_ok() {
@@ -405,7 +409,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Cả thư mục quá trần → xoá file CŨ NHẤT trước, KHÔNG xoá file hôm nay, không đụng file lạ.
+    /// Các ngày cũ quá trần → xoá file CŨ NHẤT trước, KHÔNG xoá file hôm nay (nó
+    /// không tính vào trần ngày cũ — tự chặn ở trần ngày), không đụng file lạ.
     #[test]
     fn don_theo_tong_dung_luong_xoa_cu_nhat_truoc() {
         let dir = thu_muc_tam("tran");
@@ -414,10 +419,12 @@ mod tests {
                     "print-agent-2026-09-24.txt", "ghi-chu.txt"] {
             std::fs::write(dir.join(ten), vec![b'x'; 100]).unwrap();
         }
-        don_file_cu_voi_tran(&dir, hom_nay(), 250);
+        don_file_cu_voi_tran(&dir, hom_nay(), 150);
         assert_eq!(con_lai(&dir), vec!["ghi-chu.txt", "print-agent-2026-09-22.txt", "print-agent-2026-09-24.txt"]);
         don_file_cu_voi_tran(&dir, hom_nay(), 10);
         assert_eq!(con_lai(&dir), vec!["ghi-chu.txt", "print-agent-2026-09-24.txt"], "file hôm nay giữ dù quá trần");
+        // Trần cứng: ngày cũ ≤ TONG − MOI_NGAY, hôm nay ≤ MOI_NGAY.
+        assert_eq!(TONG_TOI_DA.saturating_sub(MOI_NGAY_TOI_DA) + MOI_NGAY_TOI_DA, TONG_TOI_DA);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

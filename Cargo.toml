@@ -63,7 +63,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Power",
 ] }
 
+# rust_engineio 0.6.0 VÁ CỤC BỘ (vendor/rust_engineio-0.6.0/VA-CUC-BO.md): bước dựng websocket có
+# hạn 25 s — bản gốc chờ MÃI khi mạng chết giữa chừng (PC vừa ngủ dậy), app không bao giờ nối lại.
+[patch.crates-io]
+rust_engineio = { path = "vendor/rust_engineio-0.6.0" }
+
 [build-dependencies]
 slint-build = "1.8"
 
 [dev-dependencies]
+# Test đầu-cuối đọc hạn dựng kết nối của bản vá cục bộ (vendor/rust_engineio-0.6.0).
+rust_engineio = "0.6"

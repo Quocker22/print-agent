@@ -4403,6 +4403,7 @@ dependencies = [
  "base64 0.22.1",
  "image",
  "raw-window-handle",
+ "rust_engineio",
  "rust_socketio",
  "serde",
  "serde_json",
@@ -4958,8 +4959,6 @@ dependencies = [
 [[package]]
 name = "rust_engineio"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3d3572ceba6c5d79eecedf3be93640ca9512fa4100dff6a70f96c514adf4f1f"
 dependencies = [
  "adler32",
  "async-stream",
